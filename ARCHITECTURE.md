@@ -41,17 +41,18 @@ Agent Loop（通用，LLM + function calling，自主多步 + 防循环护栏 + 
 | **流式输出** | LLM 原始流 → 统一 AgentEvent → 带 request_id/heartbeat/no-cache 的 SSE；完成前排空尾事件，切工作区取消旧请求 | `providers/deepseek.py` + `ui.py` + `ui/app.js` |
 | **防循环护栏** | 连续 3 次相同 run_stata 中断（确定性，不靠模型自觉） | `agent_loop.py` |
 | **幂等/恢复** | 同 input_hash 复用；断点续跑；writer lease/fence；reconcile | `executor.py` + `storage/` + `harness/recovery.py` |
-| **长会话** | token 计量 + 语义压缩(compaction.boundary) + 大结果摘要进账本 | `harness/safety.py` + `compaction.py` |
-| **记忆** | 项目约定/决定（约束非证据），与证据库分开 | `memory/memstore.py` |
-| **多工作区** | 每工作区=事件账本的 idea_id；`?ws=` 贯穿；registry 存元数据 | `ui.py` |
+| **长会话** | `ContextAssembler` 按固定层级构造有界 projection；token 压力触发 append-only `compaction.boundary`，保留完整工具尾部与 manifest | `harness/context_assembler.py` + `compaction.py` + `agent_loop.py` |
+| **记忆** | Memory V2 按 workspace 隔离、检索相关约束并附 provenance；项目约定/决定是约束而非证据，与证据库分开 | `memory/memstore.py` + `toolkit.py` + `runner.py` |
+| **多工作区** | 每工作区=事件账本的 idea_id；`?ws=` 贯穿；registry 存元数据；V2 memory identity 由 canonical ledger/project root 哈希生成 | `ui.py` |
 | **RAG** | 内容哈希 doc/chunk identity；chunk/page/file 有界；显式 source_role（默认 style-only）；缓存原子写、清理删除文件，索引可复用 | `rag/` |
 | **评测** | 五层 L0–L4 设计；L0/对抗有实现；复现 golden 自建入口 | `eval/` + `eval_golden/README.md` |
 
 ## 3. 代码地图（src/stata_agent/）
 
 ```
-harness/agent_loop.py     通用 loop + 防循环 + 流式(on_event)
+harness/agent_loop.py     通用 loop + ContextAssembler 接入 + 防循环 + 流式(on_event)
 harness/safety.py         预算 / 健康探针 / estimate_tokens
+harness/context_assembler.py V2 分层上下文 projection + token budget/manifest
 harness/compaction.py     语义压缩(compaction.boundary)
 harness/recovery.py       reconcile 未决执行链
 harness/telemetry.py      两本账遥测(jsonl)
@@ -93,7 +94,7 @@ writer/citation.py        引文接地(marker 反查)
 writer/figure.py          figure 证据卡 + Word 插图
 writer/docx_out.py        claims/表格 → docx
 writer/draft_multi.py     多表初稿(draft_from_ledger)
-memory/memstore.py        项目记忆(usage/prune)
+memory/memstore.py        V2 项目记忆(search/select/provenance/consolidate/prune)
 privacy/modes.py          隐私三档 + 边界
 ui.py                     FastAPI 全部端点 + SSE 流式 + 多工作区 + config
 ui/index.html·app.js·styles.css  前端(纯原生，无框架)
@@ -106,7 +107,7 @@ ui/index.html·app.js·styles.css  前端(纯原生，无框架)
 - 证据：`evidence.card_signed → claim.signed → claim.retracted`
 - 审批：`approval.requested → approval.granted/rejected`
 - 决策：`agent_step`（payload: reply 或 ask 或 decision_summary；**不存思维链**）
-- 其它：`idea.declared / user.message / spec.frozen / phase.transition / compaction.boundary / budget.limit / health.probe / system.restored / branch.created`
+- 其它：`idea.declared / user.message / spec.frozen / phase.transition / compaction.boundary / context.assembled / budget.limit / health.probe / system.restored / branch.created`
 
 ## 5. 已完成 vs 遗留
 

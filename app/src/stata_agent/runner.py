@@ -7,7 +7,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+import inspect
 
 import uuid
 
@@ -46,18 +48,109 @@ class CycleResult:
     proposal: ActionProposal | None = None
 
 
-def _request_approval(store, idea, act, dec) -> str:
+def _request_approval(store, idea, act, dec, *, workspace_id: str | None = None) -> str:
     """ASK → 持久化 approval.requested（DD-01 #4）：学者决定前不执行。"""
     request_id = f"apr-{uuid.uuid4().hex[:8]}"
     store.append(Event(idea_id=idea, event_type=EVENT_APPROVAL_REQ, actor=ACTOR_ORCH, source=ACTOR_ORCH,
                        payload={"request_id": request_id, "act": act.act_type,
                                 "reason": dec.reason, "note": act.reason or "",
-                                "target": act.target or {}}))
+                                "target": act.target or {}, "workspace_id": workspace_id}))
     return request_id
 
 
-def approve(store: SQLiteStore, request_id: str, *, decision: str, note: str = "",
-            idea: str = "i1", memory=None) -> str:
+def _remember_approved_note(
+    memory,
+    note: str,
+    *,
+    workspace_id: str | None = None,
+    source_ids: tuple[str, ...] = (),
+) -> None:
+    """Write an approved note through either the V2 or legacy memory API.
+
+    Approval is already durable once its ledger event has been appended.  A
+    memory validation failure therefore must not turn a successful approval
+    into a 500; the helper is intentionally best effort.  Signature
+    inspection preserves the old ``remember_decision(memory, note)`` call for
+    integrations that still provide the V1 helper.
+    """
+
+    if memory is None or not note:
+        return
+    try:
+        from .memory.memstore import remember_decision
+
+        parameters: Mapping[str, inspect.Parameter]
+        try:
+            parameters = inspect.signature(remember_decision).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        supports_v2 = "workspace_id" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        if supports_v2:
+            decision_kwargs: dict[str, object] = {"workspace_id": workspace_id}
+            if "source_ids" in parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            ):
+                decision_kwargs["source_ids"] = source_ids
+            elif "provenance" in parameters:
+                decision_kwargs["provenance"] = source_ids
+            remember_decision(
+                memory,
+                note,
+                **decision_kwargs,
+            )
+        else:
+            # A V2 store may be paired with an older helper during a rolling
+            # upgrade.  Prefer its richer add API when available so the note
+            # still carries workspace/provenance rather than silently falling
+            # back to a global legacy record.
+            add = getattr(memory, "add", None)
+            add_parameters: Mapping[str, inspect.Parameter]
+            try:
+                add_parameters = inspect.signature(add).parameters if callable(add) else {}
+            except (TypeError, ValueError):
+                add_parameters = {}
+            add_supports_v2 = "workspace_id" in add_parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in add_parameters.values()
+            )
+            if add_supports_v2 and callable(add):
+                add_kwargs: dict[str, object] = {
+                    "kind": "decision",
+                    "workspace_id": workspace_id,
+                    "confidence": "explicit",
+                }
+                if "source_ids" in add_parameters or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in add_parameters.values()
+                ):
+                    add_kwargs["source_ids"] = source_ids
+                elif "provenance" in add_parameters:
+                    add_kwargs["provenance"] = source_ids
+                if "scope" in add_parameters:
+                    add_kwargs["scope"] = "project"
+                add(f"研究决定：{note}", **add_kwargs)
+            else:
+                remember_decision(memory, note)
+    except Exception:
+        # The grant/reject event remains the source of truth.  Memory is a
+        # reusable constraint layer and cannot block the auditable decision.
+        return
+
+
+def approve(
+    store: SQLiteStore,
+    request_id: str,
+    *,
+    decision: str,
+    note: str = "",
+    idea: str = "i1",
+    memory=None,
+    workspace_id: str | None = None,
+) -> str:
     """学者决定：approval.granted / rejected（持久化，可审计）。decision ∈ {approve,reject}。
 
     memory 可选：有 note 时记成"研究决定"记忆（约束后续，不作证据）。
@@ -65,12 +158,19 @@ def approve(store: SQLiteStore, request_id: str, *, decision: str, note: str = "
     kind = EVENT_APPROVAL_GRANT if decision == "approve" else EVENT_APPROVAL_REJECT
     if decision not in {"approve", "reject"}:
         raise ValueError("decision 必须是 approve|reject")
-    store.append(Event(idea_id=idea, event_type=kind, actor=ACTOR_USER, source=ACTOR_USER,
-                       payload={"request_id": request_id, "note": note}))
+    source_ids = (request_id,)
+    event_seq = store.append(Event(idea_id=idea, event_type=kind, actor=ACTOR_USER, source=ACTOR_USER,
+                                   payload={"request_id": request_id, "note": note,
+                                            "workspace_id": workspace_id,
+                                            "source_ids": list(source_ids),
+                                            "provenance": {"approval_request_id": request_id}}))
     if memory is not None and decision == "approve" and note:
-        from .memory.memstore import remember_decision
-
-        remember_decision(memory, note)
+        _remember_approved_note(
+            memory,
+            note,
+            workspace_id=workspace_id,
+            source_ids=(*source_ids, str(event_seq)),
+        )
     return kind
 
 
@@ -124,6 +224,7 @@ def cycle(
     record_user: bool = True,
     gate_mode: GateMode = GateMode.EXPLORE,
     token_cap: int | None = None,
+    workspace_id: str | None = None,
 ) -> CycleResult:
     """一次用户输入闭环。question=None 表示无新输入（纯自动推进）。"""
     if record_user and question:
@@ -132,7 +233,13 @@ def cycle(
 
     extra = literature_context(question or "", index) if index is not None else []
     if memory is not None:
-        extra = extra + memory.to_context()
+        try:
+            # V2 requires an explicit workspace for automatic injection.  A
+            # queryless legacy caller still receives its old projection when
+            # the store has no V2 keyword support.
+            extra = extra + memory.to_context(workspace_id=workspace_id)
+        except TypeError:
+            extra = extra + memory.to_context()
     turn = research_turn(store, provider, idea=idea, extra_context=extra, gate_mode=gate_mode,
                          token_cap=token_cap)
 
@@ -144,7 +251,13 @@ def cycle(
         for act, dec in zip(turn.proposal.acts, turn.decisions):
             if dec.verdict == "ask":
                 # 人工门：持久化请求并停下，学者决定后才继续
-                approval_request = _request_approval(store, idea, act, dec)
+                approval_request = _request_approval(
+                    store,
+                    idea,
+                    act,
+                    dec,
+                    workspace_id=workspace_id,
+                )
                 lines.append(f"需你决定：{act.act_type}（{dec.reason}）→ 请求 {approval_request}")
                 break
             if dec.verdict != "allow":
@@ -209,6 +322,7 @@ def run_until_gate(
     token_cap: int | None = None,
     auto_compact_every: int | None = None,
     autonomous: bool = False,
+    workspace_id: str | None = None,
 ) -> list[CycleResult]:
     """阶段内自动续轮（DD-02 §6）：spec 冻结后继续问模型，直到 ① 问用户 ② need_input/done
     ③ 一轮无推进 ④ 预算耗尽(budget.limit) ⑤ 健康检查不过。每一步全落 events。"""
@@ -231,8 +345,19 @@ def run_until_gate(
 
         q = question if step == 0 else None
         try:
-            res = cycle(store, idea, q, provider, executor=executor, index=index, memory=memory,
-                        record_user=q is not None, gate_mode=gate_mode, token_cap=token_cap)
+            res = cycle(
+                store,
+                idea,
+                q,
+                provider,
+                executor=executor,
+                index=index,
+                memory=memory,
+                record_user=q is not None,
+                gate_mode=gate_mode,
+                token_cap=token_cap,
+                workspace_id=workspace_id,
+            )
         except StopIteration:
             break  # 模型剧本用尽 = 该停下问用户（mock 语义）
         results.append(res)

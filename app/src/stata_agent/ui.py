@@ -12,6 +12,7 @@ and keeps the FastAPI layer small enough to hand over to the next maintainer.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import threading
@@ -316,6 +317,34 @@ def _validate_workspace_id(value: str | None) -> str:
     return raw
 
 
+def _canonical_workspace_root(idea: str = _IDEA) -> Path:
+    """Return the stable local project root used for memory partitioning.
+
+    The UI keeps several logical ideas in one SQLite ledger.  Consequently a
+    workspace identity must include the validated idea key as well as the
+    canonical ledger directory; using ``memory.json`` here would make a
+    process-wide storage detail accidentally define project identity.
+    """
+
+    validated = _validate_workspace_id(idea)
+    configured = os.environ.get("STATA_AGENT_PROJECT_ROOT", "").strip()
+    base = Path(configured).expanduser() if configured else Path(DEFAULT_DB).resolve().parent
+    return (base / validated).resolve()
+
+
+def _workspace_id(idea: str = _IDEA) -> str:
+    """Derive the opaque, deterministic V2 workspace id from its root."""
+
+    root = _canonical_workspace_root(idea)
+    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+# Descriptive alias for integrations that need to distinguish the opaque V2
+# identity from the legacy ``idea``/registry slug.
+_memory_workspace_id = _workspace_id
+
+
 def _read_workspace_registry() -> list[dict[str, Any]]:
     """Read the small local registry, creating the compatibility ``ui`` row."""
 
@@ -335,6 +364,7 @@ def _read_workspace_registry() -> list[dict[str, Any]]:
                     continue
                 rows.append({
                     "id": ident,
+                    "workspace_id": _workspace_id(ident),
                     "name": str(item.get("name") or ident)[:120],
                     "created_at": int(item.get("created_at") or 0),
                 })
@@ -391,6 +421,7 @@ def _workspace_entries(store: SQLiteStore) -> list[dict[str, Any]]:
         status, status_detail = _run_state(events, approvals)
         result.append({
             "id": idea,
+            "workspace_id": _workspace_id(idea),
             "name": (question or row.get("name") or idea)[:120],
             "created_at": row.get("created_at") or (events[0].created_at if events else None),
             "updated_at": events[-1].created_at if events else row.get("created_at"),
@@ -513,6 +544,38 @@ def _memory():
 
         return MemoryStore(path)
     except Exception:  # noqa: BLE001
+        return None
+
+
+def _context_budget():
+    """Build an optional ContextBudget from explicit environment overrides.
+
+    No override keeps the assembler's documented defaults.  Invalid operator
+    input is ignored here so a stale deployment variable cannot make the UI
+    fail before the loop has a chance to emit its normal budget error.
+    """
+
+    values: dict[str, int] = {}
+    env_map = {
+        "max_input_tokens": "STATA_AGENT_CONTEXT_MAX_INPUT_TOKENS",
+        "reserve_output_tokens": "STATA_AGENT_CONTEXT_RESERVE_OUTPUT_TOKENS",
+        "recent_tail_tokens": "STATA_AGENT_CONTEXT_RECENT_TAIL_TOKENS",
+        "memory_tokens": "STATA_AGENT_CONTEXT_MEMORY_TOKENS",
+    }
+    for field, env_name in env_map.items():
+        raw = os.environ.get(env_name, "").strip()
+        if raw:
+            try:
+                values[field] = int(raw)
+            except ValueError:
+                return None
+    if not values:
+        return None
+    try:
+        from .harness.context_assembler import ContextBudget
+
+        return ContextBudget(**values)
+    except (ImportError, AttributeError, TypeError, ValueError):
         return None
 
 
@@ -941,6 +1004,10 @@ def _summary(store: SQLiteStore, idea: str = _IDEA) -> dict[str, Any]:
         "runs": {k: v.status for k, v in sorted(proj.runs.items())},
         "events": len(events),
         "workspace_id": idea,
+        # ``workspace_id`` above is the legacy registry/ledger key.  Expose
+        # the opaque V2 identity separately so old clients remain compatible
+        # while memory/context consumers can audit their partition.
+        "memory_workspace_id": _workspace_id(idea),
         "workspace_name": workspace["name"],
         "workspace": workspace,
         # Read-only UI projection fields.
@@ -1077,7 +1144,12 @@ def create_workspace(body: WorkspaceIn):
             while f"{stem}-{suffix}" in used:
                 suffix += 1
             idea = f"{stem}-{suffix}"
-        row = {"id": idea, "name": name, "created_at": int(time.time() * 1000)}
+        row = {
+            "id": idea,
+            "workspace_id": _workspace_id(idea),
+            "name": name,
+            "created_at": int(time.time() * 1000),
+        }
         rows.append(row)
         _write_workspace_registry(rows)
     return {"workspace": {**row, "events": 0, "last_seq": None, "run_status": "idle", "pending_approvals": 0},
@@ -1318,6 +1390,7 @@ def _decision(
                 "request_id": request_id,
                 "approval_request_id": request_id,
                 "kind": "approval_revision",
+                "workspace_id": _workspace_id(idea),
             },
         ))
         store.append(Event(
@@ -1330,6 +1403,7 @@ def _decision(
                 "decision": "modify",
                 "note": note,
                 "kind": "approval_revision",
+                "workspace_id": _workspace_id(idea),
             },
         ))
         event_seq = store.append(Event(
@@ -1342,6 +1416,7 @@ def _decision(
                 "decision": "modify",
                 "note": note,
                 "kind": "approval_revision",
+                "workspace_id": _workspace_id(idea),
             },
         ))
         return {
@@ -1352,7 +1427,16 @@ def _decision(
         }
     if decision not in {"approve", "reject"}:
         raise HTTPException(status_code=422, detail="decision 必须是 approve|reject|modify。")
-    event_kind = runner_approve(store, request_id, decision=decision, note=note, idea=idea)
+    memory = _memory() if decision == "approve" and note else None
+    event_kind = runner_approve(
+        store,
+        request_id,
+        decision=decision,
+        note=note,
+        idea=idea,
+        memory=memory,
+        workspace_id=_workspace_id(idea),
+    )
     return {
         "decision": "approved" if decision == "approve" else "rejected",
         "event": event_kind,
@@ -1618,9 +1702,13 @@ def _run_chat_sync(
         provider = _provider()
         pm = _privacy_mode()
         executor = _executor(s)
+        workspace_id = _workspace_id(idea)
+        memory = _memory()
         ctx = ToolContext(
             idea=idea, store=s, executor=executor,
-            rag=_rag(), memory=_memory(),
+            workspace_id=workspace_id,
+            context_budget=_context_budget(),
+            rag=_rag(), memory=memory,
             run_root=(DEFAULT_DB.parent / "runs"),
             privacy_mode=pm,
             network_available=(pm != "local_strict"),

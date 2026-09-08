@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,6 +25,14 @@ class ToolContext:
     """工具执行所需的外部依赖（由 loop 注入；环境类信息不让模型填）。"""
 
     idea: str = "ui"
+    # Stable project identity used by ContextAssembler/MemoryStore V2.  Keep
+    # ``idea`` as the public ledger key for backward compatibility; this
+    # field deliberately has a separate name because an idea slug is not a
+    # durable filesystem/workspace identity.
+    workspace_id: str | None = None
+    # Optional ContextBudget instance (or a compatible object/dict).  The
+    # loop passes it to ContextAssembler; ``None`` selects its safe default.
+    context_budget: Any = None
     store: Any = None
     rag: Any = None           # HybridRetriever | None
     executor: Any = None      # StataExecutor | FakeExecutor | None
@@ -381,10 +389,38 @@ def _update_research_plan(args: dict, ctx: ToolContext) -> dict:
     note = str(args.get("note") or "").strip()
     if not note:
         return err("note 不能为空", type="missing_param")
-    if ctx.memory is None:
-        ctx.memory = None  # 降级：无记忆也不崩
     if ctx.memory is not None:
-        ctx.memory.add(note, kind="plan")
+        # Memory V2 accepts project scope/provenance while the old store only
+        # accepts ``add(text, kind=...)``.  Inspect the signature first so a
+        # validation TypeError from the new store is not mistaken for an old
+        # API and silently retried with the wrong scope.
+        add = getattr(ctx.memory, "add", None)
+        if callable(add):
+            # ``procedure`` is the V2 equivalent of the old free-form
+            # ``plan`` label.  Keep ``plan`` only on the legacy fallback.
+            kwargs: dict[str, object] = {"kind": "procedure"}
+            try:
+                parameters: Mapping[str, inspect.Parameter] = inspect.signature(add).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            v2_supported = "workspace_id" in parameters or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+            )
+            if v2_supported:
+                kwargs.update(
+                    workspace_id=ctx.workspace_id,
+                    confidence="inferred",
+                )
+            try:
+                add(note, **kwargs)
+            except TypeError:
+                # A callable with an opaque signature may still be the legacy
+                # store.  Preserve the established graceful-degradation path
+                # without swallowing other validation errors.
+                if not v2_supported:
+                    add(note, kind="plan")
+                else:
+                    raise
     return ok({"recorded": note})
 
 

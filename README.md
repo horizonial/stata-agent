@@ -35,7 +35,7 @@
 
 ## 2. 面试/工业级四维（已定设计，见 SPEC §4.9）
 
-- **上下文与记忆**：分层（线程状态 / 项目记忆 / 证据库 / 遥测）；工具大结果进事件表/证据库、上下文只放摘要；每 phase 写结论压缩上下文。金句：*agent 不靠记住，靠随时能查——RAG-over-own-history*。
+- **上下文与记忆**：V2 由 `ContextAssembler` 按固定层级、token budget 和 manifest 构造 projection；`compaction.boundary` 只追加 checkpoint、保留完整工具尾部；MemoryStore 按 canonical workspace 隔离并附 provenance（项目约定/决定是约束，不是证据）。工具大结果进事件表/证据库、上下文只放摘要。金句：*agent 不靠记住，靠随时能查——RAG-over-own-history*。
 - **安全**：外部输入（文献/数据/粘贴）不可信、与指令隔离（信任标签）；Stata 全走 MCP 受限模式不裸执行；**隐私三档模式**（v0.4）。金句：*最危险的是文献里的注入被当成你的指令，最隐蔽的是 fallback 偷偷变成数据出境*。
 - **异常/兜底**：每层失败有明确降级 + 幂等键（operation/attempt/语义哈希）+ 恢复协议（稳定阶段续跑、先核未决副作用再决定）+ validator 不硬出 + 预算超停。金句：*超时是"不知道成功没"，不是"肯定没成功"*。
 - **评测（杀手锏）**：实证有 ground truth —— **复现 ≥3 篇异质论文当 eval + 五层 L0–L4**（契约/组件/轨迹/单元格数值/专家盲评），遮蔽答案、防污染。金句：*通用 agent 苦于没标准答案；实证 agent 有——复现论文就是 eval，数字对不上就是失败*。

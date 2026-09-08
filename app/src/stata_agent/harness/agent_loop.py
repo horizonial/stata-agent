@@ -174,6 +174,292 @@ def _memory_context(ctx: ToolContext, limit: int = 6) -> list[str]:
         return []
 
 
+_CONTEXT_ASSEMBLED_EVENT = "context.assembled"
+
+
+class _LegacyContextBudgetExceeded(RuntimeError):
+    """Local fallback used only while the V2 context module is unavailable."""
+
+
+def _context_budget_error_type():
+    """Return the public V2 budget exception without hard-importing it.
+
+    The integration branch is intentionally mergeable before the context-core
+    branch.  Once that branch lands, this resolves to its public exception;
+    the tiny local type keeps old checkouts/tests importable in the interim.
+    """
+
+    try:
+        from .context_assembler import ContextBudgetExceeded
+
+        return ContextBudgetExceeded
+    except (ImportError, AttributeError):
+        return _LegacyContextBudgetExceeded
+
+
+def _raise_context_budget(message: str) -> None:
+    raise _context_budget_error_type()(message)
+
+
+def _is_context_budget_error(error: BaseException) -> bool:
+    error_type = _context_budget_error_type()
+    return isinstance(error, error_type) or "contextbudget" in type(error).__name__.lower()
+
+
+def _budget_limit(ctx: ToolContext) -> int | None:
+    """Resolve the provider-input budget from a V2 budget-like object."""
+
+    budget = getattr(ctx, "context_budget", None)
+    if budget is None:
+        return None
+    if isinstance(budget, dict):
+        maximum = budget.get("max_input_tokens")
+        reserve = budget.get("reserve_output_tokens", 0)
+    else:
+        maximum = getattr(budget, "max_input_tokens", None)
+        reserve = getattr(budget, "reserve_output_tokens", 0)
+    try:
+        value = int(maximum) - int(reserve)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else value
+
+
+def _message_tokens(message: dict) -> int:
+    from .safety import estimate_tokens
+
+    return estimate_tokens(_dump(message))
+
+
+def _ensure_current_user(messages: list[dict], user_text: str) -> list[dict]:
+    """Ensure the current user text occurs exactly once in an assembled list."""
+
+    matches = [
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") == "user" and str(message.get("content") or "") == user_text
+    ]
+    if not matches:
+        return [*messages, {"role": "user", "content": user_text}]
+    keep = matches[-1]
+    return [message for index, message in enumerate(messages) if index == keep or index not in matches]
+
+
+def _legacy_initial_messages(
+    store: SQLiteStore,
+    ctx: ToolContext,
+    user_text: str,
+    system_msg: str,
+    skills: list | None,
+) -> list[dict]:
+    """V1 projection fallback; never used after context-core is installed."""
+
+    fallback_system = system_msg
+    if skills:
+        skill_text = "\n\n".join(f"【当前任务方法论：{sk.slug}】\n{sk.body}" for sk in skills)
+        fallback_system += "\n\n" + skill_text
+    memory_lines = _memory_context(ctx)
+    if memory_lines:
+        fallback_system += "\n\n[bounded research memory; constraints, not evidence]\n" + "\n".join(memory_lines)
+    messages: list[dict] = [{"role": "system", "content": fallback_system}]
+    messages.extend(_history_messages(store, ctx.idea))
+    if not _current_user_is_recorded(store, ctx.idea, user_text):
+        messages.append({"role": "user", "content": user_text})
+    return _ensure_current_user(messages, user_text)
+
+
+def _assemble_initial_messages(
+    store: SQLiteStore,
+    ctx: ToolContext,
+    *,
+    user_text: str,
+    system_msg: str,
+    skills: list | None,
+) -> tuple[list[dict], Any]:
+    """Build the first provider projection through the V2 public API."""
+
+    try:
+        from .context_assembler import ContextAssembler
+    except (ImportError, AttributeError):
+        messages = _legacy_initial_messages(store, ctx, user_text, system_msg, skills)
+        limit = _budget_limit(ctx)
+        if limit is not None:
+            messages = _bounded_messages(messages, ctx, user_text=user_text)
+        return messages, None
+
+    assembled = ContextAssembler().assemble(
+        store=store,
+        ctx=ctx,
+        user_text=user_text,
+        system=system_msg,
+        skills=tuple(skills or ()),
+        budget=getattr(ctx, "context_budget", None),
+    )
+    messages = getattr(assembled, "messages", None)
+    if not isinstance(messages, list) or not all(isinstance(item, dict) for item in messages):
+        raise RuntimeError("ContextAssembler 返回了无效 messages")
+    return _ensure_current_user(list(messages), user_text), assembled
+
+
+def _record_context_manifest(store: SQLiteStore | None, ctx: ToolContext, assembled: Any) -> None:
+    """Append privacy-safe context assembly telemetry to the research ledger."""
+
+    if assembled is None:
+        return
+    items: list[dict[str, Any]] = []
+    for item in getattr(assembled, "manifest", ()) or ():
+        source_ids = getattr(item, "source_ids", ())
+        if isinstance(source_ids, str):
+            source_ids = (source_ids,)
+        elif not isinstance(source_ids, (list, tuple)):
+            source_ids = ()
+        items.append({
+            "layer": str(getattr(item, "layer", ""))[:80],
+            "source_ids": [str(source_id)[:160] for source_id in source_ids],
+            "estimated_tokens": int(getattr(item, "estimated_tokens", 0) or 0),
+            "truncated": bool(getattr(item, "truncated", False)),
+        })
+    _append_event(
+        store,
+        ctx,
+        _CONTEXT_ASSEMBLED_EVENT,
+        actor=ACTOR_ORCH,
+        source=ACTOR_ORCH,
+        payload={
+            "estimated_tokens": int(getattr(assembled, "estimated_tokens", 0) or 0),
+            "compacted_through_seq": getattr(assembled, "compacted_through_seq", None),
+            "items": items,
+        },
+    )
+
+
+def _bounded_messages(messages: list[dict], ctx: ToolContext, *, user_text: str) -> list[dict]:
+    """Keep a later provider request within the input budget.
+
+    The assembler owns the semantic first projection.  This local guard is
+    only for ephemeral tool-call/result messages created during the current
+    loop.  It greedily keeps the newest complete units and never keeps one
+    side of an assistant-tool pair.
+    """
+
+    limit = _budget_limit(ctx)
+    if limit is None:
+        return messages
+    if limit <= 0:
+        _raise_context_budget("context budget 必须大于 reserve_output_tokens")
+
+    system_indices = [index for index, message in enumerate(messages) if message.get("role") == "system"]
+    mandatory: set[int] = set(system_indices[:1])
+    user_indices = [
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") == "user"
+        and (user_text == "" or str(message.get("content") or "") == user_text)
+    ]
+    if user_indices:
+        mandatory.add(user_indices[-1])
+    elif messages:
+        # A custom caller may provide no exact match; the final user message
+        # remains the safest current-turn anchor.
+        mandatory.add(next((index for index in range(len(messages) - 1, -1, -1)
+                           if messages[index].get("role") == "user"), len(messages) - 1))
+
+    used = sum(_message_tokens(messages[index]) for index in mandatory)
+    if used > limit:
+        _raise_context_budget("system instructions and current user message exceed context budget")
+
+    # Build complete units, grouping an assistant tool call with all
+    # contiguous tool results.  A unit containing a mandatory item is left in
+    # place and cannot be partially selected.
+    units: list[list[int]] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            end = index + 1
+            while end < len(messages) and messages[end].get("role") == "tool":
+                end += 1
+            units.append(list(range(index, end)))
+            index = end
+        else:
+            units.append([index])
+            index += 1
+
+    selected = set(mandatory)
+    # Newest complete interactions have higher value than stale tail items.
+    for unit in reversed(units):
+        if any(item in mandatory for item in unit):
+            continue
+        unit_tokens = sum(_message_tokens(messages[item]) for item in unit)
+        if used + unit_tokens <= limit:
+            selected.update(unit)
+            used += unit_tokens
+
+    return [message for index, message in enumerate(messages) if index in selected]
+
+
+def _is_provider_overflow(error: BaseException) -> bool:
+    """Conservative provider overflow classifier for heterogeneous SDK errors."""
+
+    name = type(error).__name__.lower()
+    details = " ".join(
+        str(getattr(error, attribute, "") or "")
+        for attribute in ("code", "error_code", "status_code", "status", "type", "reason")
+    )
+    text = f"{error} {details}".lower()
+    marker = (
+        "context_length_exceeded",
+        "context length",
+        "maximum context",
+        "maximum tokens",
+        "max context",
+        "max_tokens",
+        "prompt is too long",
+        "prompt too long",
+        "prompt length",
+        "too many tokens",
+        "input token",
+        "token limit",
+        "input is too long",
+        "request too large",
+        "request_too_large",
+        "payload too large",
+        "length limit",
+        "413",
+    )
+    return any(value in name or value in text for value in marker)
+
+
+def _compact_and_reassemble(
+    store: SQLiteStore,
+    ctx: ToolContext,
+    *,
+    user_text: str,
+    system_msg: str,
+    skills: list | None,
+    previous_ephemeral: list[dict],
+) -> tuple[list[dict], Any] | None:
+    """Compact once and rebuild a fresh projection for an overflow retry."""
+
+    try:
+        from . import compaction as compaction_module
+    except ImportError:
+        return None
+    try:
+        compaction_module.compact(store, ctx.idea, reason="token_pressure")
+        messages, assembled = _assemble_initial_messages(
+            store,
+            ctx,
+            user_text=user_text,
+            system_msg=system_msg,
+            skills=skills,
+        )
+        messages.extend(previous_ephemeral)
+        return messages, assembled
+    except Exception:
+        return None
+
+
 def _provider_name(provider: Any) -> str:
     value = getattr(provider, "provider", None)
     if value:
@@ -289,17 +575,30 @@ def run_loop(
         "回复风格：直接、简短、紧扣用户问题；不要主动罗列能力清单或反复自我介绍；"
         "只有用户明确问'你能做什么'才简要列举。空泛输入（你好/在吗）一句话回应即可。"
     )
-    if skills:
-        skill_text = "\n\n".join(f"【当前任务方法论：{sk.slug}】\n{sk.body}" for sk in skills)
-        system_msg += "\n\n" + skill_text
-    memory_lines = _memory_context(ctx)
-    if memory_lines:
-        system_msg += "\n\n[bounded research memory; constraints, not evidence]\n" + "\n".join(memory_lines)
-
-    messages: list[dict] = [{"role": "system", "content": system_msg}]
-    messages.extend(_history_messages(store, ctx.idea))
-    if not _current_user_is_recorded(store, ctx.idea, user_text):
-        messages.append({"role": "user", "content": user_text})
+    # ContextAssembler is the sole owner of the first projection.  The
+    # fallback retains the pre-V2 projection until the context-core branch is
+    # merged, while the public API and all call sites stay identical.
+    try:
+        messages, assembled = _assemble_initial_messages(
+            store,
+            ctx,
+            user_text=user_text,
+            system_msg=system_msg,
+            skills=skills,
+        )
+    except Exception as exc:  # noqa: BLE001 - context errors are fail-closed
+        if _is_context_budget_error(exc):
+            return _budget_finish(
+                store,
+                ctx,
+                reason="context_budget",
+                limit=_budget_limit(ctx) or 0,
+                tool_calls=0,
+                message="（上下文超过本轮预算，未调用模型。请缩短输入或先完成当前步骤。）",
+            )
+        return _finish(store, ctx, reply="上下文组装失败，本轮未调用模型。", reason="context_error")
+    _record_context_manifest(store, ctx, assembled)
+    initial_message_count = len(messages)
 
     active: dict[str, Tool] = {}
     for name, tool in tools.items():
@@ -318,6 +617,8 @@ def run_loop(
     enforcer = ToolEnforcer(active)
     tool_calls = 0
     recent_stata: list[str] = []
+    overflow_retry_used = False
+    first_provider_call = True
 
     try:
         step_limit = max(0, int(max_steps))
@@ -344,7 +645,25 @@ def run_loop(
                 reason="cancelled",
             )
         content, calls = None, None
-        prompt_messages = sanitize_messages(messages, mode=effective_mode, provider=provider_name)
+        try:
+            prompt_source = messages
+            if not first_provider_call:
+                # Keep the unbounded in-memory transcript for a possible
+                # overflow retry; only the request projection is reduced.
+                prompt_source = _bounded_messages(messages, ctx, user_text=user_text)
+            prompt_messages = sanitize_messages(prompt_source, mode=effective_mode, provider=provider_name)
+        except Exception as exc:  # noqa: BLE001 - budget failures must stop before I/O
+            if _is_context_budget_error(exc):
+                return _budget_finish(
+                    store,
+                    ctx,
+                    reason="context_budget",
+                    limit=_budget_limit(ctx) or 0,
+                    tool_calls=tool_calls,
+                    message="（工具结果使上下文超过本轮预算，已安全停下。请继续追问。）",
+                )
+            return _finish(store, ctx, reply="上下文组装失败，本轮未调用模型。", tool_calls=tool_calls,
+                           reason="context_error")
         try:
             raise_if_cancelled(token)
             if on_event and hasattr(provider, "stream_chat"):
@@ -379,7 +698,38 @@ def run_loop(
                 reason="cancelled",
             )
         except Exception as exc:  # noqa: BLE001 - provider failures are terminal and ledgered
-            return _finish(store, ctx, reply=f"模型调用失败，本轮未完成：{str(exc)[:200]}", reason="provider_error")
+            if _is_provider_overflow(exc) and not overflow_retry_used:
+                overflow_retry_used = True
+                previous_ephemeral = messages[initial_message_count:]
+                rebuilt = _compact_and_reassemble(
+                    store,
+                    ctx,
+                    user_text=user_text,
+                    system_msg=system_msg,
+                    skills=skills,
+                    previous_ephemeral=previous_ephemeral,
+                )
+                if rebuilt is not None:
+                    messages, assembled = rebuilt
+                    initial_message_count = len(messages) - len(previous_ephemeral)
+                    _record_context_manifest(store, ctx, assembled)
+                    # The retry is still the same bounded provider step.  A
+                    # second overflow is terminal by construction.
+                    first_provider_call = False
+                    continue
+            if _is_context_budget_error(exc):
+                return _budget_finish(
+                    store,
+                    ctx,
+                    reason="context_budget",
+                    limit=_budget_limit(ctx) or 0,
+                    tool_calls=tool_calls,
+                    message="（上下文超过本轮预算，未继续调用模型。）",
+                )
+            return _finish(store, ctx, reply=f"模型调用失败，本轮未完成：{str(exc)[:200]}",
+                           tool_calls=tool_calls, reason="provider_error")
+
+        first_provider_call = False
 
         if not calls:
             return _finish(store, ctx, reply=content or "", tool_calls=tool_calls, reason="model_stop")

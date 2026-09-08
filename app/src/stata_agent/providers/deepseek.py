@@ -12,12 +12,15 @@ import urllib.request
 
 from ..domain.action import ActionProposal
 from .capabilities import ModelCapabilityProfile, deepseek_chat_profile
-from .codec import proposal_prompt
 from .llm import chat_proposal
 
 
 class MissingApiKey(RuntimeError):
     pass
+
+
+class StreamProtocolError(RuntimeError):
+    """The provider closed a stream without a complete terminal response."""
 
 
 class DeepSeekProvider:
@@ -85,7 +88,29 @@ class DeepSeekProvider:
         return {"content": content, "tool_calls": calls or None}
 
     def _json_chat(self, messages: list[dict]) -> str:
-        return self.chat(messages, json_mode=True)
+        """Adapt the tool-oriented ``chat`` dict to ``chat_proposal``'s text API."""
+
+        response = self.chat(messages, json_mode=True)
+        if isinstance(response, str):
+            return response
+        if not isinstance(response, dict):
+            from .codec import StructuredOutputError
+
+            raise StructuredOutputError("provider chat response must be an object")
+        content = response.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, (dict, list)):
+            return json.dumps(content, ensure_ascii=False)
+        # Some OpenAI-compatible adapters expose the structured object under
+        # ``json`` rather than ``content``; support it without accepting an
+        # arbitrary response as a successful proposal.
+        structured = response.get("json")
+        if isinstance(structured, (dict, list)):
+            return json.dumps(structured, ensure_ascii=False)
+        from .codec import StructuredOutputError
+
+        raise StructuredOutputError("provider response has no structured content")
 
     def propose(self, context: str) -> ActionProposal:
         # 直接复用 chat_proposal 的结构化收敛 + schema 重试（此路径开 json）
@@ -111,6 +136,8 @@ class DeepSeekProvider:
         )
         content_parts: list[str] = []
         calls_by_idx: dict[int, dict] = {}
+        saw_done_marker = False
+        finish_reason: str | None = None
         with urllib.request.urlopen(req, timeout=self._timeout) as resp:
             for raw in resp:
                 line = raw.decode("utf-8", errors="replace").strip()
@@ -118,12 +145,19 @@ class DeepSeekProvider:
                     continue
                 data = line[len("data:"):].strip()
                 if data == "[DONE]":
+                    saw_done_marker = True
                     break
                 try:
                     obj = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                delta = (obj.get("choices") or [{}])[0].get("delta") or {}
+                except json.JSONDecodeError as exc:
+                    raise StreamProtocolError(f"stream chunk 不是合法 JSON：{exc.msg}") from exc
+                choices = obj.get("choices") or []
+                if not choices:
+                    raise StreamProtocolError("stream chunk 缺少 choices")
+                choice = choices[0] or {}
+                if choice.get("finish_reason") is not None:
+                    finish_reason = str(choice.get("finish_reason"))
+                delta = choice.get("delta") or {}
                 if delta.get("content"):
                     content_parts.append(delta["content"])
                     yield {"type": "text_delta", "text": delta["content"]}
@@ -135,14 +169,22 @@ class DeepSeekProvider:
                     fn = tc.get("function") or {}
                     entry["name"] += fn.get("name") or ""
                     entry["args"] += fn.get("arguments") or ""
+        if not saw_done_marker:
+            raise StreamProtocolError("stream 异常 EOF：缺少 [DONE]")
+        if finish_reason not in {"stop", "tool_calls"}:
+            raise StreamProtocolError(
+                f"stream 未正常结束（finish_reason={finish_reason!r}）"
+            )
         content = "".join(content_parts) or None
         calls = []
         for idx in sorted(calls_by_idx):
             e = calls_by_idx[idx]
             try:
                 args = json.loads(e["args"] or "{}")
-            except json.JSONDecodeError:
-                args = {}
+            except json.JSONDecodeError as exc:
+                raise StreamProtocolError(
+                    f"tool call {e['name']!r} arguments 不是合法 JSON"
+                ) from exc
             calls.append({"id": e["id"], "name": e["name"], "arguments": args})
         yield {"type": "done", "content": content, "tool_calls": calls or None}
 

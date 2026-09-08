@@ -11,7 +11,7 @@ from stata_agent.domain.action import ActionProposal
 from stata_agent.providers.capabilities import deepseek_chat_profile, from_file, to_file
 from stata_agent.providers.codec import StructuredOutputError, parse_proposal
 from stata_agent.providers.contract import check_all, run_checks
-from stata_agent.providers.deepseek import DeepSeekProvider, MissingApiKey
+from stata_agent.providers.deepseek import DeepSeekProvider, MissingApiKey, StreamProtocolError
 from stata_agent.providers.fake import FakeChat
 from stata_agent.providers.llm import chat_proposal
 from stata_agent.providers.mock import MockFixedProvider
@@ -65,6 +65,49 @@ def test_deepseek_missing_key_raises(monkeypatch):
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     with pytest.raises(MissingApiKey):
         DeepSeekProvider(api_key=None)
+
+
+def test_unknown_privacy_mode_is_fail_closed(monkeypatch):
+    from stata_agent.providers.registry import PrivacyBlock, live_available, privacy_mode
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("STATA_AGENT_PRIVACY", "typo_that_must_not_enable_remote")
+    assert privacy_mode() == "local_strict"
+    assert live_available() is False
+    with pytest.raises(PrivacyBlock):
+        from stata_agent.providers.registry import default_provider
+
+        default_provider()
+
+
+def test_deepseek_propose_adapts_chat_dict_to_structured_text():
+    provider = DeepSeekProvider(api_key="test-key")
+    provider.chat = lambda messages, **kwargs: {
+        "content": {"decision_summary": "ok", "acts": [], "ask_user": None},
+        "tool_calls": None,
+    }
+    proposal = provider.propose("phase=IDEA")
+    assert isinstance(proposal, ActionProposal)
+    assert proposal.decision_summary == "ok"
+
+
+def test_stream_protocol_rejects_abnormal_eof(monkeypatch):
+    provider = DeepSeekProvider(api_key="test-key")
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __iter__(self):
+            # No [DONE] and no finish_reason: this is a truncated response.
+            yield b'data: {"choices":[{"delta":{"content":"half"},"finish_reason":null}]}\n'
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: Response())
+    with pytest.raises(StreamProtocolError):
+        list(provider.stream_chat([{"role": "user", "content": "x"}]))
 
 
 def test_contract_checks_on_mock():

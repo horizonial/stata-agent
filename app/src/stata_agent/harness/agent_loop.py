@@ -1,10 +1,9 @@
-"""通用 agent loop（agent-tool-routing.md §2）：LLM + function calling，自主多步。
+"""通用 agent loop（LLM + function calling，自主多步）。
 
-替换 research_turn：聊天是默认（模型不调工具直接回文本）；要做事就调工具。
-护栏在工具执行前：validator（名字/参数在注册表）→ policy（隐私/写类允许）。
-每步落 events（agent_step / tool.call / tool.result），Trace 可回放。
-
-返回：最终文本回复（模型自判停）或 ask_user 的问题。
+This is the single tool-routing path used by the UI.  The model may propose a
+tool, but :class:`ToolEnforcer` is the only component allowed to validate or
+execute it.  Every normal, failed, or budget-limited termination is recorded
+as an ``agent_step`` so the loop is replayable from the ledger.
 """
 
 from __future__ import annotations
@@ -13,15 +12,23 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..events.schema import (
-    EVENT_AGENT_STEP,
-    EVENT_TOOL_INVOKED,
-    EVENT_TOOL_DONE,
     ACTOR_AGENT,
     ACTOR_ORCH,
+    EVENT_AGENT_STEP,
+    EVENT_BUDGET,
+    EVENT_TOOL_DONE,
+    EVENT_TOOL_INVOKED,
     Event,
+)
+from ..privacy.modes import (
+    LOCAL_STRICT,
+    normalize_mode,
+    remote_llm_allowed,
+    sanitize_messages,
 )
 from ..storage.sqlite_store import SQLiteStore
 from ..toolkit import Tool, ToolContext
+from .tool_enforcer import ToolEnforcer, normalize_arguments
 
 
 @dataclass
@@ -36,33 +43,146 @@ class LoopResult:
 
 
 class Guard:
-    """工具执行前护栏：validator（未知工具拒绝，防现造工具）。
+    """Backward-compatible facade for callers that imported the old Guard.
 
-    更细的 policy/隐私/审批在工具 handler 内部与后续层判定；本层先保证"只能调注册表里的工具"。
+    New code should use :class:`ToolEnforcer` directly.  Keeping this facade
+    avoids breaking integrations while ensuring they get the same checks.
     """
 
     def __init__(self, tools: dict[str, Tool]):
-        self.tools = tools
+        self.enforcer = ToolEnforcer(tools)
 
-    def validate(self, name: str, arguments: dict) -> str | None:
-        """返回 None=通过；否则错误字符串。"""
-        if name not in self.tools:
-            return f"未知工具 {name!r}（只能调用已注册工具，不许现造）"
-        return None
+    def validate(self, name: str, arguments: Any, ctx: ToolContext | None = None) -> str | None:
+        return self.enforcer.validate(name, arguments, ctx)
 
 
 def _history_messages(store: SQLiteStore, idea: str, limit: int = 16) -> list[dict]:
-    """把账本投影成 OpenAI 消息（历史）。只取 user/assistant 文本，工具结果不塞历史。"""
+    """把账本投影成 OpenAI 消息（只取 user/assistant 文本）。"""
+
     out: list[dict] = []
-    for e in store.scan(idea):
-        p = e.payload or {}
-        if e.event_type == "user.message":
-            out.append({"role": "user", "content": str(p.get("text") or "")})
-        elif e.event_type == EVENT_AGENT_STEP and not p.get("tool_call"):
-            content = str(p.get("ask") or p.get("reply") or p.get("decision_summary") or "")
+    for event in store.scan(idea):
+        payload = event.payload or {}
+        if event.event_type == "user.message":
+            out.append({"role": "user", "content": str(payload.get("text") or "")})
+        elif event.event_type == EVENT_AGENT_STEP and not payload.get("tool_call"):
+            content = str(payload.get("ask") or payload.get("reply") or payload.get("decision_summary") or "")
             if content:
                 out.append({"role": "assistant", "content": content})
     return out[-limit:]
+
+
+def _current_user_is_recorded(store: SQLiteStore, idea: str, text: str) -> bool:
+    """Detect the UI's pre-appended user event without deduplicating old turns."""
+
+    try:
+        events = list(store.scan(idea))
+    except Exception:  # noqa: BLE001
+        return False
+    if not events or events[-1].event_type != "user.message":
+        return False
+    return str((events[-1].payload or {}).get("text") or "") == text
+
+
+def _phase(store: SQLiteStore, ctx: ToolContext) -> str | None:
+    phase = getattr(ctx, "phase", None)
+    if phase is not None:
+        return getattr(phase, "value", str(phase))
+    try:
+        return store.project(ctx.idea).phase
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _append_event(store: SQLiteStore | None, ctx: ToolContext, event_type: str, *,
+                  actor: str, source: str, payload: dict) -> None:
+    """Best-effort event append used by terminal paths and telemetry hooks."""
+
+    if store is None:
+        return
+    try:
+        store.append(Event(
+            idea_id=ctx.idea,
+            event_type=event_type,
+            actor=actor,
+            source=source,
+            phase=_phase(store, ctx),
+            payload=payload,
+        ))
+    except Exception:
+        # A caller may be using a read-only/replay store.  Never hide the
+        # model/tool result behind a secondary ledger failure.
+        return
+
+
+def _finish(store: SQLiteStore | None, ctx: ToolContext, *, reply: str | None = None,
+            ask: str | None = None, tool_calls: int = 0, reason: str | None = None) -> LoopResult:
+    payload: dict[str, Any] = {}
+    if reply is not None:
+        payload["reply"] = reply
+    if ask is not None:
+        payload["ask"] = ask
+    if reason:
+        payload["terminal_reason"] = reason
+    _append_event(store, ctx, EVENT_AGENT_STEP, actor=ACTOR_AGENT, source=ACTOR_AGENT, payload=payload)
+    return LoopResult(reply=reply, ask=ask, tool_calls=tool_calls)
+
+
+def _budget_finish(store: SQLiteStore | None, ctx: ToolContext, *, reason: str,
+                   limit: int, tool_calls: int, message: str) -> LoopResult:
+    _append_event(
+        store,
+        ctx,
+        EVENT_BUDGET,
+        actor=ACTOR_ORCH,
+        source=ACTOR_ORCH,
+        payload={"kind": reason, "limit": limit, "tool_calls": tool_calls},
+    )
+    return _finish(store, ctx, reply=message, tool_calls=tool_calls, reason=reason)
+
+
+def _memory_context(ctx: ToolContext, limit: int = 6) -> list[str]:
+    memory = getattr(ctx, "memory", None)
+    if memory is None or not hasattr(memory, "to_context"):
+        return []
+    try:
+        return [str(item)[:1200] for item in memory.to_context(max_items=limit)]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _provider_name(provider: Any) -> str:
+    value = getattr(provider, "provider", None)
+    if value:
+        return str(value).strip().lower()
+    return provider.__class__.__name__.strip().lower()
+
+
+def _assistant_tool_message(calls: list[dict]) -> dict:
+    encoded: list[dict] = []
+    for index, call in enumerate(calls):
+        if not isinstance(call, dict):
+            call = {}
+        arguments = call.get("arguments")
+        if isinstance(arguments, str):
+            argument_text = arguments
+        else:
+            argument_text = _dump(arguments if arguments is not None else {})
+        encoded.append({
+            "id": call.get("id") or f"agent-tool-{index}",
+            "type": "function",
+            "function": {
+                "name": str(call.get("name") or ""),
+                "arguments": argument_text,
+            },
+        })
+    return {"role": "assistant", "content": None, "tool_calls": encoded}
+
+
+def _tool_context_text(tool: Tool | None, result: dict) -> str:
+    try:
+        return tool.result_to_context(result) if tool else _stringify(result)
+    except Exception as exc:  # noqa: BLE001
+        return f"工具结果摘要失败：{exc}"
 
 
 def run_loop(
@@ -74,18 +194,35 @@ def run_loop(
     user_text: str,
     system: str | None = None,
     max_steps: int = 12,
-    privacy_mode: str = "local_strict",
+    max_tool_calls: int = 32,
+    privacy_mode: str | None = None,
     skills: list | None = None,
     on_event=None,
 ) -> LoopResult:
-    """通用循环。provider.chat(messages, tools=[...]) 返回 {content, tool_calls}。
+    """Run a bounded function-calling loop.
 
-    skills：匹配到的方法论（Skill，决策层）。全文注入 system，allowed_tools 约束工具池。
-    on_event：可选回调 callable(dict)，流式接收统一 AgentEvent：
-      {"type":"text_delta","text":...} / {"type":"tool_started","name":...} / {"type":"tool_completed","name":...}
+    ``max_steps`` bounds provider turns; ``max_tool_calls`` bounds individual
+    calls even when one provider response contains a large batch.  The latter
+    is intentionally separate so a single malformed response cannot evade the
+    budget by packing 100 calls into one step.
     """
+
+    effective_mode = privacy_mode if privacy_mode is not None else getattr(ctx, "privacy_mode", LOCAL_STRICT)
+    try:
+        effective_mode = normalize_mode(effective_mode)
+    except Exception as exc:  # noqa: BLE001 - unknown mode is a hard stop
+        return _finish(store, ctx, reply=f"隐私模式无效，已拒绝本轮：{exc}", reason="privacy_denied")
+
+    provider_name = _provider_name(provider)
+    if not remote_llm_allowed(effective_mode, provider_name):
+        return _finish(
+            store,
+            ctx,
+            reply="当前 local_strict 不允许把研究内容发送到远端模型。",
+            reason="privacy_denied",
+        )
     if not hasattr(provider, "chat"):
-        return LoopResult(reply="（当前 provider 不支持工具调用，仅能聊天。）")
+        return _finish(store, ctx, reply="（当前 provider 不支持工具调用，仅能聊天。）", reason="provider_unsupported")
 
     system_msg = system or (
         "你是 stata-agent，一个实证研究 agent。你由本项目自主搭建，"
@@ -98,106 +235,165 @@ def run_loop(
         "效率规则：run_stata 一旦返回了结果（含机器层数值），就是成功，"
         "不要重跑相同命令；拿到的结果够用就推进下一步（如 write_draft 出稿或换稳健性变体）。"
     )
-    # 决策层注入 Skill 方法论（全文）
     if skills:
-        skill_text = "\n\n".join(
-            f"【当前任务方法论：{sk.slug}】\n{sk.body}" for sk in skills)
-        system_msg = system_msg + "\n\n" + skill_text
+        skill_text = "\n\n".join(f"【当前任务方法论：{sk.slug}】\n{sk.body}" for sk in skills)
+        system_msg += "\n\n" + skill_text
+    memory_lines = _memory_context(ctx)
+    if memory_lines:
+        system_msg += "\n\n[bounded research memory; constraints, not evidence]\n" + "\n".join(memory_lines)
 
     messages: list[dict] = [{"role": "system", "content": system_msg}]
     messages.extend(_history_messages(store, ctx.idea))
-    messages.append({"role": "user", "content": user_text})
+    if not _current_user_is_recorded(store, ctx.idea, user_text):
+        messages.append({"role": "user", "content": user_text})
 
-    # 动态暴露：enabled(ctx) 为真，且被当前 Skill 允许（若 Skill 声明了 allowed_tools）
-    active = {name: t for name, t in tools.items() if t.enabled(ctx)}
+    active: dict[str, Tool] = {}
+    for name, tool in tools.items():
+        try:
+            if tool.enabled(ctx):
+                active[name] = tool
+        except Exception:
+            continue
     if skills:
-        allowed = set()
-        for sk in skills:
-            allowed.update(sk.allowed_tools)
+        allowed: set[str] = set()
+        for skill in skills:
+            allowed.update(getattr(skill, "allowed_tools", ()) or ())
         if allowed:
-            active = {name: t for name, t in active.items() if name in allowed or name == "ask_user"}
-    tool_schemas = [t.as_openai() for t in active.values()]
-    guard = Guard(active)
+            active = {name: tool for name, tool in active.items() if name in allowed or name == "ask_user"}
+    tool_schemas = [tool.as_openai() for tool in active.values()]
+    enforcer = ToolEnforcer(active)
     tool_calls = 0
-    recent_stata: list[str] = []  # 防循环：记录最近 run_stata 的 code
+    recent_stata: list[str] = []
 
-    for _step in range(max_steps):
+    try:
+        step_limit = max(0, int(max_steps))
+        call_limit = max(0, int(max_tool_calls))
+    except (TypeError, ValueError):
+        return _finish(store, ctx, reply="预算参数无效，已拒绝本轮。", reason="budget_invalid")
+    if step_limit == 0:
+        return _budget_finish(
+            store,
+            ctx,
+            reason="max_steps",
+            limit=step_limit,
+            tool_calls=tool_calls,
+            message="（达到本轮步数上限，已停下。可继续追问。）",
+        )
+
+    for _step in range(step_limit):
         content, calls = None, None
-        if on_event and hasattr(provider, "stream_chat"):
-            for ev in provider.stream_chat(messages, tools=tool_schemas):
-                if ev["type"] == "text_delta":
-                    on_event({"type": "text_delta", "text": ev["text"]})
-                elif ev["type"] == "done":
-                    content, calls = ev["content"], ev["tool_calls"]
-        else:
-            resp = provider.chat(messages, tools=tool_schemas)
-            content, calls = resp.get("content"), resp.get("tool_calls")
+        prompt_messages = sanitize_messages(messages, mode=effective_mode, provider=provider_name)
+        try:
+            if on_event and hasattr(provider, "stream_chat"):
+                stream_done = False
+                for event in provider.stream_chat(prompt_messages, tools=tool_schemas):
+                    if not isinstance(event, dict):
+                        raise RuntimeError("provider stream event 不是 object")
+                    event_type = event.get("type")
+                    if event_type == "text_delta":
+                        if on_event:
+                            on_event({"type": "text_delta", "text": event.get("text") or ""})
+                    elif event_type == "done":
+                        stream_done = True
+                        content, calls = event.get("content"), event.get("tool_calls")
+                    elif event_type == "error":
+                        raise RuntimeError(str(event.get("message") or "provider stream error"))
+                if not stream_done:
+                    raise RuntimeError("provider stream 异常 EOF：缺少 done")
+            else:
+                response = provider.chat(prompt_messages, tools=tool_schemas)
+                if not isinstance(response, dict):
+                    raise RuntimeError("provider response 不是 object")
+                content, calls = response.get("content"), response.get("tool_calls")
+        except Exception as exc:  # noqa: BLE001 - provider failures are terminal and ledgered
+            return _finish(store, ctx, reply=f"模型调用失败，本轮未完成：{str(exc)[:200]}", reason="provider_error")
 
         if not calls:
-            # 最终文本回复
-            store.append(Event(idea_id=ctx.idea, event_type=EVENT_AGENT_STEP, actor=ACTOR_AGENT,
-                               source=ACTOR_AGENT, phase=ctx.store.project(ctx.idea).phase,
-                               payload={"reply": content or ""}))
-            return LoopResult(reply=content or "", tool_calls=tool_calls)
+            return _finish(store, ctx, reply=content or "", tool_calls=tool_calls, reason="model_stop")
+        if not isinstance(calls, list):
+            return _finish(store, ctx, reply="模型返回的工具调用格式无效。", tool_calls=tool_calls, reason="invalid_tool_calls")
 
-        # 有工具调用：逐条护栏 + 执行 + 回填
-        # assistant 消息的 tool_calls 必须用 OpenAI 格式（arguments 是 JSON 字符串）
-        assistant_msg = {
-            "role": "assistant",
-            "content": content,
-            "tool_calls": [
-                {"id": c["id"], "type": "function",
-                 "function": {"name": c["name"], "arguments": _dump(c.get("arguments") or {})}}
-                for c in calls
-            ],
-        }
-        messages.append(assistant_msg)
-        for call in calls:
-            name, args = call["name"], call.get("arguments") or {}
-            # 防循环护栏：连续 3 次相同 run_stata 代码 → 中断（确定性，不靠模型自觉）
-            if name == "run_stata":
-                sig = _dump(args.get("code") or "")
-                if sig and len(recent_stata) >= 2 and recent_stata[-1] == sig and recent_stata[-2] == sig:
-                    store.append(Event(idea_id=ctx.idea, event_type=EVENT_AGENT_STEP, actor=ACTOR_AGENT,
-                                       source=ACTOR_AGENT, phase=ctx.store.project(ctx.idea).phase,
-                                       payload={"reply": "该回归已运行过且结果已签入证据链，无需重跑。"}))
-                    return LoopResult(
+        remaining = call_limit - tool_calls
+        if remaining <= 0:
+            return _budget_finish(
+                store,
+                ctx,
+                reason="tool_calls",
+                limit=call_limit,
+                tool_calls=tool_calls,
+                message="（达到本轮工具调用上限，已停下。可继续追问。）",
+            )
+        selected = calls[:remaining]
+        messages.append(_assistant_tool_message(selected))
+        for index, raw_call in enumerate(selected):
+            call = raw_call if isinstance(raw_call, dict) else {}
+            name = str(call.get("name") or "")
+            raw_args = call.get("arguments") if "arguments" in call else {}
+            args, _arg_error = normalize_arguments(raw_args)
+            if name == "run_stata" and args is not None:
+                signature = _dump(args.get("code") or "")
+                if signature and len(recent_stata) >= 2 and recent_stata[-1] == signature and recent_stata[-2] == signature:
+                    return _finish(
+                        store,
+                        ctx,
                         reply="主回归已运行，结果已签入证据链。请继续：write_draft 出初稿，或换稳健性变体（不要重跑相同命令）。",
-                        tool_calls=tool_calls)
-                recent_stata.append(sig)
+                        tool_calls=tool_calls,
+                        reason="duplicate_run_blocked",
+                    )
+                if signature:
+                    recent_stata.append(signature)
+
             tool = active.get(name)
-            err = guard.validate(name, args)
             if on_event:
                 on_event({"type": "tool_started", "name": name})
-            store.append(Event(idea_id=ctx.idea, event_type=EVENT_TOOL_INVOKED, actor=ACTOR_ORCH,
-                               source=ACTOR_ORCH, phase=ctx.store.project(ctx.idea).phase,
-                               payload={"tool": name, "args": args, "allowed": err is None}))
-            if err:
-                result = {"ok": False, "error": {"type": "guard", "message": err}}
-            else:
-                try:
-                    result = tool.handler(args, ctx)
-                except Exception as e:  # noqa: BLE001
-                    result = {"ok": False, "error": {"type": "tool_error", "message": str(e)[:200]}}
+            _append_event(
+                store,
+                ctx,
+                EVENT_TOOL_INVOKED,
+                actor=ACTOR_ORCH,
+                source=ACTOR_ORCH,
+                payload={"tool": name, "args": raw_args, "allowed": tool is not None},
+            )
+            result = enforcer.execute(name, raw_args, ctx)
             tool_calls += 1
             if on_event:
                 on_event({"type": "tool_completed", "name": name, "ok": bool(result.get("ok"))})
-            store.append(Event(idea_id=ctx.idea, event_type=EVENT_TOOL_DONE, actor=ACTOR_ORCH,
-                               source=ACTOR_ORCH, phase=ctx.store.project(ctx.idea).phase,
-                               payload={"tool": name, "ok": bool(result.get("ok")), "result": result}))
-            # 结果进上下文：用 result_to_context（摘要/截断），不整段塞
-            context_text = tool.result_to_context(result) if tool else _stringify(result)
-            messages.append({"role": "tool", "tool_call_id": call.get("id"),
-                             "content": context_text})
-            # ask_user：停，把问题交给用户
-            if (result.get("data") or {}).get("ask"):
-                ask = result["data"]["ask"]
-                store.append(Event(idea_id=ctx.idea, event_type=EVENT_AGENT_STEP, actor=ACTOR_AGENT,
-                                   source=ACTOR_AGENT, phase=ctx.store.project(ctx.idea).phase,
-                                   payload={"ask": ask}))
-                return LoopResult(reply=None, ask=ask, tool_calls=tool_calls)
+            _append_event(
+                store,
+                ctx,
+                EVENT_TOOL_DONE,
+                actor=ACTOR_ORCH,
+                source=ACTOR_ORCH,
+                payload={"tool": name, "ok": bool(result.get("ok")), "result": result},
+            )
+            context_text = _tool_context_text(tool, result)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.get("id") or f"agent-tool-{index}",
+                "content": context_text,
+            })
+            ask = (result.get("data") or {}).get("ask") if isinstance(result, dict) else None
+            if ask:
+                return _finish(store, ctx, ask=str(ask), tool_calls=tool_calls, reason="ask_user")
 
-    return LoopResult(reply="（达到本轮步数上限，已停下。可继续追问。）", tool_calls=tool_calls)
+        if len(calls) > len(selected):
+            return _budget_finish(
+                store,
+                ctx,
+                reason="tool_calls",
+                limit=call_limit,
+                tool_calls=tool_calls,
+                message="（单次模型响应包含过多工具调用，已按预算截断。）",
+            )
+
+    return _budget_finish(
+        store,
+        ctx,
+        reason="max_steps",
+        limit=step_limit,
+        tool_calls=tool_calls,
+        message="（达到本轮步数上限，已停下。可继续追问。）",
+    )
 
 
 def _stringify(result: dict) -> str:

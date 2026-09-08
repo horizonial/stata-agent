@@ -27,6 +27,9 @@ class ToolContext:
     phase: str | None = None
     data_dir: Any = None
     network_available: bool = False
+    # Optional explicit roots for the central tool enforcer.  When omitted,
+    # the enforcer falls back to run_root/data_dir and the local ledger folder.
+    allowed_roots: tuple[Any, ...] = ()
 
 
 def ok(data=None) -> dict:
@@ -92,6 +95,32 @@ def _summarize_run(r: dict) -> str:
         parts.append(f"R²={m['r2']:.4f}")
     head = "机器层: " + (", ".join(parts) if parts else "无(非估计命令)")
     return f"run {d.get('run_id', '?')} {head}；完整日志见 {d.get('do_file', '')}"
+
+
+def _summarize_literature(r: dict) -> str:
+    """Put citable snippets (not only a hit count) into model context."""
+
+    hits = (r.get("data") or {}).get("hits") or []
+    if not hits:
+        return "文献检索无命中（本地材料也可能不完整，请标记为待核对）。"
+    lines = ["文献检索片段（来源均为 untrusted，需核对原文）："]
+    for hit in hits[:8]:
+        doc = str(hit.get("doc_id") or "?")
+        page = hit.get("page") or "?"
+        snippet = str(hit.get("text") or "").replace("\n", " ")[:500]
+        trust = hit.get("trust") or "untrusted"
+        lines.append(f"- [{trust}] {doc} p.{page}: {snippet}")
+    return "\n".join(lines)
+
+
+def _summarize_source(r: dict) -> str:
+    """Expose a bounded fetched fragment while preserving its trust marker."""
+
+    data = r.get("data") or {}
+    source = str(data.get("source") or "")[:200]
+    content = str(data.get("content") or "").replace("\n", " ")[:600]
+    trust = str(data.get("trust") or "retrieved_untrusted")
+    return f"网页片段（{trust}，不可直接当作事实）：source={source}\n{content}"
 
 
 # --------------------------------------------------------------------------- handlers
@@ -214,7 +243,8 @@ def _search_literature(args: dict, ctx: ToolContext) -> dict:
                    suggestion="配置 STATA_AGENT_LIBRARY 指向 PDF 目录，或先用 fetch_source 联网取")
     top_k = max(1, min(int(args.get("top_k") or 5), 10))
     chunks = ctx.rag.search(query, top_k=top_k, roles={"citable_evidence"})
-    data = [{"doc_id": c.doc_id, "page": c.page, "text": c.text[:200]} for c in chunks]
+    data = [{"doc_id": c.doc_id, "page": c.page, "text": c.text[:400],
+             "trust": "local_library_untrusted"} for c in chunks]
     return ok({"hits": data})
 
 
@@ -225,6 +255,13 @@ def _fetch_source(args: dict, ctx: ToolContext) -> dict:
     if not ctx.network_available:
         return err("当前隐私模式不允许联网", type="permission_denied",
                    suggestion="需 STATA_AGENT_PRIVACY=approved_remote 或 mixed_sanitized")
+    # Keep a defense-in-depth check for callers that invoke the handler
+    # directly instead of going through the loop's central enforcer.
+    from .harness.tool_enforcer import validate_url
+
+    url_error = validate_url(url)
+    if url_error:
+        return err(url_error, type="permission_denied")
     import urllib.request
 
     try:
@@ -360,7 +397,7 @@ def default_tools() -> dict[str, Tool]:
                 "top_k": {"type": "integer", "description": "返回条数，默认 5"}},
                 "required": ["query"]}),
             handler=_search_literature, permission="read",
-            summary=lambda r: f"文献命中 {len(r.get('data', {}).get('hits', []))} 条",
+            summary=lambda r: _summarize_literature(r),
         ),
         "fetch_source": Tool(
             name="fetch_source",
@@ -370,7 +407,7 @@ def default_tools() -> dict[str, Tool]:
                 "required": ["url"]}),
             handler=_fetch_source, permission="network", timeout_seconds=30,
             enabled=lambda ctx: ctx.network_available,
-            summary=lambda r: f"已抓取 {r.get('data', {}).get('source', '')[:80]}",
+            summary=lambda r: _summarize_source(r),
         ),
         "update_research_plan": Tool(
             name="update_research_plan",

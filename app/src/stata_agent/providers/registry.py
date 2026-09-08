@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import os
 
-LOCAL_STRICT = "local_strict"
-APPROVED_REMOTE = "approved_remote"
-MIXED_SANITIZED = "mixed_sanitized"
+from ..privacy import modes as _privacy_modes
+
+APPROVED_REMOTE = _privacy_modes.APPROVED_REMOTE
+LOCAL_STRICT = _privacy_modes.LOCAL_STRICT
+MIXED_SANITIZED = _privacy_modes.MIXED_SANITIZED
+configured_mode = _privacy_modes.configured_mode
+normalize_mode = _privacy_modes.normalize_mode
 
 
 class PrivacyBlock(RuntimeError):
@@ -19,7 +23,9 @@ class PrivacyBlock(RuntimeError):
 
 
 def privacy_mode() -> str:
-    return os.environ.get("STATA_AGENT_PRIVACY", LOCAL_STRICT)
+    """Return the configured privacy mode, failing closed on typos."""
+
+    return configured_mode()
 
 
 def _remote_available() -> tuple[str, bool]:
@@ -34,7 +40,11 @@ def _remote_available() -> tuple[str, bool]:
 def live_available() -> bool:
     """UI/测试判据：有远端 key 且当前隐私模式允许发远端。"""
     _, has = _remote_available()
-    return has and privacy_mode() != LOCAL_STRICT
+    try:
+        mode = normalize_mode(privacy_mode())
+    except Exception:  # noqa: BLE001 - an invalid mode is never live-enabled
+        return False
+    return has and mode != LOCAL_STRICT
 
 
 def default_provider():

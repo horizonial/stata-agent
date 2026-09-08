@@ -15,7 +15,8 @@ import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from time import monotonic
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from ..phase.phasedef import Phase
@@ -23,6 +24,7 @@ from ..privacy.modes import (
     LOCAL_STRICT,
     normalize_mode,
 )
+from .cancellation import cancellation_reason, is_cancel_requested
 
 if TYPE_CHECKING:  # pragma: no cover - imports are only for type checkers
     from ..toolkit import Tool, ToolContext
@@ -156,6 +158,16 @@ def _phase_value(ctx: ToolContext | None) -> str | None:
     if phase is None:
         return None
     return str(phase).strip().upper()
+
+
+def _context_token(ctx: ToolContext | None):
+    if ctx is None:
+        return None
+    return (
+        getattr(ctx, "cancellation", None)
+        or getattr(ctx, "cancel_token", None)
+        or getattr(ctx, "cancellation_token", None)
+    )
 
 
 def _roots(ctx: ToolContext | None) -> tuple[Path, ...]:
@@ -304,6 +316,39 @@ def _requires_store_thread(tool: Tool, ctx: ToolContext) -> bool:
     return tool.name in {"run_stata", "run_do_file", "verify_result", "write_draft"}
 
 
+def _cancel_result(tool: Tool, ctx: ToolContext, *, started: bool) -> dict:
+    """Return a cancellation result without pretending a thread was killed.
+
+    Once an execute/write/network handler has started, its external side
+    effect may outlive this waiting call.  ``uncertain`` is therefore the
+    honest result; a not-yet-started call is safely ``cancelled``.
+    """
+
+    side_effect = str(getattr(tool, "permission", "read") or "read").lower() in {
+        "write", "execute", "network", "external", "destructive"
+    }
+    uncertain = bool(started and side_effect)
+    error_type = "uncertain" if uncertain else "cancelled"
+    error = {
+        "type": error_type,
+        "message": (
+            f"工具 {tool.name} 收到取消请求，外部副作用状态不可确认"
+            if uncertain else f"工具 {tool.name} 已取消"
+        ),
+        "retryable": False,
+        "cancel_requested": True,
+        "terminal_reason": "cancel_requested" if uncertain else "cancelled",
+    }
+    if uncertain:
+        error["uncertain"] = True
+        error["suggestion"] = "先核对/恢复未决执行，再决定是否重试"
+    else:
+        error["suggestion"] = "如需继续，请重新发起操作"
+    reason = cancellation_reason(_context_token(ctx))
+    error["reason"] = reason
+    return {"ok": False, "error": error}
+
+
 class ToolEnforcer:
     """The one policy gate used immediately before every tool handler."""
 
@@ -374,6 +419,9 @@ class ToolEnforcer:
         return None
 
     def execute(self, name: str, arguments: Any, ctx: ToolContext) -> dict:
+        tool = self.tools.get(name)
+        if tool is not None and is_cancel_requested(_context_token(ctx)):
+            return _cancel_result(tool, ctx, started=False)
         error = self.validate(name, arguments, ctx)
         if error:
             return EnforcementError("permission_denied", error).as_result()
@@ -398,6 +446,12 @@ class ToolEnforcer:
                 result = tool.handler(args, ctx)
             except BaseException as exc:  # noqa: BLE001
                 return EnforcementError("tool_error", str(exc)[:200]).as_result()
+            if is_cancel_requested(_context_token(ctx)):
+                if isinstance(result, dict) and not result.get("ok"):
+                    result_error = result.get("error") or {}
+                    if result_error.get("type") in {"cancelled", "uncertain", "cancel_requested"}:
+                        return result
+                return _cancel_result(tool, ctx, started=True)
             return result if isinstance(result, dict) else EnforcementError(
                 "tool_error", "工具返回值必须是 object"
             ).as_result()
@@ -416,16 +470,31 @@ class ToolEnforcer:
 
         thread = threading.Thread(target=invoke, name=f"stata-agent-tool-{name}", daemon=True)
         thread.start()
-        if not done.wait(timeout):
-            return EnforcementError(
-                "timeout",
-                f"工具 {name} 超过 {timeout:g}s 执行时限，已停止等待",
-                "缩小输入或拆分操作后重试",
-            ).as_result()
+        deadline = monotonic() + timeout
+        while not done.is_set():
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return EnforcementError(
+                    "timeout",
+                    f"工具 {name} 超过 {timeout:g}s 执行时限，已停止等待",
+                    "缩小输入或拆分操作后重试",
+                ).as_result()
+            if is_cancel_requested(_context_token(ctx)):
+                # The daemon worker is intentionally not force-killed.  It
+                # receives the same token and may stop cooperatively; if it
+                # has started a side effect, report uncertainty to callers.
+                return _cancel_result(tool, ctx, started=True)
+            done.wait(min(remaining, 0.05))
         if error_box:
             exc = error_box[0]
             return EnforcementError("tool_error", str(exc)[:200]).as_result()
         result = result_box[0] if result_box else None
+        if is_cancel_requested(_context_token(ctx)):
+            if isinstance(result, dict) and not result.get("ok"):
+                result_error = result.get("error") or {}
+                if result_error.get("type") in {"cancelled", "uncertain", "cancel_requested"}:
+                    return result
+            return _cancel_result(tool, ctx, started=True)
         if not isinstance(result, dict):
             return EnforcementError("tool_error", "工具返回值必须是 object").as_result()
         return result

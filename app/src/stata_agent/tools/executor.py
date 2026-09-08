@@ -10,23 +10,25 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import re
+import threading
 import uuid
 from pathlib import Path
 
-from ..domain.reducers import Projection
 from ..events.schema import (
+    ACTOR_ORCH,
     EVENT_RUN_FAILED,
     EVENT_RUN_REQ,
     EVENT_RUN_SUCCEEDED,
     EVENT_RUN_UNCERTAIN,
     EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
-    ACTOR_ORCH,
     Event,
 )
+from ..harness.cancellation import cancellation_reason, is_cancel_requested
 from ..storage.sqlite_store import SQLiteStore
-from .stata_client import StataSession
+from .stata_client import StataCancelledError, StataSession
 
 
 class MachineParseError(RuntimeError):
@@ -77,6 +79,17 @@ def _transport_error(error: BaseException | None = None, text: str = "") -> bool
     ))
 
 
+def _supports_keyword(callable_obj, keyword: str) -> bool:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return True
+    return keyword in signature.parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
 class StataExecutor:
     def __init__(self, store: SQLiteStore, *, run_root: Path | None = None,
                  share_session: bool = False):
@@ -85,13 +98,17 @@ class StataExecutor:
         self._run_root.mkdir(parents=True, exist_ok=True)
         self._share_session = share_session
         self._session = None
+        self._state_lock = threading.RLock()
 
     def close(self) -> None:
-        if self._session is not None:
+        with self._state_lock:
+            session = self._session
+            self._session = None
+        if session is not None:
             try:
-                self._session.close()
-            finally:
-                self._session = None
+                session.close()
+            except Exception:  # noqa: BLE001 - repeated cleanup must be safe
+                pass
 
     # ------------------------------------------------------------------ 机器层
     @staticmethod
@@ -131,11 +148,16 @@ class StataExecutor:
         spec_id: str | None = None,
         side_effect: str = "write",
         require_ados: list[str] | None = None,
+        cancellation=None,
+        cancel_token=None,
     ) -> dict:
         """跑一段脚本 → 落 run 链事件 + 返回 {machine, env, do_file, command_hash}。
 
         require_ados：skill 预检用的必需 ado（如 reghdfe），缺则先失败，不硬跑。
         """
+        token = cancellation or cancel_token
+        if is_cancel_requested(token):
+            raise StataCancelledError(cancellation_reason(token), uncertain=False)
         if require_ados:
             from .ado import missing_ados
 
@@ -167,6 +189,9 @@ class StataExecutor:
                      "semantic_input_hash": input_hash},
         ))
 
+        terminal_emitted = False
+        normal_completion = False
+
         if not lines:
             reason = "script 为空"
             self._store.append(Event(
@@ -176,23 +201,47 @@ class StataExecutor:
             ))
             raise MachineParseError(reason)
 
-        sess = self._session if self._share_session else None
+        with self._state_lock:
+            sess = self._session if self._share_session else None
         owned_session = False
         texts: list[str] = []
         env: dict = {}
         machine: dict = {}
+        external_started = False
 
         def discard_session() -> None:
             nonlocal sess
             if sess is None:
                 return
-            if self._share_session and self._session is sess:
-                self._session = None
+            with self._state_lock:
+                if self._share_session and self._session is sess:
+                    self._session = None
             try:
                 sess.close()
             except Exception:  # noqa: BLE001 - cleanup must not hide the outcome
                 pass
             sess = None
+
+        def call_session(line: str):
+            """Invoke old and new session test doubles compatibly."""
+
+            nonlocal external_started
+            if is_cancel_requested(token):
+                raise StataCancelledError(cancellation_reason(token), uncertain=False)
+            external_started = True
+            call = getattr(sess, "call", None)
+            if callable(call):
+                if _supports_keyword(call, "cancellation"):
+                    return call(line, cancellation=token)
+                return call(line)
+            run_batch = sess.run_batch
+            if _supports_keyword(run_batch, "cancellation"):
+                batch = run_batch([line], cancellation=token)
+            else:
+                batch = run_batch([line])
+            if not batch:
+                raise RuntimeError("stata transport returned no result")
+            return batch[0]
 
         def append_call(call_id: str, line: str, index: int) -> None:
             self._store.append(Event(
@@ -222,42 +271,81 @@ class StataExecutor:
                     operation_id=op, phase=phase, payload=result_payload,
                 ))
                 return
+            error_payload = {
+                "run_id": run_id, "call_id": call_id, "transport_error": True,
+                "error_type": type(error).__name__ if error else "UnknownError",
+                "error": str(error or "unknown transport failure")[:300],
+                "side_effect": side_effect,
+            }
+            if getattr(error, "cancelled", False):
+                error_payload.update({
+                    "cancel_requested": True,
+                    "terminal_reason": "cancel_requested",
+                    "uncertain": bool(getattr(error, "uncertain", True)),
+                })
             self._store.append(Event(
                 idea_id=idea, event_type=EVENT_TOOL_RESULT, actor=ACTOR_ORCH, source=ACTOR_ORCH,
                 operation_id=op, phase=phase,
-                payload={"run_id": run_id, "call_id": call_id, "transport_error": True,
-                         "error_type": type(error).__name__ if error else "UnknownError",
-                         "error": str(error or "unknown transport failure")[:300],
-                         "side_effect": side_effect},
+                payload=error_payload,
             ))
 
         def append_terminal(kind: str, payload: dict, state: str) -> None:
+            nonlocal terminal_emitted
             self._store.append(Event(
                 idea_id=idea, event_type=kind, actor=ACTOR_ORCH, source=ACTOR_ORCH,
                 operation_id=op, side_effect_state=state, phase=phase,
                 payload={"run_id": run_id, **payload},
             ))
+            terminal_emitted = True
+
+        def append_cancel_terminal(error: StataCancelledError, *, uncertain: bool) -> None:
+            reason = str(error or cancellation_reason(token) or "cancelled")
+            payload = {
+                "reason": reason[:240],
+                "terminal_reason": "cancel_requested",
+                "cancel_requested": True,
+                "machine": {},
+            }
+            if uncertain:
+                payload["provenance"] = {
+                    "kind": "real", "executor": "stata-mcp", "attested": False,
+                    "do_file": str(do_file), "command_hash": input_hash,
+                    "side_effect": side_effect,
+                    "terminal_reason": "cancel_requested",
+                }
+            append_terminal(
+                EVENT_RUN_UNCERTAIN if uncertain else EVENT_RUN_FAILED,
+                payload,
+                "uncertain" if uncertain else "cancelled",
+            )
 
         try:
             for index, line in enumerate(lines, start=1):
                 call_id = f"{op}:call:{index}"
+                if is_cancel_requested(token):
+                    cancel_error = StataCancelledError(cancellation_reason(token), uncertain=False)
+                    append_cancel_terminal(cancel_error, uncertain=False)
+                    raise cancel_error
                 append_call(call_id, line, index)
+                if is_cancel_requested(token):
+                    cancel_error = StataCancelledError(cancellation_reason(token), uncertain=False)
+                    append_result(call_id, error=cancel_error)
+                    append_cancel_terminal(cancel_error, uncertain=False)
+                    raise cancel_error
                 try:
                     if sess is None:
                         sess = StataSession()
                         owned_session = True
                         if self._share_session:
-                            self._session = sess
-                    call = getattr(sess, "call", None)
-                    if callable(call):
-                        result = call(line)
-                    else:
-                        # Compatibility with small test doubles/older clients;
-                        # one-line batches still represent one external call.
-                        batch = sess.run_batch([line])
-                        if not batch:
-                            raise RuntimeError("stata transport returned no result")
-                        result = batch[0]
+                            with self._state_lock:
+                                self._session = sess
+                    result = call_session(line)
+                except StataCancelledError as error:
+                    append_result(call_id, error=error)
+                    uncertain = bool(getattr(error, "uncertain", True))
+                    append_cancel_terminal(error, uncertain=uncertain)
+                    discard_session()
+                    raise
                 except Exception as error:  # noqa: BLE001 - classify transport below
                     append_result(call_id, error=error)
                     reason = str(error or "Stata transport failure")
@@ -282,6 +370,11 @@ class StataExecutor:
                     raise MachineParseError(reason) from error
 
                 append_result(call_id, result)
+                if is_cancel_requested(token):
+                    cancel_error = StataCancelledError(cancellation_reason(token), uncertain=True)
+                    append_cancel_terminal(cancel_error, uncertain=True)
+                    discard_session()
+                    raise cancel_error
                 result_text = str(getattr(result, "text", "") or "")
                 texts.append(result_text)
                 result_rc = getattr(result, "rc", None)
@@ -313,6 +406,11 @@ class StataExecutor:
                     raise MachineParseError(reason)
 
             text = "\n".join(texts)
+            if is_cancel_requested(token):
+                cancel_error = StataCancelledError(cancellation_reason(token), uncertain=True)
+                append_cancel_terminal(cancel_error, uncertain=True)
+                discard_session()
+                raise cancel_error
             try:
                 machine = self.parse_machine(text)
                 env = self.parse_env(text)
@@ -325,12 +423,36 @@ class StataExecutor:
                 )
                 discard_session()
                 raise
+            normal_completion = True
         finally:
             if owned_session and not self._share_session and sess is not None:
                 try:
                     sess.close()
+                except Exception:  # noqa: BLE001 - cleanup must not mask run outcome
+                    pass
                 finally:
                     sess = None
+            if not normal_completion and not terminal_emitted:
+                # Last-resort audit closure for an unexpected Python error.
+                # If the ledger itself is unavailable, preserve the original
+                # exception; the health/recovery layer will report the gap.
+                try:
+                    append_terminal(
+                        EVENT_RUN_UNCERTAIN if external_started else EVENT_RUN_FAILED,
+                        {
+                            "reason": "unexpected executor error",
+                            "terminal_reason": "executor_error",
+                            "machine": {},
+                            "provenance": {
+                                "kind": "real", "executor": "stata-mcp", "attested": False,
+                                "do_file": str(do_file), "command_hash": input_hash,
+                                "side_effect": side_effect,
+                            },
+                        },
+                        "uncertain" if external_started else "failed",
+                    )
+                except Exception:  # noqa: BLE001 - never mask the primary error
+                    pass
 
         prov = {
             "kind": "real",

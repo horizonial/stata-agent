@@ -8,8 +8,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable
+import inspect
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
+from .harness.cancellation import (
+    CancellationRequested,
+    cancellation_reason,
+    is_cancel_requested,
+)
 
 # --------------------------------------------------------------------------- 契约
 @dataclass
@@ -30,6 +38,24 @@ class ToolContext:
     # Optional explicit roots for the central tool enforcer.  When omitted,
     # the enforcer falls back to run_root/data_dir and the local ledger folder.
     allowed_roots: tuple[Any, ...] = ()
+    # Cooperative cancellation.  ``cancel_token`` and ``cancellation_token``
+    # are compatibility aliases used by integrations; all three names point
+    # at the same object after initialization.
+    cancellation: Any = None
+    cancel_token: Any = None
+    cancellation_token: Any = None
+
+    def __post_init__(self) -> None:
+        token = self.cancellation or self.cancel_token or self.cancellation_token
+        self.cancellation = token
+        self.cancel_token = token
+        self.cancellation_token = token
+
+    def cancellation_requested(self) -> bool:
+        return is_cancel_requested(self.cancellation)
+
+    def cancellation_reason(self) -> str:
+        return cancellation_reason(self.cancellation)
 
 
 def ok(data=None) -> dict:
@@ -80,6 +106,32 @@ def _dump(obj) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
+def _cancelled(ctx: ToolContext) -> dict | None:
+    """Return a normal tool error at a cooperative boundary, if requested."""
+
+    if not ctx.cancellation_requested():
+        return None
+    return err(
+        f"工具执行已取消：{ctx.cancellation_reason()}",
+        type="cancelled",
+        retryable=False,
+        suggestion="如需继续，请重新发起操作",
+    )
+
+
+def _supports_keyword(callable_obj: Callable, keyword: str) -> bool:
+    """Check optional cancellation support without risking a duplicate call."""
+
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return True
+    return keyword in signature.parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
 def _summarize_run(r: dict) -> str:
     """run_stata 结果摘要：格式化机器层 + do_file 路径（让模型直接写结论/必要时读产物）。"""
     d = r.get("data", {})
@@ -125,6 +177,9 @@ def _summarize_source(r: dict) -> str:
 
 # --------------------------------------------------------------------------- handlers
 def _inspect_dataset(args: dict, ctx: ToolContext) -> dict:
+    stopped = _cancelled(ctx)
+    if stopped:
+        return stopped
     data = str(args.get("data") or "").strip()
     if not data:
         return err("需要 data 文件路径才能查看数据", type="missing_param",
@@ -138,7 +193,10 @@ def _inspect_dataset(args: dict, ctx: ToolContext) -> dict:
 
     sess = StataSession()
     try:
-        results = sess.run_batch([f'import delimited "{data}", clear', "describe", "summarize"])
+        results = sess.run_batch(
+            [f'import delimited "{data}", clear', "describe", "summarize"],
+            cancellation=ctx.cancellation,
+        )
     finally:
         sess.close()
     text = "\n".join(r.text for r in results)
@@ -158,13 +216,20 @@ def _run_stata(args: dict, ctx: ToolContext) -> dict:
     code = str(args.get("code") or "").strip()
     if not code:
         return err("code 不能为空", type="missing_param")
+    stopped = _cancelled(ctx)
+    if stopped:
+        return stopped
     if ctx.executor is None:
         return err("未连接 Stata 执行器", type="unavailable", retryable=False,
                    suggestion="检查 STATA_AGENT_EXECUTOR 是否开启、Stata 是否安装")
     from .tools.executor import MachineParseError
 
     try:
-        out = ctx.executor.execute(code + "\n" + _MACHINE_MARKERS, idea=ctx.idea)
+        execute_kwargs = {"idea": ctx.idea}
+        execute = ctx.executor.execute
+        if ctx.cancellation is not None and _supports_keyword(execute, "cancellation"):
+            execute_kwargs["cancellation"] = ctx.cancellation
+        out = execute(code + "\n" + _MACHINE_MARKERS, **execute_kwargs)
         # 证据链完整：run 成功后由 validator 自动签 numeric 卡 + claim（模型不直接写证据）
         signed = []
         if out.get("machine"):
@@ -180,10 +245,28 @@ def _run_stata(args: dict, ctx: ToolContext) -> dict:
                    "do_file": out.get("do_file"), "reused": out.get("reused", False),
                    "signed_cards": len(signed),
                    "output_head": out.get("output_head", "")})
-    except MachineParseError as e:
-        return err(str(e)[:200], type="stata_error", retryable=True,
-                   suggestion="检查变量名/命令语法，可先 inspect_dataset 确认")
-    except Exception as e:  # noqa: BLE001
+    except CancellationRequested as e:
+        return err(
+            f"Stata 执行已取消：{e}",
+            type="cancelled",
+            retryable=False,
+            suggestion="若外部副作用已开始，账本会保留 cancel_requested/uncertain 状态",
+        )
+    except Exception as e:  # noqa: BLE001 - executor exposes typed cancellation metadata
+        if getattr(e, "cancelled", False):
+            uncertain = bool(getattr(e, "uncertain", True))
+            return err(
+                f"Stata 执行取消请求：{str(e)[:200]}",
+                type="uncertain" if uncertain else "cancelled",
+                retryable=False,
+                suggestion=(
+                    "外部副作用状态不可确认，请先 reconcile"
+                    if uncertain else "如需继续，请重新发起操作"
+                ),
+            )
+        if isinstance(e, MachineParseError):
+            return err(str(e)[:200], type="stata_error", retryable=True,
+                       suggestion="检查变量名/命令语法，可先 inspect_dataset 确认")
         return err(str(e)[:200], type="tool_error", retryable=False)
 
 
@@ -192,6 +275,9 @@ def _run_do_file(args: dict, ctx: ToolContext) -> dict:
     path = str(args.get("path") or "").strip()
     if not path:
         return err("需要 do 文件路径", type="missing_param")
+    stopped = _cancelled(ctx)
+    if stopped:
+        return stopped
     from pathlib import Path
 
     p = Path(path)
@@ -202,6 +288,9 @@ def _run_do_file(args: dict, ctx: ToolContext) -> dict:
 
 
 def _read_artifact(args: dict, ctx: ToolContext) -> dict:
+    stopped = _cancelled(ctx)
+    if stopped:
+        return stopped
     path = str(args.get("path") or "").strip()
     if not path:
         # 无 path：读最近一次 run 的 do_file（agent 常忘传 path）
@@ -222,6 +311,9 @@ def _read_artifact(args: dict, ctx: ToolContext) -> dict:
 
 
 def _write_artifact(args: dict, ctx: ToolContext) -> dict:
+    stopped = _cancelled(ctx)
+    if stopped:
+        return stopped
     path = str(args.get("path") or "").strip()
     content = str(args.get("content") or "")
     if not path:
@@ -235,6 +327,9 @@ def _write_artifact(args: dict, ctx: ToolContext) -> dict:
 
 
 def _search_literature(args: dict, ctx: ToolContext) -> dict:
+    stopped = _cancelled(ctx)
+    if stopped:
+        return stopped
     query = str(args.get("query") or "").strip()
     if not query:
         return err("query 不能为空", type="missing_param")
@@ -249,6 +344,9 @@ def _search_literature(args: dict, ctx: ToolContext) -> dict:
 
 
 def _fetch_source(args: dict, ctx: ToolContext) -> dict:
+    stopped = _cancelled(ctx)
+    if stopped:
+        return stopped
     url = str(args.get("url") or "").strip()
     if not url:
         return err("需要 url", type="missing_param")
@@ -267,6 +365,9 @@ def _fetch_source(args: dict, ctx: ToolContext) -> dict:
     try:
         with urllib.request.urlopen(url, timeout=30) as resp:
             body = resp.read(4000)
+        stopped = _cancelled(ctx)
+        if stopped:
+            return stopped
         return ok({"content": body.decode("utf-8", errors="replace")[:4000],
                    "source": url, "trust": "retrieved_untrusted"})
     except Exception as e:  # noqa: BLE001
@@ -274,6 +375,9 @@ def _fetch_source(args: dict, ctx: ToolContext) -> dict:
 
 
 def _update_research_plan(args: dict, ctx: ToolContext) -> dict:
+    stopped = _cancelled(ctx)
+    if stopped:
+        return stopped
     note = str(args.get("note") or "").strip()
     if not note:
         return err("note 不能为空", type="missing_param")
@@ -286,6 +390,9 @@ def _update_research_plan(args: dict, ctx: ToolContext) -> dict:
 
 def _verify_result(args: dict, ctx: ToolContext) -> dict:
     """复核某次 run 的结果（样本/系数），独立于生成。"""
+    stopped = _cancelled(ctx)
+    if stopped:
+        return stopped
     run_id = str(args.get("run_id") or "").strip()
     proj = ctx.store.project(ctx.idea)
     rec = proj.runs.get(run_id)
@@ -300,10 +407,16 @@ def _verify_result(args: dict, ctx: ToolContext) -> dict:
 
 
 def _ask_user(args: dict, ctx: ToolContext) -> dict:
+    stopped = _cancelled(ctx)
+    if stopped:
+        return stopped
     return ok({"ask": str(args.get("question") or "需要你确认一下")})
 
 
 def _write_draft(args: dict, ctx: ToolContext) -> dict:
+    stopped = _cancelled(ctx)
+    if stopped:
+        return stopped
     from .writer.draft_multi import draft_from_ledger
 
     proj = ctx.store.project(ctx.idea)

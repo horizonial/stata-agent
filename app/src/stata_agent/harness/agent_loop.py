@@ -28,6 +28,12 @@ from ..privacy.modes import (
 )
 from ..storage.sqlite_store import SQLiteStore
 from ..toolkit import Tool, ToolContext
+from .cancellation import (
+    CancellationRequested,
+    cancellation_reason,
+    is_cancel_requested,
+    raise_if_cancelled,
+)
 from .tool_enforcer import ToolEnforcer, normalize_arguments
 
 
@@ -36,6 +42,8 @@ class LoopResult:
     reply: str | None
     ask: str | None = None
     tool_calls: int = 0
+    terminal_reason: str | None = None
+    cancelled: bool = False
 
     def __post_init__(self):
         if self.reply is None and self.ask is None:
@@ -123,8 +131,24 @@ def _finish(store: SQLiteStore | None, ctx: ToolContext, *, reply: str | None = 
         payload["ask"] = ask
     if reason:
         payload["terminal_reason"] = reason
+    cancelled = reason in {"cancelled", "cancel_requested"}
+    if cancelled:
+        payload["cancel_requested"] = True
+        token = getattr(ctx, "cancellation", None)
+        acknowledge = getattr(token, "acknowledge", None)
+        if callable(acknowledge):
+            try:
+                acknowledge()
+            except Exception:  # noqa: BLE001 - cancellation acknowledgement is best effort
+                pass
     _append_event(store, ctx, EVENT_AGENT_STEP, actor=ACTOR_AGENT, source=ACTOR_AGENT, payload=payload)
-    return LoopResult(reply=reply, ask=ask, tool_calls=tool_calls)
+    return LoopResult(
+        reply=reply,
+        ask=ask,
+        tool_calls=tool_calls,
+        terminal_reason=reason,
+        cancelled=cancelled,
+    )
 
 
 def _budget_finish(store: SQLiteStore | None, ctx: ToolContext, *, reason: str,
@@ -198,6 +222,9 @@ def run_loop(
     privacy_mode: str | None = None,
     skills: list | None = None,
     on_event=None,
+    cancellation=None,
+    cancel_token=None,
+    cancel_event=None,
 ) -> LoopResult:
     """Run a bounded function-calling loop.
 
@@ -206,6 +233,31 @@ def run_loop(
     is intentionally separate so a single malformed response cannot evade the
     budget by packing 100 calls into one step.
     """
+
+    token = (
+        cancellation
+        or cancel_token
+        or cancel_event
+        or getattr(ctx, "cancellation", None)
+        or getattr(ctx, "cancel_token", None)
+        or getattr(ctx, "cancellation_token", None)
+    )
+    if token is not None:
+        # ToolContext aliases are normalized by its __post_init__, but callers
+        # may pass an older context-like object.  Set all supported names so
+        # handlers and custom tools observe the same token.
+        for attr in ("cancellation", "cancel_token", "cancellation_token"):
+            try:
+                setattr(ctx, attr, token)
+            except Exception:  # noqa: BLE001 - a read-only context can still be polled below
+                pass
+    if is_cancel_requested(token):
+        return _finish(
+            store,
+            ctx,
+            reply=f"（本轮已取消：{cancellation_reason(token)}。）",
+            reason="cancelled",
+        )
 
     effective_mode = privacy_mode if privacy_mode is not None else getattr(ctx, "privacy_mode", LOCAL_STRICT)
     try:
@@ -283,12 +335,22 @@ def run_loop(
         )
 
     for _step in range(step_limit):
+        if is_cancel_requested(token):
+            return _finish(
+                store,
+                ctx,
+                reply=f"（本轮已取消：{cancellation_reason(token)}。）",
+                tool_calls=tool_calls,
+                reason="cancelled",
+            )
         content, calls = None, None
         prompt_messages = sanitize_messages(messages, mode=effective_mode, provider=provider_name)
         try:
+            raise_if_cancelled(token)
             if on_event and hasattr(provider, "stream_chat"):
                 stream_done = False
                 for event in provider.stream_chat(prompt_messages, tools=tool_schemas):
+                    raise_if_cancelled(token)
                     if not isinstance(event, dict):
                         raise RuntimeError("provider stream event 不是 object")
                     event_type = event.get("type")
@@ -307,6 +369,15 @@ def run_loop(
                 if not isinstance(response, dict):
                     raise RuntimeError("provider response 不是 object")
                 content, calls = response.get("content"), response.get("tool_calls")
+            raise_if_cancelled(token)
+        except CancellationRequested:
+            return _finish(
+                store,
+                ctx,
+                reply=f"（本轮已取消：{cancellation_reason(token)}。）",
+                tool_calls=tool_calls,
+                reason="cancelled",
+            )
         except Exception as exc:  # noqa: BLE001 - provider failures are terminal and ledgered
             return _finish(store, ctx, reply=f"模型调用失败，本轮未完成：{str(exc)[:200]}", reason="provider_error")
 
@@ -328,6 +399,14 @@ def run_loop(
         selected = calls[:remaining]
         messages.append(_assistant_tool_message(selected))
         for index, raw_call in enumerate(selected):
+            if is_cancel_requested(token):
+                return _finish(
+                    store,
+                    ctx,
+                    reply=f"（本轮已取消：{cancellation_reason(token)}。）",
+                    tool_calls=tool_calls,
+                    reason="cancelled",
+                )
             call = raw_call if isinstance(raw_call, dict) else {}
             name = str(call.get("name") or "")
             raw_args = call.get("arguments") if "arguments" in call else {}
@@ -374,6 +453,20 @@ def run_loop(
                 "tool_call_id": call.get("id") or f"agent-tool-{index}",
                 "content": context_text,
             })
+            if is_cancel_requested(token):
+                result_error = (result.get("error") or {}) if isinstance(result, dict) else {}
+                cancel_reason = (
+                    "cancel_requested"
+                    if result_error.get("type") in {"uncertain", "cancel_requested"}
+                    else "cancelled"
+                )
+                return _finish(
+                    store,
+                    ctx,
+                    reply=f"（本轮已取消：{cancellation_reason(token)}。）",
+                    tool_calls=tool_calls,
+                    reason=cancel_reason,
+                )
             ask = (result.get("data") or {}).get("ask") if isinstance(result, dict) else None
             if ask:
                 return _finish(store, ctx, ask=str(ask), tool_calls=tool_calls, reason="ask_user")

@@ -44,10 +44,14 @@ def save_docx(buf: BytesIO, path: str | Path) -> Path:
 def tables_to_docx(title: str, tables: list) -> BytesIO:
     """把一组 TableModel 渲染成 .docx（含表头与行）。"""
     from .table import add_table_to_doc
+    from .table import numeric_cells
 
     doc = Document()
     doc.add_heading(title, level=0)
     for model in tables:
+        missing = [cell.text for _ri, _ci, cell in numeric_cells(model) if not cell.card_id]
+        if missing:
+            raise ValueError(f"数字表格缺 EvidenceCard provenance: {missing[:5]}")
         add_table_to_doc(doc, model, title_heading=True)
     buf = BytesIO()
     doc.save(buf)

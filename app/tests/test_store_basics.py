@@ -8,8 +8,11 @@ from stata_agent.events.append import WriterNotPermitted
 from stata_agent.events.schema import (
     EVENT_CLAIM_SIGNED,
     EVENT_IDEA,
+    EVENT_RUN_REQ,
+    EVENT_TOOL_CALL,
     EVENT_SPEC_FREEZE,
     ACTOR_AGENT,
+    ACTOR_EVIDENCE,
     ACTOR_VALIDATOR,
     Event,
 )
@@ -27,8 +30,10 @@ def test_seq_monotonic_and_scan_order(tmp_path):
     s = SQLiteStore(str(tmp_path / "l.db"), writer_id="a")
     a = s.append(E(kind=EVENT_IDEA, payload={"q": "研究问题"}))
     b = s.append(E(kind=EVENT_SPEC_FREEZE, payload={"spec_id": "s1"}, source=ACTOR_AGENT))
-    c = s.append(E(kind=EVENT_CLAIM_SIGNED, payload={"claim": {"claim_id": "cl1", "statement": "x", "cards": []}},
-                  source=ACTOR_VALIDATOR))
+    c = s.append(E(kind=EVENT_CLAIM_SIGNED, actor=ACTOR_EVIDENCE,
+                  payload={"claim": {"claim_id": "cl1", "statement": "x", "cards": [],
+                                     "written_by": ACTOR_EVIDENCE}},
+                  source=ACTOR_EVIDENCE))
     assert (a, b, c) == (1, 2, 3)
     kinds = [ev.event_type for ev in s.scan("i1")]
     assert kinds == [EVENT_IDEA, EVENT_SPEC_FREEZE, EVENT_CLAIM_SIGNED]
@@ -40,9 +45,13 @@ def test_seq_monotonic_and_scan_order(tmp_path):
 
 def test_fingerprint_duplicate_rejected(tmp_path):
     s = SQLiteStore(str(tmp_path / "l.db"), writer_id="a")
-    s.append(E(kind="tool.call", operation_id="op1", fingerprint="fp1", payload={"side_effect": "read"}))
+    s.append(E(kind=EVENT_RUN_REQ, operation_id="op1", fingerprint="req1",
+               payload={"run_id": "r1", "side_effect": "read"}))
+    s.append(E(kind=EVENT_TOOL_CALL, operation_id="op1", fingerprint="fp1",
+               payload={"run_id": "r1", "call_id": "c1"}))
     with pytest.raises(DuplicateFingerprint):
-        s.append(E(kind="tool.call", operation_id="op2", fingerprint="fp1", payload={"side_effect": "read"}))
+        s.append(E(kind=EVENT_TOOL_CALL, operation_id="op1", fingerprint="fp1",
+                   payload={"run_id": "r1", "call_id": "c2"}))
     s.close()
 
 

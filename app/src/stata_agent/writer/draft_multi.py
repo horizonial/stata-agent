@@ -62,26 +62,79 @@ def draft_from_ledger(proj, *, title: str = "实证研究初稿",
     if method:
         doc.add_paragraph(method)
 
+    from .table import build_run_table
+
     ok_runs = [(rid, rec) for rid, rec in proj.runs.items()
                if rec.status == "succeeded" and rec.machine]
+    # A raw machine dict is not publishable.  Build/validate every run table
+    # first so a missing card fails loudly instead of producing a partial DOCX.
+    run_models = {rid: build_run_table(proj, rid, title="") for rid, _rec in ok_runs}
+
+    active_claims = []
+    for claim in sorted(proj.claims.values(), key=lambda c: c.claim_id):
+        if claim.status != "supported":
+            continue
+        missing = [card_id for card_id in claim.cards if card_id not in proj.cards]
+        if missing:
+            raise ValueError(f"active claim {claim.claim_id!r} 缺 EvidenceCard: {missing}")
+        if not claim.cards:
+            raise ValueError(f"active claim {claim.claim_id!r} 没有 EvidenceCard，不能出稿")
+        for card_id in claim.cards:
+            card = proj.cards[card_id]
+            if card.kind != "numeric":
+                continue
+            loc = card.locator or {}
+            run_id = loc.get("run_id")
+            stat_type = loc.get("stat_type")
+            rec = proj.runs.get(run_id)
+            if rec is None or rec.status != "succeeded" or stat_type not in rec.machine:
+                raise ValueError(f"active claim {claim.claim_id!r} 的 numeric card {card_id!r} provenance 不完整")
+            import hashlib
+            import json
+            machine_hash = hashlib.sha256(
+                json.dumps(rec.machine, sort_keys=True, ensure_ascii=False).encode()
+            ).hexdigest()
+            if card.machine_hash != machine_hash or not isinstance(card.value, dict):
+                raise ValueError(f"active claim {claim.claim_id!r} 的 numeric card {card_id!r} provenance 不匹配")
+            try:
+                if float(card.value.get("value")) != float(rec.machine[stat_type]):
+                    raise ValueError(f"active claim {claim.claim_id!r} 的 numeric card {card_id!r} 数值不一致")
+            except (TypeError, ValueError) as error:
+                if isinstance(error, ValueError) and "数值不一致" in str(error):
+                    raise
+                raise ValueError(f"active claim {claim.claim_id!r} 的 numeric card {card_id!r} 数值无效") from error
+        active_claims.append(claim)
+    citation_cards = [c for c in proj.cards.values() if c.kind == "citation"]
+    if not ok_runs and not active_claims and not citation_cards:
+        raise ValueError("没有 active claim 或含 provenance 的 run，不能出稿")
     if ok_runs:
         model = TableModel(title="回归结果（由事件账本渲染）",
                            columns=[rid[:14] for rid, _ in ok_runs])
-        stats = {
-            "系数": lambda m: _f(m.get("coef")),
-            "标准误": lambda m: _f(m.get("se")) if m.get("se") is not None else "-",
-            "样本量": lambda m: str(int(m.get("N", 0))) if m.get("N") is not None else "-",
-            "R²": lambda m: _f(m.get("r2")),
+        labels = {
+            "系数": "核心系数",
+            "标准误": "SE",
+            "样本量": "样本量",
+            "R²": "R²",
         }
-        for label, fmt in stats.items():
-            model.rows.append(Row(label=label,
-                                  cells=[Cell(text=fmt(rec.machine)) for _, rec in ok_runs]))
+        for label, source_label in labels.items():
+            cells = []
+            for rid, _rec in ok_runs:
+                source = next(
+                    (row.cells[0] for row in run_models[rid].rows if row.label == source_label),
+                    None,
+                )
+                if source is None:
+                    cells.append(Cell(text="-", stat_type=label))
+                else:
+                    cells.append(Cell(text=source.text, stat_type=label,
+                                      numeric=source.numeric, card_id=source.card_id))
+            model.rows.append(Row(label=label, cells=cells))
         add_table_to_doc(doc, model)
 
-    for claim in sorted(proj.claims.values(), key=lambda c: c.claim_id):
+    for claim in active_claims:
         doc.add_paragraph(render_claim_sentence(claim, proj.cards) + f"  [{claim.claim_id}]")
 
-    cit = [c for c in proj.cards.values() if c.kind == "citation"]
+    cit = citation_cards
     if cit:
         doc.add_paragraph("引用文献（citable 块）")
         for c in sorted(cit, key=lambda x: x.card_id):

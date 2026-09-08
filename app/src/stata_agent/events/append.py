@@ -6,12 +6,16 @@ store 在事务内先跑这些校验，过了才落库。
 from __future__ import annotations
 
 from .schema import (
+    CARD_SIGNING_SOURCES,
     CHAIN_INTERMEDIATE,
     CHAIN_START,
     CHAIN_TERMINAL,
-    SIGNING_SOURCES,
+    CLAIM_SIGNING_SOURCES,
+    EVENT_CARD_SIGNED,
+    EVENT_CLAIM_RETRACT,
+    EVENT_CLAIM_SIGNED,
+    RETRACT_SOURCES,
     Event,
-    writer_permission,
 )
 
 
@@ -24,11 +28,49 @@ class WriterNotPermitted(AppendError):
 
 
 def validate_writer(ev: Event) -> None:
-    """DD-01 §3.3-5：card/claim 只有 validator/evidence_builder 能写。"""
-    if not writer_permission(ev.event_type, ev.source):
+    """Validate the role boundary for immutable evidence writes.
+
+    ``actor`` and ``source`` are deliberately checked together.  For cards and
+    claims the signed object carries a second role assertion (``signed_by`` or
+    ``written_by``), which must agree with the event writer.  This keeps the
+    existing Event API while preventing the common source-spoofing failure mode
+    where a model emits ``source='validator'`` around an agent-authored object.
+    """
+    kind = ev.event_type
+    if kind not in {EVENT_CARD_SIGNED, EVENT_CLAIM_SIGNED, EVENT_CLAIM_RETRACT}:
+        return
+
+    payload = ev.payload or {}
+    if kind == EVENT_CARD_SIGNED:
+        allowed = CARD_SIGNING_SOURCES
+        role_key = "signed_by"
+        object_key = "card"
+    elif kind == EVENT_CLAIM_SIGNED:
+        allowed = CLAIM_SIGNING_SOURCES
+        role_key = "written_by"
+        object_key = "claim"
+    else:
+        allowed = RETRACT_SOURCES
+        role_key = "written_by"
+        object_key = None
+
+    if ev.actor != ev.source or ev.source not in allowed:
         raise WriterNotPermitted(
-            f"event_type={ev.event_type} 不允许 source={ev.source!r} 写入"
-            f"（仅 {sorted(SIGNING_SOURCES)!r} 可签发）"
+            f"event_type={kind} 不允许 actor={ev.actor!r}, source={ev.source!r}"
+            f"（允许 source={sorted(allowed)!r}）"
+        )
+
+    # Retracts predate the role field and are still accepted when the payload
+    # only contains claim_id.  If a role assertion is present, it is checked.
+    if object_key is not None:
+        obj = payload.get(object_key, payload)
+        if not isinstance(obj, dict) or obj.get(role_key) != ev.source:
+            raise WriterNotPermitted(
+                f"event_type={kind} 的 payload.{role_key} 必须等于 source={ev.source!r}"
+            )
+    elif role_key in payload and payload.get(role_key) != ev.source:
+        raise WriterNotPermitted(
+            f"event_type={kind} 的 payload.{role_key} 必须等于 source={ev.source!r}"
         )
 
 

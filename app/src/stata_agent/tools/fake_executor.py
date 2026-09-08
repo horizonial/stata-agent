@@ -11,6 +11,8 @@ import uuid
 from ..events.schema import (
     EVENT_RUN_REQ,
     EVENT_RUN_SUCCEEDED,
+    EVENT_TOOL_CALL,
+    EVENT_TOOL_RESULT,
     ACTOR_ORCH,
     Event,
 )
@@ -28,18 +30,43 @@ class FakeExecutor:
         run_id = run_id or f"run-fake-{uuid.uuid4().hex[:8]}"
         op = f"op-{run_id}"
         attempt = len(self._store.project(idea).runs) + 1
-        self._store.append(Event(
-            idea_id=idea, event_type=EVENT_RUN_REQ, actor=ACTOR_ORCH, source=ACTOR_ORCH,
-            operation_id=op, fingerprint=f"fake-{run_id}", attempt_id=attempt,
-            side_effect_state="running",
-            payload={"run_id": run_id, "spec_id": spec_id, "side_effect": side_effect},
-        ))
-        prov = {"do_file": f"fake:{run_id}.do", "command_hash": f"fake-{run_id}", "data_signature": None,
-                "env_sig": {"stata_version": "fake", "stata_flavor": "fake"}}
-        self._store.append(Event(
-            idea_id=idea, event_type=EVENT_RUN_SUCCEEDED, actor=ACTOR_ORCH, source=ACTOR_ORCH,
-            operation_id=op, side_effect_state="committed",
-            payload={"run_id": run_id, "spec_id": spec_id, "provenance": prov, "machine": dict(_MACHINE)},
-        ))
+        call_id = f"call-{run_id}"
+        prov = {
+            "kind": "test",
+            "executor": "fake",
+            "test_only": True,
+            "do_file": f"fake:{run_id}.do",
+            "command_hash": f"fake-{run_id}",
+            "data_signature": "fake",
+            "env_sig": {"stata_version": "fake", "stata_flavor": "fake"},
+        }
+        # Keep the same correlated execution chain as the real executor.  The
+        # call/result are synthetic and explicitly marked test-only in the
+        # terminal provenance, so a fake result cannot masquerade as Stata.
+        self._store.append_many([
+            Event(
+                idea_id=idea, event_type=EVENT_RUN_REQ, actor=ACTOR_ORCH, source=ACTOR_ORCH,
+                operation_id=op, fingerprint=f"fake-{run_id}", attempt_id=attempt,
+                side_effect_state="running",
+                payload={"run_id": run_id, "spec_id": spec_id, "side_effect": side_effect},
+            ),
+            Event(
+                idea_id=idea, event_type=EVENT_TOOL_CALL, actor=ACTOR_ORCH, source=ACTOR_ORCH,
+                operation_id=op, fingerprint=f"fake-call-{run_id}",
+                payload={"run_id": run_id, "call_id": call_id, "executor": "fake", "test_only": True},
+            ),
+            Event(
+                idea_id=idea, event_type=EVENT_TOOL_RESULT, actor=ACTOR_ORCH, source=ACTOR_ORCH,
+                operation_id=op,
+                payload={"run_id": run_id, "call_id": call_id, "rc": 0, "is_error": False,
+                         "executor": "fake", "test_only": True},
+            ),
+            Event(
+                idea_id=idea, event_type=EVENT_RUN_SUCCEEDED, actor=ACTOR_ORCH, source=ACTOR_ORCH,
+                operation_id=op, side_effect_state="committed",
+                payload={"run_id": run_id, "spec_id": spec_id, "provenance": prov,
+                         "machine": dict(_MACHINE)},
+            ),
+        ])
         return {"run_id": run_id, "machine": dict(_MACHINE), "env": prov["env_sig"],
                 "do_file": prov["do_file"], "command_hash": prov["command_hash"]}

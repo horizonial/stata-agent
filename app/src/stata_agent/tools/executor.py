@@ -19,6 +19,9 @@ from ..events.schema import (
     EVENT_RUN_FAILED,
     EVENT_RUN_REQ,
     EVENT_RUN_SUCCEEDED,
+    EVENT_RUN_UNCERTAIN,
+    EVENT_TOOL_CALL,
+    EVENT_TOOL_RESULT,
     ACTOR_ORCH,
     Event,
 )
@@ -28,6 +31,12 @@ from .stata_client import StataSession
 
 class MachineParseError(RuntimeError):
     pass
+
+
+class TransportUncertainError(MachineParseError):
+    """The Stata transport/process outcome cannot be known safely."""
+
+    uncertain = True
 
 
 def sha(text: str) -> str:
@@ -55,6 +64,17 @@ def _find_marker(text: str, token: str) -> str | None:
     """解析形如 `token<value>` 的一行，value 到行尾。"""
     m = re.search(rf"^{re.escape(token)}(.*)$", text, re.M)
     return m.group(1).strip() if m else None
+
+
+def _transport_error(error: BaseException | None = None, text: str = "") -> bool:
+    """Classify connection/timeout failures separately from Stata rc errors."""
+    if isinstance(error, (TimeoutError, ConnectionError, BrokenPipeError, EOFError, OSError)):
+        return True
+    haystack = f"{error or ''} {text}".lower()
+    return any(token in haystack for token in (
+        "timeout", "timed out", "disconnect", "connection reset", "broken pipe",
+        "eof", "process exited", "session closed", "transport", "超时", "断开", "关闭",
+    ))
 
 
 class StataExecutor:
@@ -129,76 +149,205 @@ class StataExecutor:
         reuse = reuse_for(self._store, idea, input_hash)
         if reuse is not None:
             return reuse
-        attempt = len(self._store.project(idea).runs) + 1
+        previous_runs = self._store.project(idea).runs.values()
+        attempt = max((rec.attempt_id for rec in previous_runs), default=0) + 1
 
-        # 脚本写进 run 目录 → do_file（可复现）；再发给 stata-mcp
+        # 脚本写进 run 目录 → do_file（可复现）。 关键顺序：requested 必须
+        # 先提交，之后的每个真实 MCP 调用才允许开始。
         do_file = self._run_root / f"{run_id}.do"
         do_file.write_text(script, encoding="utf-8")
         lines = [ln for ln in script.splitlines() if ln.strip()]
 
-        # 执行（最多 2 次；share_session 时复用会话省启动，失败则丢弃共享会话降级全新）
-        ok: tuple[dict, dict, str] | None = None
-        last_err: Exception | None = None
-        for _try in range(1, 3):
-            close_sess = False
-            if self._share_session and self._session is not None:
-                sess = self._session
-            else:
-                sess = StataSession()
-                close_sess = not self._share_session
-                if self._share_session:
-                    self._session = sess
-            try:
-                results = sess.run_batch(lines)
-            finally:
-                if close_sess:
-                    sess.close()
-            text = "\n".join(r.text for r in results)
-            if any(r.is_error for r in results) or "crashed" in text.lower():
-                # 会话可能崩了：丢弃共享会话，下次用全新
-                if self._share_session:
-                    self._session = None
-                last_err = MachineParseError(f"stata rc!=0: {text[:300]}")
-                continue
-            try:
-                machine = self.parse_machine(text)
-                env = self.parse_env(text)
-                ok = (machine, env, text)
-                break
-            except MachineParseError as e:
-                last_err = e
-                if "crashed" not in text.lower():
-                    break  # 非瞬时会话问题 → 不再重试
-        # 事件只在最终成败时写一次（避免重试产生重复指纹/半截状态）
+        phase = self._store.project(idea).phase
         self._store.append(Event(
             idea_id=idea, event_type=EVENT_RUN_REQ, actor=ACTOR_ORCH, source=ACTOR_ORCH,
             operation_id=op, fingerprint=input_hash, attempt_id=attempt,
-            side_effect_state="running", phase=self._store.project(idea).phase,
+            side_effect_state="running", phase=phase,
             payload={"run_id": run_id, "spec_id": spec_id, "side_effect": side_effect,
                      "semantic_input_hash": input_hash},
         ))
-        if ok is None:
-            reason = str(last_err or "执行失败")
+
+        if not lines:
+            reason = "script 为空"
             self._store.append(Event(
                 idea_id=idea, event_type=EVENT_RUN_FAILED, actor=ACTOR_ORCH, source=ACTOR_ORCH,
-                operation_id=op, side_effect_state="failed", phase=self._store.project(idea).phase,
-                payload={"run_id": run_id, "reason": reason[:200], "text_head": text[:200]},
+                operation_id=op, side_effect_state="failed", phase=phase,
+                payload={"run_id": run_id, "reason": reason},
             ))
-            raise MachineParseError(reason) from last_err
-        machine, env, text = ok
+            raise MachineParseError(reason)
+
+        sess = self._session if self._share_session else None
+        owned_session = False
+        texts: list[str] = []
+        env: dict = {}
+        machine: dict = {}
+
+        def discard_session() -> None:
+            nonlocal sess
+            if sess is None:
+                return
+            if self._share_session and self._session is sess:
+                self._session = None
+            try:
+                sess.close()
+            except Exception:  # noqa: BLE001 - cleanup must not hide the outcome
+                pass
+            sess = None
+
+        def append_call(call_id: str, line: str, index: int) -> None:
+            self._store.append(Event(
+                idea_id=idea, event_type=EVENT_TOOL_CALL, actor=ACTOR_ORCH, source=ACTOR_ORCH,
+                operation_id=op, fingerprint=sha(f"{op}:{index}:{line}"), phase=phase,
+                payload={"run_id": run_id, "call_id": call_id, "call_index": index,
+                         "code_hash": sha(line), "code_head": line[:160],
+                         "side_effect": side_effect, "executor": "stata-mcp"},
+            ))
+
+        def append_result(call_id: str, result=None, *, error: BaseException | None = None) -> None:
+            if result is not None:
+                result_text = str(getattr(result, "text", "") or "")
+                structured = getattr(result, "structured", {}) or {}
+                rc = getattr(result, "rc", None)
+                if callable(rc):
+                    rc = rc()
+                is_error = bool(getattr(result, "is_error", False))
+                result_payload = {
+                    "run_id": run_id, "call_id": call_id, "rc": rc,
+                    "is_error": is_error, "text_head": result_text[:500],
+                    "structured": structured if isinstance(structured, dict) else {},
+                    "side_effect": side_effect,
+                }
+                self._store.append(Event(
+                    idea_id=idea, event_type=EVENT_TOOL_RESULT, actor=ACTOR_ORCH, source=ACTOR_ORCH,
+                    operation_id=op, phase=phase, payload=result_payload,
+                ))
+                return
+            self._store.append(Event(
+                idea_id=idea, event_type=EVENT_TOOL_RESULT, actor=ACTOR_ORCH, source=ACTOR_ORCH,
+                operation_id=op, phase=phase,
+                payload={"run_id": run_id, "call_id": call_id, "transport_error": True,
+                         "error_type": type(error).__name__ if error else "UnknownError",
+                         "error": str(error or "unknown transport failure")[:300],
+                         "side_effect": side_effect},
+            ))
+
+        def append_terminal(kind: str, payload: dict, state: str) -> None:
+            self._store.append(Event(
+                idea_id=idea, event_type=kind, actor=ACTOR_ORCH, source=ACTOR_ORCH,
+                operation_id=op, side_effect_state=state, phase=phase,
+                payload={"run_id": run_id, **payload},
+            ))
+
+        try:
+            for index, line in enumerate(lines, start=1):
+                call_id = f"{op}:call:{index}"
+                append_call(call_id, line, index)
+                try:
+                    if sess is None:
+                        sess = StataSession()
+                        owned_session = True
+                        if self._share_session:
+                            self._session = sess
+                    call = getattr(sess, "call", None)
+                    if callable(call):
+                        result = call(line)
+                    else:
+                        # Compatibility with small test doubles/older clients;
+                        # one-line batches still represent one external call.
+                        batch = sess.run_batch([line])
+                        if not batch:
+                            raise RuntimeError("stata transport returned no result")
+                        result = batch[0]
+                except Exception as error:  # noqa: BLE001 - classify transport below
+                    append_result(call_id, error=error)
+                    reason = str(error or "Stata transport failure")
+                    if _transport_error(error):
+                        append_terminal(
+                            EVENT_RUN_UNCERTAIN,
+                            {"reason": reason[:240], "machine": {}, "provenance": {
+                                "kind": "real", "executor": "stata-mcp", "attested": False,
+                                "do_file": str(do_file), "command_hash": input_hash,
+                                "side_effect": side_effect,
+                            }},
+                            "uncertain",
+                        )
+                        discard_session()
+                        raise TransportUncertainError(reason) from error
+                    append_terminal(
+                        EVENT_RUN_FAILED,
+                        {"reason": reason[:240], "machine": {}, "text_head": reason[:200]},
+                        "failed",
+                    )
+                    discard_session()
+                    raise MachineParseError(reason) from error
+
+                append_result(call_id, result)
+                result_text = str(getattr(result, "text", "") or "")
+                texts.append(result_text)
+                result_rc = getattr(result, "rc", None)
+                if callable(result_rc):
+                    result_rc = result_rc()
+                is_error = bool(getattr(result, "is_error", False))
+                transport = _transport_error(text=result_text)
+                if transport:
+                    reason = result_text or "Stata transport returned an uncertain response"
+                    append_terminal(
+                        EVENT_RUN_UNCERTAIN,
+                        {"reason": reason[:240], "machine": {}, "provenance": {
+                            "kind": "real", "executor": "stata-mcp", "attested": False,
+                            "do_file": str(do_file), "command_hash": input_hash,
+                            "side_effect": side_effect,
+                        }},
+                        "uncertain",
+                    )
+                    discard_session()
+                    raise TransportUncertainError(reason)
+                if is_error or (result_rc is not None and result_rc != 0):
+                    reason = f"stata rc!=0: {result_text[:300]}"
+                    append_terminal(
+                        EVENT_RUN_FAILED,
+                        {"reason": reason[:240], "text_head": result_text[:200]},
+                        "failed",
+                    )
+                    discard_session()
+                    raise MachineParseError(reason)
+
+            text = "\n".join(texts)
+            try:
+                machine = self.parse_machine(text)
+                env = self.parse_env(text)
+            except MachineParseError as error:
+                reason = str(error)
+                append_terminal(
+                    EVENT_RUN_FAILED,
+                    {"reason": reason[:240], "text_head": text[:200]},
+                    "failed",
+                )
+                discard_session()
+                raise
+        finally:
+            if owned_session and not self._share_session and sess is not None:
+                try:
+                    sess.close()
+                finally:
+                    sess = None
+
         prov = {
+            "kind": "real",
+            "executor": "stata-mcp",
+            "attested": True,
             "do_file": str(do_file),
             "command_hash": input_hash,
             "data_signature": None,  # 内置数据集 sysuse，无外部文件
             "env_sig": env,
             "side_effect": side_effect,
         }
-        self._store.append(Event(
-            idea_id=idea, event_type=EVENT_RUN_SUCCEEDED, actor=ACTOR_ORCH, source=ACTOR_ORCH,
-            operation_id=op, side_effect_state="committed", phase=self._store.project(idea).phase,
-            payload={"run_id": run_id, "spec_id": spec_id, "provenance": prov, "machine": machine,
-                     "output_head": text[:500]},  # 大输出摘要进账本；do_file 存全文可按需读
-        ))
+        append_terminal(
+            EVENT_RUN_SUCCEEDED,
+            {"spec_id": spec_id, "provenance": prov, "machine": machine,
+             "output_head": text[:500]},
+            "committed",
+        )
         return {"run_id": run_id, "machine": machine, "env": env, "do_file": str(do_file),
                 "command_hash": input_hash, "output_head": text[:800]}
 

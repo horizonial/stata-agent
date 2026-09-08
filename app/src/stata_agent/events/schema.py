@@ -61,8 +61,17 @@ ACTOR_EVIDENCE = "evidence_builder"
 ACTOR_STATA = "stata_mcp"
 ACTOR_SYSTEM = "system"
 
-# 允许产出不可变证据(EvidenceCard/Claim)的来源（DD-01 §2.7 写者矩阵）
-SIGNING_SOURCES = frozenset({ACTOR_VALIDATOR, ACTOR_EVIDENCE})
+# 允许产出不可变证据(EvidenceCard/Claim)的来源（DD-01 §2.7 写者矩阵）。
+#
+# Keep the roles separate.  A string in ``Event.source`` is not a capability by
+# itself, but requiring the same role in actor/source/payload gives the append
+# boundary a useful defence against a model (or a stale caller) spoofing a
+# validator write.  The public constants are kept for callers that used the
+# original, coarser ``SIGNING_SOURCES`` contract.
+CARD_SIGNING_SOURCES = frozenset({ACTOR_VALIDATOR})
+CLAIM_SIGNING_SOURCES = frozenset({ACTOR_EVIDENCE})
+RETRACT_SOURCES = frozenset({ACTOR_VALIDATOR, ACTOR_EVIDENCE})
+SIGNING_SOURCES = frozenset({*CARD_SIGNING_SOURCES, *CLAIM_SIGNING_SOURCES})
 SIGNING_KINDS = frozenset({EVENT_CARD_SIGNED, EVENT_CLAIM_SIGNED, EVENT_CLAIM_RETRACT})
 
 # 需要 fingerprint（幂等）的事件（DD-01 §3.3）：工具执行
@@ -99,6 +108,10 @@ class Event(BaseModel):
 
 def writer_permission(kind: str, source: str) -> bool:
     """DD-01 §3.3 不变量 5：模型/agent 无权产出 card/claim。"""
-    if kind in SIGNING_KINDS:
-        return source in SIGNING_SOURCES
+    if kind == EVENT_CARD_SIGNED:
+        return source in CARD_SIGNING_SOURCES
+    if kind == EVENT_CLAIM_SIGNED:
+        return source in CLAIM_SIGNING_SOURCES
+    if kind == EVENT_CLAIM_RETRACT:
+        return source in RETRACT_SOURCES
     return True

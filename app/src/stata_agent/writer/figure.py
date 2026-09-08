@@ -27,6 +27,9 @@ def sign_figure_card(
     rec = proj.runs.get(run_id)
     if rec is None or rec.status != "succeeded":
         raise ValueError(f"run {run_id!r} 不存在或未成功，图不能作为证据")
+    from ..tools.evidence_signer import validate_run_provenance
+
+    provenance_kind = validate_run_provenance(rec.provenance or {})
     path = Path(figure_path)
     if not path.exists():
         raise ValueError(f"图文件不存在: {path}")
@@ -34,7 +37,8 @@ def sign_figure_card(
     card = EvidenceCard(
         card_id=card_id,
         kind="figure",
-        locator={"run_id": run_id, "path": str(path), "kind": kind},
+        locator={"run_id": run_id, "path": str(path), "kind": kind,
+                 "provenance_kind": provenance_kind},
         value={"caption": caption},
         signed_by=ACTOR_VALIDATOR,
     )
@@ -57,9 +61,14 @@ def figure_docx(
     doc = Document()
     doc.add_heading(title, level=0)
     for n, item in enumerate(items, start=1):
+        card_id = item.get("card_id")
+        if not card_id:
+            raise ValueError("图缺 figure EvidenceCard provenance，不能出稿")
+        if not Path(item["path"]).exists():
+            raise ValueError(f"图文件不存在: {item['path']}")
         doc.add_picture(str(item["path"]), width=Inches(5.2))
         cap = item.get("caption") or ""
-        note = item.get("card_id") or item.get("claim_id") or ""
+        note = card_id
         doc.add_paragraph(f"图 {n}：{cap}" + (f"　[{note}]" if note else ""))
     import io
 

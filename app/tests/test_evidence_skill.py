@@ -9,6 +9,8 @@ import pytest
 from stata_agent.events.schema import (
     EVENT_RUN_REQ,
     EVENT_RUN_SUCCEEDED,
+    EVENT_TOOL_CALL,
+    EVENT_TOOL_RESULT,
     ACTOR_ORCH,
     Event,
 )
@@ -23,11 +25,18 @@ def _run_succeeded(idea="i1", run="r1", machine=None):
     events = [
         Event(idea_id=idea, event_type=EVENT_RUN_REQ, actor=ACTOR_ORCH, source=ACTOR_ORCH,
               operation_id="op1", fingerprint="h", payload={"run_id": run}),
+        Event(idea_id=idea, event_type=EVENT_TOOL_CALL, actor=ACTOR_ORCH, source=ACTOR_ORCH,
+              operation_id="op1", payload={"run_id": run, "call_id": "call-1"}),
+        Event(idea_id=idea, event_type=EVENT_TOOL_RESULT, actor=ACTOR_ORCH, source=ACTOR_ORCH,
+              operation_id="op1", payload={"run_id": run, "call_id": "call-1", "rc": 0}),
         Event(idea_id=idea, event_type=EVENT_RUN_SUCCEEDED, actor=ACTOR_ORCH, source=ACTOR_ORCH,
               operation_id="op1", payload={
                   "run_id": run,
                   "machine": machine or {"coef": -238.9, "N": 74, "r2": 0.2196},
-                  "provenance": {"command_hash": "c", "data_signature": None, "env_sig": {"v": "18"}},
+                  "provenance": {"kind": "test", "executor": "fake", "test_only": True,
+                                  "do_file": f"fake:{run}.do", "command_hash": "h",
+                                  "data_signature": "fake",
+                                  "env_sig": {"stata_version": "fake", "stata_flavor": "fake"}},
               }),
     ]
     return events

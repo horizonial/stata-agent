@@ -4,7 +4,16 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from stata_agent.events.schema import EVENT_APPROVAL_REQ, EVENT_RUN_SUCCEEDED, EVENT_USER, Event
+from stata_agent.events.schema import (
+    ACTOR_ORCH,
+    EVENT_APPROVAL_REQ,
+    EVENT_RUN_REQ,
+    EVENT_RUN_SUCCEEDED,
+    EVENT_TOOL_CALL,
+    EVENT_TOOL_RESULT,
+    EVENT_USER,
+    Event,
+)
 from stata_agent.storage.sqlite_store import SQLiteStore
 import stata_agent.ui as ui
 
@@ -49,7 +58,15 @@ def test_trace_filter_and_cursor(tmp_path, monkeypatch):
     store = SQLiteStore(str(ui.DEFAULT_DB), writer_id="seed", takeover=True)
     try:
         store.append(Event(idea_id="ui", event_type=EVENT_USER, actor="user", payload={"text": "检查主回归"}))
-        store.append(Event(idea_id="ui", event_type=EVENT_RUN_SUCCEEDED, actor="stata_mcp", phase="ESTIMATION", payload={"run_id": "run-1", "summary": "运行成功"}))
+        store.append(Event(idea_id="ui", event_type=EVENT_RUN_REQ, actor=ACTOR_ORCH, source=ACTOR_ORCH,
+                           operation_id="op-run-1", payload={"run_id": "run-1", "side_effect": "read"}))
+        store.append(Event(idea_id="ui", event_type=EVENT_TOOL_CALL, actor=ACTOR_ORCH, source=ACTOR_ORCH,
+                           operation_id="op-run-1", payload={"run_id": "run-1", "call_id": "call-1"}))
+        store.append(Event(idea_id="ui", event_type=EVENT_TOOL_RESULT, actor=ACTOR_ORCH, source=ACTOR_ORCH,
+                           operation_id="op-run-1", payload={"run_id": "run-1", "call_id": "call-1", "rc": 0}))
+        store.append(Event(idea_id="ui", event_type=EVENT_RUN_SUCCEEDED, actor=ACTOR_ORCH, source=ACTOR_ORCH,
+                           operation_id="op-run-1", phase="ESTIMATION",
+                           payload={"run_id": "run-1", "summary": "运行成功"}))
         store.append(Event(idea_id="ui", event_type=EVENT_APPROVAL_REQ, actor="agent", phase="ESTIMATION", payload={"request_id": "approval-1", "act": "request_run", "reason": "需要确认主回归"}))
     finally:
         store.close()

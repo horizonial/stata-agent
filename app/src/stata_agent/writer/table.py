@@ -119,24 +119,45 @@ _STAT_LABELS = {"coef": "核心系数", "N": "样本量", "r2": "R²", "se": "SE
 
 
 def build_run_table(proj, run_id: str, *, title: str = "主回归") -> TableModel:
-    """从一次 run 的机器层构造单列回归表，并尽量给每个数字格挂 card_id。"""
+    """从一次 run 的机器层构造单列回归表。
+
+    A succeeded run is not printable merely because it has ``machine`` values:
+    every numeric cell must have its validator-issued numeric card and the card
+    must point back to this run's machine hash.
+    """
     from .ground import display_for
+    import hashlib
+    import json
 
     rec = proj.runs.get(run_id)
     if rec is None or rec.status != "succeeded":
         raise ValueError(f"run {run_id!r} 不存在或未成功，不能出表")
+    if not rec.machine:
+        raise ValueError(f"run {run_id!r} 无机器层数字，不能出表")
+    machine_hash = hashlib.sha256(
+        json.dumps(rec.machine, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
     cards_by_stat = {}
     for card in proj.cards.values():
         if card.kind == "numeric" and isinstance(card.locator, dict):
             if card.locator.get("run_id") == run_id:
                 cards_by_stat[str(card.locator.get("stat_type"))] = card.card_id
-    stats = ["coef", "N", "r2"]
+    stats = ["coef", "se", "N", "r2"]
     order = [s for s in stats if s in rec.machine]
     model = TableModel(title=title, columns=["主回归"])
     for stat in order:
         raw = rec.machine[stat]
         value = float(raw)
         cid = cards_by_stat.get(stat)
+        if cid is None:
+            raise ValueError(f"run {run_id!r} 的 {stat} 缺 numeric EvidenceCard，不能出表")
+        card = proj.cards.get(cid)
+        if card is None or card.kind != "numeric":
+            raise ValueError(f"run {run_id!r} 的 {stat} card 不完整，不能出表")
+        if card.locator.get("run_id") != run_id or card.machine_hash != machine_hash:
+            raise ValueError(f"run {run_id!r} 的 {stat} card provenance 不匹配，不能出表")
+        if not isinstance(card.value, dict) or float(card.value.get("value")) != value:
+            raise ValueError(f"run {run_id!r} 的 {stat} card 数值与机器层不一致，不能出表")
         display = display_for(stat, value) if stat != "se" else str(value)
         model.rows.append(Row(
             label=_STAT_LABELS.get(stat, stat),

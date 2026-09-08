@@ -12,7 +12,7 @@ import time
 import uuid
 from typing import Iterator, Optional
 
-from ..domain.reducers import Projection, fold as _fold
+from ..domain.reducers import Projection, apply as _apply, fold as _fold
 from ..events.append import assert_sane_event
 from ..events.schema import Event
 from ..events.upcast import upcast
@@ -86,13 +86,6 @@ class SQLiteStore:
     # ---------------------------------------------------------------- lease
     def _acquire_lease(self, *, takeover: bool) -> None:
         now = int(time.time())
-        row = self._conn.execute(
-            "SELECT writer_id, token FROM writer_lease WHERE writer_id='master'"
-        ).fetchone()
-        if row is not None:
-            if not takeover and row["writer_id"] != self._writer_id:
-                # 兼容性：单主键=master 行；简化用固定 writer_id=master
-                pass
         if takeover:
             self._conn.execute(
                 "INSERT INTO writer_lease(writer_id,token,revision,acquired_at,expires_at) "
@@ -103,9 +96,12 @@ class SQLiteStore:
             )
             self._conn.commit()
             return
-        cur = self._conn.execute(
+        self._conn.execute(
             "INSERT INTO writer_lease(writer_id,token,revision,acquired_at,expires_at) "
-            "VALUES('master',?,0,?,?) ON CONFLICT(writer_id) DO NOTHING",
+            "VALUES('master',?,0,?,?) "
+            "ON CONFLICT(writer_id) DO UPDATE SET token=excluded.token, acquired_at=excluded.acquired_at, "
+            "expires_at=excluded.expires_at "
+            "WHERE writer_lease.expires_at <= excluded.acquired_at",
             (self._token, now, now + 3600),
         )
         self._conn.commit()
@@ -114,9 +110,14 @@ class SQLiteStore:
             raise LeaseConflict("账本已被其他 writer 持有（单写者）")
 
     def _check_lease(self) -> None:
-        row = self._conn.execute("SELECT token FROM writer_lease WHERE writer_id='master'").fetchone()
+        row = self._conn.execute(
+            "SELECT token, expires_at FROM writer_lease WHERE writer_id='master'"
+        ).fetchone()
+        now = int(time.time())
         if row is None or row["token"] != self._token:
             raise StaleWrite(f"writer={self._writer_id!r} 的租约已失效（fence）")
+        if int(row["expires_at"]) <= now:
+            raise StaleWrite(f"writer={self._writer_id!r} 的租约已过期（fence）")
 
     def _bump_revision(self) -> None:
         self._conn.execute(
@@ -130,38 +131,80 @@ class SQLiteStore:
 
     # ---------------------------------------------------------------- append
     def append(self, event: Event) -> int:
+        with self._conn:
+            self._check_lease()
+            projection = self.project(event.idea_id)
+            self._validate_candidate(event, projection)
+            return self._insert_event(event)
+
+    def append_many(self, events: list[Event]) -> int:
+        """Atomically append a batch after folding every candidate event.
+
+        Validation happens against an in-memory projection that is advanced for
+        each event in the same batch.  Any invalid event therefore aborts the
+        surrounding transaction and leaves no earlier batch item committed.
+        """
+        if not events:
+            return 0
+        with self._conn:
+            self._check_lease()
+            projections: dict[str, Projection] = {}
+            seen_fingerprints: set[tuple[str, str, str]] = set()
+            last = 0
+            for event in events:
+                projection = projections.get(event.idea_id)
+                if projection is None:
+                    projection = self.project(event.idea_id)
+                self._validate_candidate(
+                    event,
+                    projection,
+                    seen_fingerprints=seen_fingerprints,
+                )
+                projections[event.idea_id] = _apply(projection, event)
+                last = self._insert_event(event)
+                if event.fingerprint:
+                    seen_fingerprints.add((event.idea_id, event.event_type, event.fingerprint))
+            return last
+
+    def _validate_candidate(
+        self,
+        event: Event,
+        projection: Projection,
+        *,
+        seen_fingerprints: set[tuple[str, str, str]] | None = None,
+    ) -> None:
+        """Validate one candidate before its INSERT executes."""
         assert_sane_event(event)
-        if event.fingerprint and self._exists_fingerprint(event):
-            raise DuplicateFingerprint(
-                f"dup (idea={event.idea_id}, {event.event_type}, {event.fingerprint[:12]}…)"
-            )
+        if event.fingerprint:
+            key = (event.idea_id, event.event_type, event.fingerprint)
+            if (seen_fingerprints and key in seen_fingerprints) or self._exists_fingerprint(event):
+                raise DuplicateFingerprint(
+                    f"dup (idea={event.idea_id}, {event.event_type}, {event.fingerprint[:12]}…)"
+                )
+        # _apply raises IllegalEventSequence for invalid FSM/card/claim events.
+        _apply(projection, event)
+
+    def _insert_event(self, event: Event) -> int:
+        """Insert one already validated event in the caller's transaction."""
         seq = self._next_seq()
         event_id = uuid.uuid4().hex
         prev = self._prev_event_id(event.idea_id, event.branch_id)
         now = int(time.time() * 1000)
-        with self._conn:
-            self._check_lease()
-            self._conn.execute(
-                "INSERT INTO events(event_id,idea_id,seq,branch_id,prev_event_id,phase,event_type,"
-                "schema_version,actor,source,correlation_id,causation_id,operation_id,attempt_id,"
-                "fingerprint,confidence,side_effect_state,payload,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    event_id, event.idea_id, seq, event.branch_id, prev, event.phase, event.event_type,
-                    event.schema_version, event.actor, event.source, event.correlation_id, event.causation_id,
-                    event.operation_id, event.attempt_id, event.fingerprint, event.confidence,
-                    event.side_effect_state, json.dumps(event.payload, ensure_ascii=False), now,
-                ),
-            )
-            self._set_last_seq(seq)
-            self._bump_revision()
+        self._conn.execute(
+            "INSERT INTO events(event_id,idea_id,seq,branch_id,prev_event_id,phase,event_type,"
+            "schema_version,actor,source,correlation_id,causation_id,operation_id,attempt_id,"
+            "fingerprint,confidence,side_effect_state,payload,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                event_id, event.idea_id, seq, event.branch_id, prev, event.phase, event.event_type,
+                event.schema_version, event.actor, event.source, event.correlation_id, event.causation_id,
+                event.operation_id, event.attempt_id, event.fingerprint, event.confidence,
+                event.side_effect_state, json.dumps(event.payload, ensure_ascii=False), now,
+            ),
+        )
+        self._set_last_seq(seq)
+        self._bump_revision()
         return seq
-
-    def append_many(self, events: list[Event]) -> int:
-        last = None
-        for ev in events:
-            last = self.append(ev)  # 每步独立小事务；量小够用
-        return last if last is not None else 0
 
     # ---------------------------------------------------------------- query
     def scan(
@@ -233,6 +276,7 @@ class SQLiteStore:
         blob = json.dumps({"summary": summary, "seq": asof}, ensure_ascii=False).encode()
         now = int(time.time() * 1000)
         with self._conn:
+            self._check_lease()
             self._conn.execute("DELETE FROM snapshots WHERE idea_id=? AND kind='full'", (idea_id,))
             self._conn.execute(
                 "INSERT INTO snapshots(idea_id,as_of_seq,kind,blob,created_at) VALUES(?,?,'full',?,?)",

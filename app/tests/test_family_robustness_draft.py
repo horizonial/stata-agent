@@ -7,6 +7,7 @@ from docx import Document
 from stata_agent.domain.family import family_view, register_run, select_main
 from stata_agent.storage.sqlite_store import SQLiteStore
 from stata_agent.tools.fake_executor import FakeExecutor
+from stata_agent.tools.evidence_signer import sign_run_numeric_cards
 from stata_agent.tools.robustness import check_robustness
 from stata_agent.writer.draft_multi import draft_docx, draft_from_ledger, regression_table_from_results
 
@@ -27,6 +28,7 @@ def _run_family(store):
     ex = FakeExecutor(store)
     for vid in ("main", "robust_no_mgr", "robust_cluster_chain"):
         out = ex.execute("sysuse auto, clear\nreg price mpg", idea="i1", run_id=f"i1-{vid}")
+        sign_run_numeric_cards(store, out["run_id"], idea="i1")
         register_run(store, "i1", "family-i1", out["run_id"], variant=vid)
     select_main(store, "i1", "family-i1", "i1-main", reason="主回归")
     return store

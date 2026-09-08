@@ -79,62 +79,31 @@ def _remember_approved_note(
     try:
         from .memory.memstore import remember_decision
 
+        add = getattr(memory, "add", None)
         parameters: Mapping[str, inspect.Parameter]
         try:
-            parameters = inspect.signature(remember_decision).parameters
+            parameters = inspect.signature(add).parameters if callable(add) else {}
         except (TypeError, ValueError):
             parameters = {}
-        supports_v2 = "workspace_id" in parameters or any(
+        accepts_kwargs = any(
             parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters.values()
         )
-        if supports_v2:
-            decision_kwargs: dict[str, object] = {"workspace_id": workspace_id}
-            if "source_ids" in parameters or any(
-                parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters.values()
-            ):
-                decision_kwargs["source_ids"] = source_ids
+        if callable(add) and ("workspace_id" in parameters or accepts_kwargs):
+            rich: dict[str, object] = {
+                "kind": "decision",
+                "workspace_id": workspace_id,
+                "confidence": "explicit",
+            }
+            if "source_ids" in parameters or accepts_kwargs:
+                rich["source_ids"] = source_ids
             elif "provenance" in parameters:
-                decision_kwargs["provenance"] = source_ids
-            remember_decision(
-                memory,
-                note,
-                **decision_kwargs,
-            )
+                rich["provenance"] = source_ids
+            if "scope" in parameters or accepts_kwargs:
+                rich["scope"] = "project"
+            add(f"研究决定：{note}", **rich)
         else:
-            # A V2 store may be paired with an older helper during a rolling
-            # upgrade.  Prefer its richer add API when available so the note
-            # still carries workspace/provenance rather than silently falling
-            # back to a global legacy record.
-            add = getattr(memory, "add", None)
-            add_parameters: Mapping[str, inspect.Parameter]
-            try:
-                add_parameters = inspect.signature(add).parameters if callable(add) else {}
-            except (TypeError, ValueError):
-                add_parameters = {}
-            add_supports_v2 = "workspace_id" in add_parameters or any(
-                parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in add_parameters.values()
-            )
-            if add_supports_v2 and callable(add):
-                add_kwargs: dict[str, object] = {
-                    "kind": "decision",
-                    "workspace_id": workspace_id,
-                    "confidence": "explicit",
-                }
-                if "source_ids" in add_parameters or any(
-                    parameter.kind is inspect.Parameter.VAR_KEYWORD
-                    for parameter in add_parameters.values()
-                ):
-                    add_kwargs["source_ids"] = source_ids
-                elif "provenance" in add_parameters:
-                    add_kwargs["provenance"] = source_ids
-                if "scope" in add_parameters:
-                    add_kwargs["scope"] = "project"
-                add(f"研究决定：{note}", **add_kwargs)
-            else:
-                remember_decision(memory, note)
+            remember_decision(memory, note)
     except Exception:
         # The grant/reject event remains the source of truth.  Memory is a
         # reusable constraint layer and cannot block the auditable decision.

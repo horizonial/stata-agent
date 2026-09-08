@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Stata 研究助手</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <div id="app-shell" class="app-shell">
+      <header class="topbar" aria-label="Stata 研究助手顶栏">
+        <button id="menu-button" class="icon-button menu-button" type="button"
+                aria-label="收起工作区导航" aria-expanded="true" aria-controls="workspace-sidebar">
+          <span class="icon icon-menu" aria-hidden="true"></span>
+        </button>
+        <div class="brand-lockup">
+          <span class="product-name">Stata 研究助手</span>
+          <span class="product-mark" aria-label="本机应用">LOCAL</span>
+        </div>
+        <span class="topbar-divider" aria-hidden="true"></span>
+        <button id="workspace-context" class="workspace-context" type="button"
+                aria-label="打开当前工作区菜单" aria-haspopup="listbox">
+          <span id="workspace-context-title" class="workspace-context-title">未命名研究</span>
+          <span class="icon icon-chevron-down" aria-hidden="true"></span>
+        </button>
+        <div class="topbar-actions">
+          <span class="local-status" title="研究数据、文献与文本只在本机处理">
+            <span class="status-dot is-ok" aria-hidden="true"></span>
+            <span>本机运行</span>
+            <span class="topbar-separator" aria-hidden="true">·</span>
+            <span id="run-status-label">空闲</span>
+          </span>
+          <button id="trace-button" class="topbar-button" type="button">
+            <span class="icon icon-trace" aria-hidden="true"></span>
+            Trace
+          </button>
+          <button id="top-draft-button" class="topbar-button" type="button" disabled title="尚无已确认结论">
+            <span class="icon icon-file" aria-hidden="true"></span>
+            Word
+          </button>
+          <button id="user-button" class="avatar-button" type="button" aria-label="用户菜单">R</button>
+        </div>
+      </header>
+
+      <div id="refresh-notice" class="refresh-notice" role="status" hidden>
+        状态暂时未更新，页面保留上次成功内容。
+      </div>
+
+      <main class="app-body">
+        <aside id="workspace-sidebar" class="workspace-sidebar" aria-label="工作区导航">
+          <div class="sidebar-top">
+            <button id="new-workspace-button" class="new-workspace-button" type="button">
+              <span class="icon icon-plus" aria-hidden="true"></span>
+              <span class="sidebar-label">新建工作区</span>
+            </button>
+          </div>
+          <div class="sidebar-heading">工作区</div>
+          <div id="workspace-list" class="workspace-list" role="list" aria-label="工作区列表"></div>
+          <div class="sidebar-footer">
+            <button class="sidebar-footer-button" type="button" data-nav-page="settings">
+              <span class="icon icon-settings" aria-hidden="true"></span>
+              <span class="sidebar-label">设置</span>
+            </button>
+            <div class="environment-note">
+              <span class="status-dot is-ok" aria-hidden="true"></span>
+              <span class="sidebar-label">本机环境正常</span>
+            </div>
+          </div>
+        </aside>
+
+        <section id="main-surface" class="main-surface" aria-label="工作区内容">
+          <div id="view-root" class="view-root"></div>
+        </section>
+      </main>
+    </div>
+
+    <div id="evidence-overlay" class="overlay" hidden>
+      <button class="overlay-backdrop" type="button" data-close-overlay="evidence-overlay" aria-label="关闭证据溯源"></button>
+      <aside class="evidence-sheet" role="dialog" aria-modal="true" aria-labelledby="evidence-title">
+        <div class="sheet-header">
+          <div>
+            <div class="eyebrow">证据溯源</div>
+            <h2 id="evidence-title">证据详情</h2>
+          </div>
+          <button id="close-evidence-button" class="icon-button" type="button" aria-label="关闭证据溯源">
+            <span class="icon icon-close" aria-hidden="true"></span>
+          </button>
+        </div>
+        <div id="evidence-content" class="sheet-content"></div>
+        <div class="sheet-footer">
+          <button id="view-run-button" class="secondary-button" type="button" disabled>查看运行</button>
+          <button id="copy-citation-button" class="primary-button" type="button" disabled>复制引用标识</button>
+        </div>
+      </aside>
+    </div>
+
+    <div id="decision-overlay" class="overlay" hidden>
+      <button class="overlay-backdrop" type="button" data-close-overlay="decision-overlay" aria-label="关闭审批说明"></button>
+      <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="decision-title">
+        <div class="sheet-header">
+          <div>
+            <div class="eyebrow">研究闸门</div>
+            <h2 id="decision-title">说明你的决定</h2>
+          </div>
+          <button id="close-decision-button" class="icon-button" type="button" aria-label="关闭审批说明">
+            <span class="icon icon-close" aria-hidden="true"></span>
+          </button>
+        </div>
+        <p id="decision-description" class="dialog-description"></p>
+        <label class="dialog-label" for="decision-note">给 Agent 的说明（可选）</label>
+        <textarea id="decision-note" rows="4" maxlength="4000" placeholder="例如：保留城市和年份固定效应，改用滞后一期的解释变量。"></textarea>
+        <div class="dialog-actions">
+          <button id="cancel-decision-button" class="secondary-button" type="button">取消</button>
+          <button id="submit-decision-button" class="primary-button" type="button">提交拒绝</button>
+        </div>
+      </section>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>

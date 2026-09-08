@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "scenarios": {
+    "L1_TOOL_ROUTING": {
+      "policy": {
+        "mark_done": "deny",
+        "request_run_in_estimation": "allow",
+        "spec_change_in_formal": "ask",
+        "web_in_local_strict": "deny"
+      },
+      "enforcer": {
+        "execute_in_done_rejected": true,
+        "missing_required_argument_rejected": true,
+        "private_url_rejected": true,
+        "registered_tools_exposed": true,
+        "unknown_tool_rejected": true
+      }
+    },
+    "L2_RUN_FSM_RECOVERY": {
+      "valid_trace": [
+        "run.requested",
+        "tool.call",
+        "tool.result",
+        "run.succeeded"
+      ],
+      "valid_run_status": "succeeded",
+      "invalid_terminal_rejected": true,
+      "invalid_event_count_after_rejection": 1,
+      "uncertain_trace": [
+        "run.requested",
+        "tool.call",
+        "tool.result",
+        "run.uncertain",
+        "system.restored"
+      ],
+      "recovery_first": ["op-uncertain -> rerun"],
+      "recovery_second_same": true,
+      "restored_event_count": 1
+    },
+    "L3_EVIDENCE_GROUNDING": {
+      "machine_keys": ["N", "coef", "r2"],
+      "signed_card_ids": [
+        "card-eval-evidence-N",
+        "card-eval-evidence-coef",
+        "card-eval-evidence-r2"
+      ],
+      "claim_id": "claim-eval-evidence",
+      "claim_card_count": 3,
+      "sentence_numbers_grounded": true,
+      "tampered_numbers_detected": ["-238.800", "80"],
+      "draft_has_claim": true,
+      "draft_nonempty": true
+    },
+    "L4_FAKE_TO_DRAFT": {
+      "trace": [
+        "user.message",
+        "tool.invoked",
+        "run.requested",
+        "tool.call",
+        "tool.result",
+        "run.succeeded",
+        "evidence.card_signed",
+        "evidence.card_signed",
+        "evidence.card_signed",
+        "claim.signed",
+        "tool.done",
+        "tool.invoked",
+        "tool.done"
+      ],
+      "tool_calls": 2,
+      "run_status": "succeeded",
+      "card_count": 3,
+      "claim_count": 1,
+      "draft_written": true,
+      "draft_has_claim": true
+    }
+  }
+}

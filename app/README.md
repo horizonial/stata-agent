@@ -9,6 +9,9 @@
 # 离线测试（无需网络/Stata）
 python -m pytest -q
 
+# 产品级离线评测（无 Stata、网络或模型 key）
+python -m stata_agent.eval --json
+
 # CLI mock loop（你说一句/想一步/回一句，全落 events）
 printf '问题\n补料\n' | PYTHONPATH=src python -m stata_agent.cli --db .demo.sqlite3
 
@@ -29,6 +32,24 @@ res = run_until_gate(s, 'i1', '跑 price 对 mpg 主回归', default_provider(),
 for r in res: print(r.ran_run_id, r.frozen_specs, r.machine)
 PY
 ```
+
+产品评测包含四个稳定 golden scenario：工具选择/拒绝、run FSM 与 uncertain 恢复、证据数字接地，以及 `消息 → 工具 → Fake → card → claim → draft` 完整链路。命令返回 0（全通过）、1（scenario 失败）、2（golden/配置错误）；`--scenario L4_FAKE_TO_DRAFT` 可只跑单项。安装开发依赖后也可使用 `stata-agent-eval --json`。
+
+发布前门禁：
+
+```bash
+python -m pytest -q
+python -m stata_agent.eval --json
+python -m ruff check src tests
+python -m mypy src
+python -m coverage run --branch -m pytest -q
+python -m coverage report
+python -m build --wheel
+```
+
+当前全量 branch coverage 实测为 75%，CI 门槛同样为 75%。
+
+golden 只比较结构化稳定字段，不锁 UUID、时间或绝对路径；源文件位于 `eval_golden/scenarios.json`，wheel 内含一份用于安装后评测的副本。真实 Stata、远端模型和 Windows UI 验收步骤见仓库根目录 `PRODUCTIZATION_PLAN.md` 的“发布门禁与验收清单”。
 
 ## 环境要求（live 项）
 - LLM key：设 `DEEPSEEK_API_KEY`（deepseek，优先）或已有 `DASHSCOPE_API_KEY`（qwen 兜底）。

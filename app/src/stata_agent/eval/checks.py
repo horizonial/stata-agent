@@ -7,9 +7,9 @@ run() 聚合；任何 fail 记 ok=False。
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
-from ..domain.models import Claim, EvidenceCard
+from ..domain.models import EvidenceCard
 from ..writer.citation import citation_marker, validate_citations
 from ..writer.ground import display_for, validate_sentence
 

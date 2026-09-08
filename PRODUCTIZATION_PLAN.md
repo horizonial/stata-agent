@@ -6,7 +6,7 @@
 
 ## 当前基线
 
-- `main` 工作树干净，离线测试 187 passed / 4 skipped。
+- `main` 工作树干净，离线测试基线为 191 passed / 4 skipped（195 collected；live Stata/远端模型默认跳过）。
 - 事件账本、工具策略、隐私模式、证据链、SSE、多工作区、RAG、Skill 与 wheel 打包已有实现。
 - 当前主要风险集中在运行取消与资源生命周期、真实环境稳定性、交互状态表达，以及可重复的产品级评测/发布门禁。
 
@@ -48,4 +48,31 @@
 3. Stop/断连/超时都会产生可审计终态，不遗留不可解释的运行中操作。
 4. golden scenarios 能覆盖一次完整的“消息 → 工具 → Stata/Fake → card → claim → draft”链路。
 5. 默认配置不联网、不公开监听、不泄露本地路径或凭据。
+
+## 发布门禁与验收清单
+
+在 `app/` 下执行以下离线门禁；CI 的四个 job 与本地命令保持一致：
+
+```bash
+python -m pytest -q
+python -m stata_agent.eval --json
+python -m ruff check src tests
+python -m mypy src
+python -m coverage run --branch -m pytest -q
+python -m coverage report
+python -m build --wheel
+```
+
+`product-eval` 的退出码为 0/1/2：全部 scenario 通过、scenario 失败、评测配置/黄金文件错误。JSON 只含稳定字段；不得把 UUID、时间戳、临时目录或绝对路径写入 golden。当前实测 coverage 基线为 `75%`（branch coverage），门槛锁定为 `75%`；新增代码不得通过扩大忽略项来掩盖下降。
+
+版本策略：`app/pyproject.toml` 的 `project.version` 是唯一发布版本源；发版时同步变更日志和 Git tag（`v<version>`），不在运行时从工作树推断版本。0.x 允许兼容性调整但仍须更新 release notes；进入 1.0 后遵循 SemVer。
+
+真实环境是发布前的人工验收，不在默认 CI 中启用：
+
+1. 在隔离 Windows 账户配置真实 Stata + `stata-mcp`，设置 `STATA_AGENT_EXECUTOR=stata`，运行一个内置 auto 回归；确认 run 事件为 `requested → call → result → succeeded`，do 文件、命令 hash、Stata 版本/ flavor 和机器层值均可复核。
+2. 注入一次 Stata transport timeout/断连；确认账本出现 `run.uncertain`，重启后 `reconcile_uncertain` 只产生一次 `system.restored`，不会静默重跑写操作。
+3. 远端模型验收必须由用户显式设置 `STATA_AGENT_PRIVACY=approved_remote`（或明确同意的 `mixed_sanitized`），检查请求中无本地绝对路径、凭据和原始研究文本泄露；`local_strict` 下应明确拒绝。
+4. 从独立 wheel 安装目录启动 UI，确认 `index.html`、静态 JS/CSS、默认 `SKILL.md` 可读取；再手工打开一个工作区，验证 stop、审批、断线恢复和 draft 下载。
+
+发布记录至少保留：Git commit/tag、四个 CI job 链接、pytest/Ruff/Mypy/coverage/wheel 输出、真实 Stata 与远端模型验收者和日期、已知遗留项及回滚版本。
 

@@ -22,7 +22,7 @@ const STATUS_LABELS = {
 
 const EVENT_GROUPS = {
   approval: new Set(["approval.requested", "approval.granted", "approval.rejected"]),
-  run: new Set(["run.requested", "tool.call", "tool.result", "run.succeeded", "run.failed", "run.uncertain"]),
+  run: new Set(["run.requested", "tool.call", "tool.result", "tool.invoked", "tool.done", "run.succeeded", "run.failed", "run.uncertain"]),
   conclusion: new Set(["spec.proposed", "spec.frozen", "spec.locked", "family.main_result_selected", "evidence.card_signed", "claim.signed"]),
   health: new Set(["budget.limit", "health.probe"]),
 };
@@ -100,6 +100,10 @@ const state = {
   draftText: "",
   streamingText: "",
   streamingRendered: "",
+  streamingTools: [],
+  activeRequestId: null,
+  stopPending: false,
+  stopStatus: null,
   lastFingerprint: "",
   sending: false,
   refreshing: false,
@@ -229,10 +233,20 @@ async function jsonResponse(response) {
   let body = null;
   try { body = await response.json(); } catch { body = null; }
   if (!response.ok) {
-    const detail = body && body.detail ? body.detail : `请求失败（${response.status}）`;
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    const error = body && typeof body.error === "object" ? body.error : null;
+    const detail = error?.message || body?.detail || body?.message || `请求失败（${response.status}）`;
+    const failure = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    if (error?.code) failure.code = String(error.code);
+    failure.status = response.status;
+    throw failure;
   }
   return body;
+}
+
+function responseErrorMessage(payload, fallback = "请求未完成。") {
+  const error = payload && typeof payload.error === "object" ? payload.error : null;
+  const detail = error?.message || payload?.detail || payload?.message;
+  return detail ? String(detail) : fallback;
 }
 
 async function getJSON(url, options = {}) {
@@ -261,6 +275,10 @@ function cancelWorkspaceRequests() {
   state.refreshController = null;
   state.sending = false;
   state.streamingText = "";
+  state.streamingTools = [];
+  state.activeRequestId = null;
+  state.stopPending = false;
+  state.stopStatus = null;
   state.events = [];
   state.traceItems = [];
   state.traceCursor = null;
@@ -529,14 +547,24 @@ function renderComposer() {
   textarea.maxLength = 20000;
   textarea.placeholder = "给研究助手发消息…";
   const footer = el("div", { className: "composer-footer" });
-  const hint = el("span", { className: `composer-hint${state.sending ? " is-busy" : ""}`, text: state.sending ? "正在提交研究指示…" : "Enter 发送 · Shift+Enter 换行" });
+  const hint = el("span", { className: `composer-hint${state.sending ? " is-busy" : ""}`, text: state.sending ? state.stopPending ? "正在请求停止…" : "正在处理研究指示…" : "Enter 发送 · Shift+Enter 换行" });
   const actions = el("div", { className: "composer-actions" });
   const mode = el("button", { className: `topbar-button mode-button${state.goalMode ? " is-active" : ""}`, type: "button", text: state.goalMode ? "目标模式" : "交互模式", dataset: { action: "toggle-mode" }, title: state.goalMode ? "目标模式：自动推进到需你决定处" : "交互模式：每轮在需要你决定处停下" });
   const attach = el("button", { className: "icon-button", type: "button", ariaLabel: "附件暂不可用", disabled: true, title: "当前后端暂不支持附件" });
   attach.append(icon("paperclip"));
   const send = el("button", { className: "primary-button", type: "submit", disabled: state.sending });
   send.append(icon("send"), el("span", { text: "发送" }));
-  actions.append(mode, attach, send);
+  actions.append(mode, attach);
+  if (state.sending) {
+    actions.append(el("button", {
+      className: "secondary-button stop-button",
+      type: "button",
+      text: state.stopPending ? "正在停止…" : "停止",
+      disabled: state.stopPending,
+      dataset: { action: "stop" },
+      ariaLabel: state.stopPending ? "正在请求停止本轮运行" : "停止本轮运行",
+    }));
+  } else actions.append(send);
   footer.append(hint, actions);
   shell.append(textarea, footer);
   form.append(shell);
@@ -545,7 +573,7 @@ function renderComposer() {
 
 function renderMarkdown(md) {
   // 极简安全 markdown 渲染：纯 DOM 构建（createTextNode/el，天然防 XSS）。
-  // 处理：标题 #/##/###、无序列表 -/*、有序列表 1.、代码块 ```、加粗 **、行内代码 `。
+  // 处理：标题、列表、代码块、加粗、行内代码和表格；不解析 HTML/URL。
   const frag = document.createDocumentFragment();
   const lines = String(md || "").split("\n");
   let i = 0;
@@ -576,6 +604,49 @@ function renderMarkdown(md) {
     listBuf = null;
   };
 
+  const tableCells = (line) => {
+    let value = String(line || "").trim();
+    if (value.startsWith("|")) value = value.slice(1);
+    if (value.endsWith("|")) value = value.slice(0, -1);
+    const cells = [];
+    let cell = "";
+    let escaped = false;
+    for (const char of value) {
+      if (char === "|" && !escaped) {
+        cells.push(cell.trim()); cell = ""; continue;
+      }
+      if (char === "\\" && !escaped) { escaped = true; cell += char; continue; }
+      cell += char; escaped = false;
+    }
+    cells.push(cell.trim());
+    return cells.map((item) => item.replaceAll("\\|", "|"));
+  };
+
+  const isTableDivider = (line) => {
+    const cells = tableCells(line);
+    return cells.length > 1 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+  };
+
+  const appendTable = (headers, rows) => {
+    const columns = Math.max(headers.length, ...rows.map((row) => row.length), 1);
+    const table = el("table", { className: "md-table" });
+    const headRow = el("tr");
+    for (let column = 0; column < columns; column += 1) {
+      headRow.append(el("th", {}, inline(headers[column] || `列 ${column + 1}`)));
+    }
+    table.append(el("thead", {}, [headRow]));
+    const body = el("tbody");
+    rows.forEach((row) => {
+      const tr = el("tr");
+      for (let column = 0; column < columns; column += 1) {
+        tr.append(el("td", {}, inline(row[column] || "")));
+      }
+      body.append(tr);
+    });
+    table.append(body);
+    frag.append(table);
+  };
+
   while (i < lines.length) {
     const line = lines[i];
     if (line.trim().startsWith("```")) {
@@ -589,6 +660,18 @@ function renderMarkdown(md) {
 
     const t = line.trim();
     if (!t) { flushList(); i++; continue; }
+    if (t.includes("|") && i + 1 < lines.length && isTableDivider(lines[i + 1])) {
+      flushList();
+      const headers = tableCells(t);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].trim() && lines[i].includes("|")) {
+        rows.push(tableCells(lines[i]));
+        i += 1;
+      }
+      appendTable(headers, rows);
+      continue;
+    }
     const h = t.match(/^(#{1,6})\s+(.*)$/);
     if (h) { flushList(); frag.append(el(`h${Math.min(h[1].length, 4)}`, { className: "md-heading" }, inline(h[2]))); i++; continue; }
     const ul = t.match(/^[-*]\s+(.*)$/);
@@ -606,19 +689,20 @@ function renderMarkdown(md) {
 
 function messageMeta(message, role) {
   const meta = el("div", { className: "message-meta" });
-  meta.append(el("span", { className: "message-author", text: role === "user" ? "你" : role === "system" ? "系统" : "Stata 研究助手" }));
+  meta.append(el("span", { className: "message-author", text: role === "user" ? "你" : role === "system" ? "系统" : role === "tool" ? "工具" : "Stata 研究助手" }));
   if (message.created_at) meta.append(el("span", { text: formatTime(message.created_at) }));
   if (message.seq !== null && message.seq !== undefined) meta.append(el("span", { className: "message-seq", text: `#${message.seq}` }));
   return meta;
 }
 
 function renderMessage(message, latest = false) {
-  const role = message.role === "user" ? "user" : message.role === "system" ? "system" : "assistant";
+  const role = message.kind === "tool" ? "tool" : message.role === "user" ? "user" : message.role === "system" ? "system" : "assistant";
   const article = el("article", { className: `message message-${role}${latest ? " is-latest" : ""}`, dataset: { seq: message.seq ?? "" } });
-  article.append(el("span", { className: "message-avatar", text: role === "user" ? "R" : role === "system" ? "·" : "S" }));
+  article.append(el("span", { className: "message-avatar", text: role === "user" ? "R" : role === "system" ? "·" : role === "tool" ? "⌘" : "S" }));
   const body = el("div", { className: "message-body" });
   body.append(messageMeta(message, role));
-  if (message.kind === "approval") body.append(renderApproval(message));
+  if (message.kind === "tool") body.append(renderToolCard(message));
+  else if (message.kind === "approval") body.append(renderApproval(message));
   else if (message.kind === "run") {
     body.append(el("p", { className: "message-text", text: message.text || "运行完成，机器层结果已签入证据链。" }));
     body.append(renderResultBlock(message));
@@ -652,6 +736,44 @@ function renderMessage(message, latest = false) {
   return article;
 }
 
+function toolStatusLabel(status) {
+  if (status === "running") return "执行中";
+  if (status === "succeeded") return "已完成";
+  if (status === "failed") return "失败";
+  return "已停止";
+}
+
+function renderToolCard(tool) {
+  const status = tool?.status || (tool?.ok === false ? "failed" : tool?.ok === true ? "succeeded" : "running");
+  const card = el("section", {
+    className: `tool-card tool-card-${status}`,
+    dataset: { toolId: tool?.tool_id || "" },
+    ariaLabel: `工具 ${valueOrFallback(tool?.tool_name || tool?.name, "未知工具")}`,
+  });
+  const header = el("div", { className: "tool-card-header" });
+  header.append(
+    el("span", { className: "tool-card-name", text: valueOrFallback(tool?.tool_name || tool?.name, "未知工具") }),
+    el("span", { className: "tool-card-status", text: toolStatusLabel(status) }),
+  );
+  const meta = [];
+  if (tool?.tool_id) meta.push(String(tool.tool_id));
+  if (Array.isArray(tool?.args_keys) && tool.args_keys.length) meta.push(`参数：${tool.args_keys.join("、")}`);
+  if (meta.length) card.append(el("div", { className: "tool-card-meta", text: meta.join(" · ") }));
+  if (status === "failed" && tool?.error) {
+    const error = typeof tool.error === "object" ? tool.error.message : tool.error;
+    card.append(el("p", { className: "tool-card-error", text: valueOrFallback(error, "工具执行失败。") }));
+  }
+  card.prepend(header);
+  return card;
+}
+
+function renderStreamingTools() {
+  const container = $("[data-streaming-tools]");
+  if (!container) return;
+  clear(container);
+  (Array.isArray(state.streamingTools) ? state.streamingTools : []).forEach((tool) => container.append(renderToolCard(tool)));
+}
+
 function renderBusyMessage() {
   const article = el("article", { className: "message message-assistant message-busy" });
   article.append(el("span", { className: "message-avatar", text: "S" }));
@@ -660,7 +782,8 @@ function renderBusyMessage() {
   // 流式文本放一个固定 data 属性节点，供 delta 到达时局部更新 textContent（不全量重建）
   const p = el("p", { className: "message-text", dataset: { streamingText: "true" } });
   p.textContent = state.streamingText || "正在处理你的研究指示…";
-  body.append(p);
+  body.append(p, el("div", { className: "streaming-tools", dataset: { streamingTools: "true" } }));
+  renderStreamingTools();
   article.append(body);
   return article;
 }
@@ -683,8 +806,9 @@ function renderApproval(message) {
   const permission = message.gate_kind === "permission_gate" || record?.kind === "permission_gate";
   const panel = el("section", { className: `approval-inline${pending ? "" : " is-decided"}`, dataset: { approvalId: message.request_id || "" } });
   const top = el("div", { className: "approval-top" });
-  top.append(el("span", { className: "approval-icon" }, [icon(permission ? "health" : "approval")]), el("span", { className: "approval-title", text: `${pending ? "需要你确认" : record.status === "approved" ? "已批准" : "已拒绝"} · ${approvalSubject(message)}` }));
-  if (!pending) top.append(el("span", { className: "approval-status", text: record.status === "approved" ? "已记录" : "已记录" }));
+  const decidedLabel = record?.status === "modified" ? "已修改" : record?.status === "approved" ? "已批准" : "已拒绝";
+  top.append(el("span", { className: "approval-icon" }, [icon(permission ? "health" : "approval")]), el("span", { className: "approval-title", text: `${pending ? "需要你确认" : decidedLabel} · ${approvalSubject(message)}` }));
+  if (!pending) top.append(el("span", { className: "approval-status", text: decidedLabel }));
   const content = el("div", { className: "approval-content" });
   content.append(el("p", { text: message.reason || record?.reason || "Agent 需要你确认这一项研究动作。" }));
   if (message.note || record?.note) content.append(el("p", { className: "approval-note", text: message.note || record.note }));
@@ -906,7 +1030,7 @@ function renderApprovalsResource() {
   else approvals.slice().reverse().forEach((record) => {
     const line = el("div", { className: "resource-line" });
     const main = el("div", { className: "resource-line-main" });
-    const dot = el("span", { className: `status-dot ${record.status === "approved" ? "is-ok" : record.status === "rejected" ? "is-error" : "is-busy"}` });
+    const dot = el("span", { className: `status-dot ${record.status === "approved" || record.status === "modified" ? "is-ok" : record.status === "rejected" ? "is-error" : "is-busy"}` });
     main.append(el("div", { className: "resource-line-title" }, [dot, document.createTextNode(` ${approvalSubject(record)}`)]), el("div", { className: "resource-line-meta", text: `${record.status} · #${valueOrFallback(record.requested_seq)}` }));
     if (record.status === "pending") line.append(main, el("button", { className: "link-button resource-line-action", type: "button", text: "回到对话", dataset: { approvalId: record.request_id } }));
     else line.append(main);
@@ -1135,13 +1259,24 @@ function closeOverlay(id) {
   if (id === "decision-overlay") state.decisionContext = null;
 }
 
-function openDecision(requestId) {
+function openDecision(requestId, decision = "reject") {
   const overlay = $("#decision-overlay");
   if (!overlay) return;
   const record = approvalFor(requestId);
-  state.decisionContext = { requestId };
+  state.decisionContext = { requestId, decision };
+  const title = $("#decision-title");
+  const eyebrow = overlay.querySelector(".eyebrow");
+  const label = $(".dialog-label", overlay);
+  const submit = $("#submit-decision-button");
+  const modifying = decision === "modify";
+  if (title) title.textContent = modifying ? "提出修改要求" : "说明你的拒绝决定";
+  if (eyebrow) eyebrow.textContent = modifying ? "审批修订" : "研究闸门";
+  if (label) label.textContent = modifying ? "具体修改要求（必填）" : "给 Agent 的说明（可选）";
+  if (submit) submit.textContent = modifying ? "提交修改" : "提交拒绝";
   const description = $("#decision-description");
-  if (description) description.textContent = record ? `你将拒绝“${approvalSubject(record)}”。研究材料与 Trace 不会丢失。` : "你将拒绝这项研究动作。";
+  if (description) description.textContent = modifying
+    ? record ? `请写清楚对“${approvalSubject(record)}”需要怎样调整；要求会写入用户事件和审批审计，并从同一停点继续。` : "请写清楚需要调整的研究动作。"
+    : record ? `你将拒绝“${approvalSubject(record)}”。研究材料与 Trace 不会丢失。` : "你将拒绝这项研究动作。";
   const note = $("#decision-note");
   if (note) note.value = "";
   overlay.hidden = false; note?.focus();
@@ -1152,14 +1287,51 @@ async function submitDecision(requestId, decision, note = "") {
   try {
     const result = await postJSON(workspaceURL(`/api/approvals/${encodeURIComponent(requestId)}/decision`), { decision, note });
     if (result?.state) state.snapshot = result.state;
-    if (decision === "approve") {
-      try { await postJSON(workspaceURL("/api/control/resume")); } catch (error) { showToast(`审批已批准，但续跑尚未完成：${error.message}`); }
+    if (decision === "approve" || decision === "modify") {
+      try { await postJSON(workspaceURL("/api/control/resume")); } catch (error) { showToast(`审批处理已记录，但续跑尚未完成：${error.message}`); }
     }
     closeOverlay("decision-overlay"); await refresh({ silent: true });
-    showToast(decision === "approve" ? "审批已批准，已尝试从当前停点继续。" : "审批已拒绝，决定已持久化。");
+    showToast(decision === "approve" ? "审批已批准，已尝试从当前停点继续。" : decision === "modify" ? "修改要求已记录，已尝试从当前停点继续。" : "审批已拒绝，决定已持久化。");
   } catch (error) {
     showToast(`提交审批失败：${error.message}`);
     $$('[data-decision]').forEach((button) => { button.disabled = false; });
+  }
+}
+
+function updateStopControls() {
+  const button = $("[data-action='stop']");
+  if (button) {
+    button.disabled = Boolean(state.stopPending);
+    button.textContent = state.stopPending ? "正在停止…" : "停止";
+    button.setAttribute("aria-label", state.stopPending ? "正在请求停止本轮运行" : "停止本轮运行");
+  }
+  const hint = $(".composer-hint");
+  if (hint && state.sending) {
+    hint.textContent = state.stopPending ? "正在请求停止…" : "正在处理研究指示…";
+  }
+}
+
+async function stopMessage() {
+  if (!state.sending || state.stopPending) return;
+  const requestId = state.activeRequestId;
+  if (!requestId) {
+    state.chatController?.abort();
+    return;
+  }
+  state.stopPending = true;
+  updateStopControls();
+  try {
+    const result = await postJSON(workspaceURL("/api/control/stop"), { request_id: requestId });
+    state.stopStatus = result?.status || "cancelling";
+    showToast(result?.status === "cancelled" ? "本轮已停止。" : "已请求停止本轮运行。正在收尾并保存可审计状态。");
+    // The server has received the cancellation request.  Closing the stream
+    // now is safe; the request-scoped worker retains the same cancel event and
+    // will finish its durable cleanup in the background.
+    state.chatController?.abort();
+  } catch (error) {
+    state.stopPending = false;
+    updateStopControls();
+    showToast(`停止本轮失败：${error.message}`);
   }
 }
 
@@ -1172,7 +1344,15 @@ async function sendMessage() {
   const controller = new AbortController();
   state.chatController?.abort();
   state.chatController = controller;
-  state.draftText = ""; state.sending = true; state.streamingText = ""; state.streamingRendered = ""; render();
+  state.draftText = "";
+  state.sending = true;
+  state.streamingText = "";
+  state.streamingRendered = "";
+  state.streamingTools = [];
+  state.activeRequestId = null;
+  state.stopPending = false;
+  state.stopStatus = null;
+  render();
   try {
     const res = await fetch(workspaceURL("/api/chat/stream"), {
       method: "POST",
@@ -1180,10 +1360,17 @@ async function sendMessage() {
       body: JSON.stringify({ text, mode: state.goalMode ? "goal" : "interactive" }),
       signal: controller.signal,
     });
-    if (!res.ok || !res.body) throw new Error(`请求失败(${res.status})`);
+    if (!res.ok) {
+      let payload = null;
+      try { payload = await res.json(); } catch { /* non-JSON proxy failure */ }
+      throw new Error(responseErrorMessage(payload, `请求失败（${res.status}）`));
+    }
+    if (!res.body) throw new Error("服务端没有返回流式响应。");
+    state.activeRequestId = res.headers.get("x-request-id") || null;
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
+    let streamTerminal = false;
     // 流式渲染（codex 式）：token 直接 append 到单一 buffer `streamingText`；
     // 一个 rAF 渲染循环每帧把 buffer 局部同步到 busy 节点 textContent，绝不 render() 全量重建。
     let rafId = null;
@@ -1212,20 +1399,40 @@ async function sendMessage() {
         if (!line) continue;
         let data; try { data = JSON.parse(line.slice(6)); } catch { continue; }
         if (generation !== state.workspaceGeneration || workspace !== state.activeWorkspace) return;
+        if (data.request_id) state.activeRequestId = String(data.request_id);
         if (data.type === "token") {
-          state.streamingText += data.text;  // 直接 append，rAF 循环负责渲染
+          state.streamingText += String(data.text || "");  // 只进入 assistant 文本缓冲
         } else if (data.type === "tool_started") {
-          state.streamingText += `\n▸ ${data.name}…\n`;
-        } else if (data.type === "tool_completed") {
-          state.streamingText += data.ok ? "  ✓ 完成\n" : "  ✕ 失败\n";
+          state.streamingTools.push({
+            tool_id: String(data.tool_id || `${data.request_id || "request"}:tool:${state.streamingTools.length + 1}`),
+            tool_name: String(data.tool || data.name || "未知工具"),
+            status: "running",
+          });
+          renderStreamingTools();
+        } else if (data.type === "tool_completed" || data.type === "tool_failed") {
+          const toolId = data.tool_id ? String(data.tool_id) : "";
+          let item = toolId ? state.streamingTools.find((tool) => tool.tool_id === toolId) : null;
+          if (!item) item = state.streamingTools.slice().reverse().find((tool) => tool.tool_name === String(data.tool || data.name || "未知工具") && tool.status === "running");
+          if (!item) {
+            item = { tool_id: toolId || `${data.request_id || "request"}:tool:${state.streamingTools.length + 1}`, tool_name: String(data.tool || data.name || "未知工具") };
+            state.streamingTools.push(item);
+          }
+          item.status = data.status || (data.ok === false ? "failed" : "succeeded");
+          item.ok = data.ok !== undefined ? Boolean(data.ok) : item.status === "succeeded";
+          item.error = data.error || null;
+          renderStreamingTools();
         } else if (data.type === "done") {
           if (data.state) state.snapshot = data.state;
+          state.stopStatus = data.status || null;
+          streamTerminal = true;
         } else if (data.type === "error") {
-          throw new Error(data.detail);
+          streamTerminal = true;
+          throw new Error(responseErrorMessage(data, "本轮未完成。"));
         }
       }
     }
     if (rafId) cancelAnimationFrame(rafId);
+    if (!streamTerminal) throw new Error("流式响应提前结束，未收到终态事件。");
     // 最后一次同步（去掉光标），再拉正式 state
     const node = $("[data-streaming-text]");
     if (node) node.textContent = state.streamingText;
@@ -1248,12 +1455,12 @@ async function sendMessage() {
         if (article) article.classList.remove("message-busy");
       }
       state.sending = false;
+      state.stopPending = false;
+      state.activeRequestId = null;
+      // 终态才允许一次完整投影刷新，确保工具卡和 composer 一起转正。
+      render();
       state.streamingText = "";
-      // 只恢复 composer（发送按钮可点、提示复原），不整页重绘
-      const send = $(".composer .primary-button[type='submit']");
-      if (send) send.disabled = false;
-      const hint = $(".composer-hint");
-      if (hint) { hint.textContent = "Enter 发送 · Shift+Enter 换行"; hint.classList.remove("is-busy"); }
+      state.streamingTools = [];
     }
   }
 }
@@ -1359,8 +1566,8 @@ function bindEvents() {
     if (decision) {
       const requestId = decision.dataset.requestId;
       if (decision.dataset.decision === "approve") submitDecision(requestId, "approve");
-      else if (decision.dataset.decision === "reject") openDecision(requestId);
-      else if (decision.dataset.decision === "modify") { state.draftText = `请修改“${approvalSubject(approvalFor(requestId) || { act: "研究动作" })}”的要求。`; setPage("chat"); render(); $("[data-composer-input]")?.focus(); }
+      else if (decision.dataset.decision === "reject") openDecision(requestId, "reject");
+      else if (decision.dataset.decision === "modify") openDecision(requestId, "modify");
       return;
     }
     const runButton = target.closest("[data-run-id]");
@@ -1373,6 +1580,7 @@ function bindEvents() {
     if (action) {
       const name = action.dataset.action;
       if (name === "toggle-mode") { state.goalMode = !state.goalMode; render(); }
+      else if (name === "stop") stopMessage();
       else if (name === "resume") resumeResearch();
       else if (name === "generate-draft") { if (state.snapshot?.draft_ready) window.location.assign(workspaceURL("/api/draft.docx")); else showToast("尚无已确认结论。"); }
       else if (name === "load-trace") { loadTrace({ reset: false, renderAfter: true }); }
@@ -1384,7 +1592,10 @@ function bindEvents() {
   $("#close-evidence-button")?.addEventListener("click", () => closeOverlay("evidence-overlay"));
   $("#close-decision-button")?.addEventListener("click", () => closeOverlay("decision-overlay"));
   $("#cancel-decision-button")?.addEventListener("click", () => closeOverlay("decision-overlay"));
-  $("#submit-decision-button")?.addEventListener("click", () => { const context = state.decisionContext; if (context) submitDecision(context.requestId, "reject", $("#decision-note")?.value.trim() || ""); });
+  $("#submit-decision-button")?.addEventListener("click", () => {
+    const context = state.decisionContext;
+    if (context) submitDecision(context.requestId, context.decision || "reject", $("#decision-note")?.value.trim() || "");
+  });
   $("#view-run-button")?.addEventListener("click", () => { closeOverlay("evidence-overlay"); setPage("models"); });
   $("#copy-citation-button")?.addEventListener("click", async () => {
     const detail = state.selectedEvidence?.detail; const claim = state.selectedEvidence?.claim;

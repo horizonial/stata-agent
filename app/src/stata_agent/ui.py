@@ -20,8 +20,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -40,6 +41,9 @@ from .events.schema import (
     EVENT_RUN_FAILED,
     EVENT_RUN_SUCCEEDED,
     EVENT_RUN_UNCERTAIN,
+    EVENT_TOOL_DONE,
+    EVENT_TOOL_INVOKED,
+    EVENT_STEERING,
     EVENT_USER,
     Event,
 )
@@ -65,14 +69,167 @@ _RAG_CACHE: dict[tuple[str, str], Any] = {}
 _RAG_CACHE_LOCK = threading.RLock()
 _SKILL_ERRORS: list[str] = []
 
+# Active stream controls are deliberately process-local.  The event ledger is
+# the durable source of research state; this small registry only lets a user
+# address one in-flight HTTP request without accidentally stopping another
+# workspace.  Terminal rows remain briefly so repeated stop requests return a
+# stable answer instead of flipping between 404 and success.
+_REQUEST_CONTROL_TTL = 3600
+_REQUEST_CONTROL_TERMINAL = frozenset({"completed", "failed", "cancelled"})
+_REQUEST_CONTROLS: dict[str, dict[str, Any]] = {}
+_REQUEST_CONTROLS_LOCK = threading.RLock()
+
 app = FastAPI(title="stata-agent · research UI")
 app.mount("/static", StaticFiles(directory=str(_UI_DIR)), name="ui-static")
+
+
+def _error_message(detail: Any, fallback: str) -> str:
+    if isinstance(detail, str) and detail.strip():
+        return detail.strip()
+    if isinstance(detail, (dict, list)):
+        try:
+            return json.dumps(detail, ensure_ascii=False)[:1000]
+        except (TypeError, ValueError):
+            pass
+    return fallback
+
+
+def _error_body(status_code: int, message: str, *, code: str | None = None, details: Any = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": False,
+        "error": {"code": code or f"http_{status_code}", "message": message},
+        # ``detail`` is kept for clients written against the original v0 API.
+        "detail": message,
+        "status_code": status_code,
+    }
+    if details:
+        payload["error"]["details"] = details
+    return payload
+
+
+@app.exception_handler(HTTPException)
+async def _http_error_handler(_request: Request, exc: HTTPException) -> JSONResponse:
+    message = _error_message(exc.detail, "请求未完成。")
+    return JSONResponse(status_code=exc.status_code, content=_error_body(exc.status_code, message))
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    # Do not echo submitted values (which may contain Stata code or private
+    # data); locations/messages are enough for a client-side form error.
+    details = [
+        {"loc": list(item.get("loc") or []), "msg": str(item.get("msg") or "参数无效"),
+         "type": str(item.get("type") or "value_error")}
+        for item in exc.errors()
+    ]
+    return JSONResponse(
+        status_code=422,
+        content=_error_body(422, "请求参数无效。", code="validation_error", details=details),
+    )
 
 # SQLiteStore owns a fenced single-writer lease even for projection reads.
 # FastAPI runs synchronous routes in a thread pool, while the browser refreshes
 # state/events/approvals concurrently. Serialising UI store sessions prevents a
 # read request from taking over the lease halfway through a chat write.
 _UI_STORE_LOCK = threading.RLock()
+
+
+def _prune_request_controls(now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    with _REQUEST_CONTROLS_LOCK:
+        expired = [
+            request_id
+            for request_id, control in _REQUEST_CONTROLS.items()
+            if control.get("status") in _REQUEST_CONTROL_TERMINAL
+            and now - float(control.get("finished_at") or control.get("created_at") or now) > _REQUEST_CONTROL_TTL
+        ]
+        for request_id in expired:
+            _REQUEST_CONTROLS.pop(request_id, None)
+
+
+def _register_request_control(request_id: str, idea: str, cancel_event: threading.Event) -> None:
+    _prune_request_controls()
+    with _REQUEST_CONTROLS_LOCK:
+        _REQUEST_CONTROLS[request_id] = {
+            "request_id": request_id,
+            "idea": idea,
+            "cancel_event": cancel_event,
+            "status": "running",
+            "cancel_requested": False,
+            "cancel_reason": None,
+            "created_at": time.time(),
+            "finished_at": None,
+        }
+
+
+def _request_control_public(control: dict[str, Any] | None) -> dict[str, Any] | None:
+    if control is None:
+        return None
+    return {
+        "request_id": control.get("request_id"),
+        "workspace": control.get("idea"),
+        "status": control.get("status"),
+        "cancel_requested": bool(control.get("cancel_requested")),
+        "cancel_reason": control.get("cancel_reason"),
+        "created_at": control.get("created_at"),
+        "finished_at": control.get("finished_at"),
+    }
+
+
+def _finish_request_control(request_id: str, *, status: str) -> None:
+    with _REQUEST_CONTROLS_LOCK:
+        control = _REQUEST_CONTROLS.get(request_id)
+        if control is None:
+            return
+        # A terminal result wins over a late disconnect callback.  This makes
+        # a stop racing the final SSE frame deterministic for the client.
+        if control.get("status") in _REQUEST_CONTROL_TERMINAL:
+            return
+        control["status"] = status
+        control["finished_at"] = time.time()
+
+
+def _request_cancel(request_id: str, idea: str, *, reason: str = "user") -> dict[str, Any]:
+    _prune_request_controls()
+    with _REQUEST_CONTROLS_LOCK:
+        control = _REQUEST_CONTROLS.get(request_id)
+        if control is None or control.get("idea") != idea:
+            raise HTTPException(status_code=404, detail="运行请求不存在或已过期。")
+        if control.get("status") in _REQUEST_CONTROL_TERMINAL:
+            return _request_control_public(control) or {}
+        control["cancel_requested"] = True
+        control["cancel_reason"] = reason
+        control["status"] = "cancelling"
+        control["cancel_event"].set()
+        return _request_control_public(control) or {}
+
+
+def _mark_request_disconnected(request_id: str) -> None:
+    with _REQUEST_CONTROLS_LOCK:
+        control = _REQUEST_CONTROLS.get(request_id)
+        if control is None or control.get("status") in _REQUEST_CONTROL_TERMINAL:
+            return
+        control["cancel_requested"] = True
+        control["cancel_reason"] = "disconnect"
+        control["status"] = "cancelling"
+        control["cancel_event"].set()
+
+
+def _request_control_snapshot(request_id: str) -> dict[str, Any] | None:
+    _prune_request_controls()
+    with _REQUEST_CONTROLS_LOCK:
+        return _request_control_public(_REQUEST_CONTROLS.get(request_id))
+
+
+def _latest_active_request(idea: str) -> dict[str, Any] | None:
+    _prune_request_controls()
+    with _REQUEST_CONTROLS_LOCK:
+        rows = [
+            control
+            for control in _REQUEST_CONTROLS.values()
+            if control.get("idea") == idea and control.get("status") not in _REQUEST_CONTROL_TERMINAL
+        ]
+        return max(rows, key=lambda item: float(item.get("created_at") or 0), default=None)
 
 
 class _LockedStore:
@@ -452,8 +609,10 @@ def _event_payload_preview(event: Event) -> dict[str, Any]:
     keys = {
         "request_id",
         "act",
+        "tool",
         "reason",
         "note",
+        "error",
         "run_id",
         "result_id",
         "spec_id",
@@ -530,6 +689,7 @@ def _approval_records(events: list[Event]) -> list[dict[str, Any]]:
                 "note": str(payload.get("note") or ""),
                 "target": payload.get("target") if isinstance(payload.get("target"), dict) else {},
                 "status": "pending",
+                "decision": None,
                 "requested_seq": event.seq,
                 "requested_at": event.created_at,
                 "decided_note": "",
@@ -537,8 +697,13 @@ def _approval_records(events: list[Event]) -> list[dict[str, Any]]:
                 "decided_at": None,
             }
         elif event.event_type in {EVENT_APPROVAL_GRANT, EVENT_APPROVAL_REJECT} and request_id in records:
+            decision = str(payload.get("decision") or "")
             records[request_id]["status"] = (
-                "approved" if event.event_type == EVENT_APPROVAL_GRANT else "rejected"
+                "modified" if decision == "modify"
+                else "approved" if event.event_type == EVENT_APPROVAL_GRANT else "rejected"
+            )
+            records[request_id]["decision"] = decision or (
+                "approve" if event.event_type == EVENT_APPROVAL_GRANT else "reject"
             )
             records[request_id]["decided_note"] = str(payload.get("note") or "")
             records[request_id]["decision_seq"] = event.seq
@@ -588,6 +753,7 @@ def _conversation(events: list[Event]) -> list[dict[str, Any]]:
     """Project durable conversation/replay blocks from append-only events."""
 
     messages: list[dict[str, Any]] = []
+    pending_tools: dict[str, list[dict[str, Any]]] = {}
     for event in events:
         payload = event.payload or {}
         base = {"seq": event.seq, "phase": event.phase, "created_at": event.created_at}
@@ -631,14 +797,58 @@ def _conversation(events: list[Event]) -> list[dict[str, Any]]:
                 }
             )
         elif event.event_type in {EVENT_APPROVAL_GRANT, EVENT_APPROVAL_REJECT}:
+            decision = str(payload.get("decision") or "")
             messages.append(
                 {
                     **base,
                     "role": "system",
                     "kind": "approval_decision",
                     "request_id": str(payload.get("request_id") or ""),
-                    "decision": "approved" if event.event_type == EVENT_APPROVAL_GRANT else "rejected",
+                    "decision": (
+                        decision
+                        if decision in {"approve", "reject", "modify"}
+                        else "approved" if event.event_type == EVENT_APPROVAL_GRANT else "rejected"
+                    ),
                     "note": str(payload.get("note") or ""),
+                }
+            )
+        elif event.event_type == EVENT_TOOL_INVOKED:
+            tool_name = str(payload.get("tool") or "未知工具")
+            args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
+            item = {
+                **base,
+                "role": "system",
+                "kind": "tool",
+                "tool_id": f"seq-{event.seq}",
+                "tool_name": tool_name,
+                "status": "running",
+                "ok": None,
+                "args_keys": sorted(str(key) for key in args)[:16],
+            }
+            messages.append(item)
+            pending_tools.setdefault(tool_name, []).append(item)
+        elif event.event_type == EVENT_TOOL_DONE:
+            tool_name = str(payload.get("tool") or "未知工具")
+            result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+            ok = bool(payload.get("ok"))
+            pending = pending_tools.get(tool_name) or []
+            item = pending.pop(0) if pending else None
+            if item is None:
+                item = {
+                    **base,
+                    "role": "system",
+                    "kind": "tool",
+                    "tool_id": f"seq-{event.seq}",
+                    "tool_name": tool_name,
+                    "args_keys": [],
+                }
+                messages.append(item)
+            item.update(
+                {
+                    "status": "succeeded" if ok else "failed",
+                    "ok": ok,
+                    "completed_seq": event.seq,
+                    "error": str(result.get("error") or result.get("detail") or "")[:800],
                 }
             )
         elif event.event_type == EVENT_RUN_SUCCEEDED:
@@ -764,13 +974,14 @@ def _summary(store: SQLiteStore, idea: str = _IDEA) -> dict[str, Any]:
             "available": checkpoint_event is not None,
             "seq": checkpoint_event.seq if checkpoint_event else None,
         },
+        "active_request": _request_control_public(_latest_active_request(idea)),
         "draft_ready": bool(any(c.status == "supported" for c in proj.claims.values())),
         "capabilities": {
             "approvals": True,
-            "approval_revision": False,
+            "approval_revision": True,
             "resume": True,
             "goal_mode": True,
-            "stop": False,
+            "stop": True,
             "draft": True,
             "cursor_events": True,
         },
@@ -1067,6 +1278,12 @@ class ApprovalDecisionIn(BaseModel):
     note: str = ""
 
 
+class StopIn(BaseModel):
+    """Optional request id for the idempotent in-flight cancellation endpoint."""
+
+    request_id: str | None = None
+
+
 def _decision(
     store: SQLiteStore,
     request_id: str,
@@ -1080,8 +1297,61 @@ def _decision(
         raise HTTPException(status_code=404, detail="审批请求不存在或已被清理。")
     if record["status"] != "pending":
         raise HTTPException(status_code=409, detail="该审批请求已经有决定，不能重复提交。")
+    decision = str(decision or "").strip().lower()
+    note = str(note or "").strip()
+    if len(note) > 4000:
+        raise HTTPException(status_code=413, detail="审批说明不能超过 4000 个字符。")
+    if decision == "modify":
+        if not note:
+            raise HTTPException(status_code=422, detail="提出修改时必须填写具体修改要求。")
+        # A revision is a first-class user instruction and an approval audit
+        # entry.  The grant event carries the explicit ``decision=modify``
+        # marker so the reducer can close the old pending gate without
+        # pretending that the user approved the original proposal.
+        store.append(Event(
+            idea_id=idea,
+            event_type=EVENT_USER,
+            actor=ACTOR_USER,
+            source=ACTOR_USER,
+            payload={
+                "text": note,
+                "request_id": request_id,
+                "approval_request_id": request_id,
+                "kind": "approval_revision",
+            },
+        ))
+        store.append(Event(
+            idea_id=idea,
+            event_type=EVENT_STEERING,
+            actor=ACTOR_USER,
+            source=ACTOR_USER,
+            payload={
+                "request_id": request_id,
+                "decision": "modify",
+                "note": note,
+                "kind": "approval_revision",
+            },
+        ))
+        event_seq = store.append(Event(
+            idea_id=idea,
+            event_type=EVENT_APPROVAL_GRANT,
+            actor=ACTOR_USER,
+            source=ACTOR_USER,
+            payload={
+                "request_id": request_id,
+                "decision": "modify",
+                "note": note,
+                "kind": "approval_revision",
+            },
+        ))
+        return {
+            "decision": "modified",
+            "event": EVENT_APPROVAL_GRANT,
+            "event_seq": event_seq,
+            "state": _summary(store, idea),
+        }
     if decision not in {"approve", "reject"}:
-        raise HTTPException(status_code=501, detail="当前后端只支持批准或拒绝；请通过对话提出修改要求。")
+        raise HTTPException(status_code=422, detail="decision 必须是 approve|reject|modify。")
     event_kind = runner_approve(store, request_id, decision=decision, note=note, idea=idea)
     return {
         "decision": "approved" if decision == "approve" else "rejected",
@@ -1173,11 +1443,25 @@ def control_resume(ws: str = _IDEA):
 
 
 @app.post("/api/control/stop")
-def control_stop(ws: str = _IDEA):
-    """Explicitly report the missing cancellation primitive; never fake success."""
+def control_stop(body: StopIn | None = None, request_id: str | None = None, ws: str = _IDEA):
+    """Request cancellation for exactly one in-flight stream.
 
-    _resolve_workspace(ws)
-    raise HTTPException(status_code=501, detail="当前后端尚未提供安全的运行中断控制；请等待当前请求返回。")
+    The endpoint is idempotent: once a request reaches a terminal state,
+    repeating stop returns that same state and never mutates a later request.
+    Omitting ``request_id`` is retained as a convenience for old clients and
+    targets only the latest active request in the selected workspace.
+    """
+
+    idea = _resolve_workspace(ws)
+    requested_id = body.request_id if body and body.request_id else request_id
+    if not requested_id:
+        control = _latest_active_request(idea)
+        if control is None:
+            return {"ok": True, "request_id": None, "workspace": idea,
+                    "status": "idle", "cancel_requested": False}
+        requested_id = str(control["request_id"])
+    result = _request_cancel(str(requested_id), idea)
+    return {"ok": True, **result}
 
 
 @app.get("/api/draft")
@@ -1342,6 +1626,12 @@ def _run_chat_sync(
             network_available=(pm != "local_strict"),
             phase=s.project(idea).phase,
         )
+        # Runtime-control may add a typed cancellation field later.  Setting
+        # the attribute keeps this UI compatible with both the current
+        # ToolContext and that future implementation without widening the
+        # toolkit ownership boundary.
+        if cancel_event is not None:
+            setattr(ctx, "cancel_event", cancel_event)
         if cancel_event is not None and cancel_event.is_set():
             return "", None, _summary(s, idea)
         # ``interactive`` is deliberately one model step; ``goal`` may use
@@ -1412,9 +1702,10 @@ async def chat_stream(body: ChatIn, ws: str = _IDEA):
         return f"data: {_json.dumps({**obj, 'request_id': request_id}, ensure_ascii=False)}\n\n"
 
     async def gen():
-        yield sse({"type": "start"})
         evq: _queue.Queue = _queue.Queue()
         cancel_event = threading.Event()
+        _register_request_control(request_id, idea, cancel_event)
+        yield sse({"type": "start", "status": "running", "schema": "sse.v1"})
 
         def on_event(ev):
             if cancel_event.is_set():
@@ -1423,7 +1714,7 @@ async def chat_stream(body: ChatIn, ws: str = _IDEA):
 
         def run():
             try:
-                return _run_chat_sync(
+                result = _run_chat_sync(
                     idea,
                     text,
                     body.mode,
@@ -1431,7 +1722,16 @@ async def chat_stream(body: ChatIn, ws: str = _IDEA):
                     request_id=request_id,
                     cancel_event=cancel_event,
                 )
+                _finish_request_control(
+                    request_id,
+                    status="cancelled" if cancel_event.is_set() else "completed",
+                )
+                return result
             except Exception as error:  # noqa: BLE001
+                _finish_request_control(
+                    request_id,
+                    status="cancelled" if cancel_event.is_set() else "failed",
+                )
                 return None, None, {"__error__": str(error)[:200]}
 
         task = asyncio.create_task(asyncio.to_thread(run))
@@ -1445,14 +1745,45 @@ async def chat_stream(body: ChatIn, ws: str = _IDEA):
                 except _queue.Empty:
                     return events
 
+        tool_counter = 0
+        pending_tool_ids: dict[str, list[str]] = {}
+
         def render_event(ev: dict) -> str | None:
+            nonlocal tool_counter
             kind = ev.get("type")
             if kind == "text_delta":
                 return sse({"type": "token", "text": ev.get("text", "")})
             if kind == "tool_started":
-                return sse({"type": "tool_started", "name": ev.get("name", "")})
+                name = str(ev.get("name") or ev.get("tool") or "未知工具")
+                tool_counter += 1
+                tool_id = str(ev.get("tool_id") or f"{request_id}:tool:{tool_counter}")
+                pending_tool_ids.setdefault(name, []).append(tool_id)
+                return sse({
+                    "type": "tool_started",
+                    "tool_id": tool_id,
+                    "tool": name,
+                    "name": name,
+                    "status": "running",
+                })
             if kind == "tool_completed":
-                return sse({"type": "tool_completed", "name": ev.get("name", ""), "ok": ev.get("ok")})
+                name = str(ev.get("name") or ev.get("tool") or "未知工具")
+                ids = pending_tool_ids.get(name) or []
+                tool_id = str(ev.get("tool_id") or (ids.pop(0) if ids else f"{request_id}:tool:{tool_counter + 1}"))
+                ok = bool(ev.get("ok"))
+                result = {
+                    "type": "tool_completed",
+                    "tool_id": tool_id,
+                    "tool": name,
+                    "name": name,
+                    "ok": ok,
+                    "status": "succeeded" if ok else "failed",
+                }
+                if not ok:
+                    result["error"] = {
+                        "code": "tool_failed",
+                        "message": str(ev.get("error") or "工具执行失败。")[0:500],
+                    }
+                return sse(result)
             return None
 
         try:
@@ -1472,9 +1803,17 @@ async def chat_stream(body: ChatIn, ws: str = _IDEA):
                             yield rendered
                     reply, ask, state = task.result()
                     if state and "__error__" in state:
-                        yield sse({"type": "error", "detail": state["__error__"]})
+                        detail = str(state["__error__"])
+                        yield sse({"type": "error", "error": {"code": "request_failed", "message": detail}, "detail": detail})
                     else:
-                        yield sse({"type": "done", "ask": ask, "state": state})
+                        control = _request_control_snapshot(request_id) or {}
+                        yield sse({
+                            "type": "done",
+                            "ask": ask,
+                            "state": state,
+                            "status": control.get("status", "completed"),
+                            "cancel_requested": bool(control.get("cancel_requested")),
+                        })
                     break
                 now = time.monotonic()
                 if now - last_heartbeat >= 15:
@@ -1485,10 +1824,10 @@ async def chat_stream(body: ChatIn, ws: str = _IDEA):
             # Starlette cancels an async generator when the client disconnects.
             # The worker may already be in a provider call, but this flag stops
             # forwarding and prevents not-yet-started UI work from proceeding.
-            cancel_event.set()
+            _mark_request_disconnected(request_id)
             raise
         finally:
-            cancel_event.set()
+            _mark_request_disconnected(request_id)
 
     return StreamingResponse(
         gen(),

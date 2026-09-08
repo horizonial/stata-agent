@@ -225,8 +225,25 @@ button:disabled { cursor: not-allowed; }
 .message .md-list li { margin: 2px 0; }
 .message .md-code { margin: 8px 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-soft); overflow-x: auto; }
 .message .md-code code { font-family: ui-monospace, Consolas, monospace; font-size: 13px; color: var(--text); }
+.message .md-table { width: 100%; margin: 10px 0; border-collapse: collapse; table-layout: fixed; }
+.message .md-table th, .message .md-table td { padding: 8px; border: 1px solid var(--border); text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.message .md-table th { background: var(--surface-soft); color: var(--text-muted); font-size: 12px; font-weight: 650; }
+.message .md-table td { color: var(--text-soft); font-size: 13px; }
 .message .inline-code { padding: 1px 5px; border-radius: 4px; background: var(--surface-soft); font-family: ui-monospace, Consolas, monospace; font-size: 0.92em; }
 .message .message-text strong { font-weight: 650; }
+
+.message-tool .message-avatar { background: var(--surface-soft); color: var(--accent); font-size: 14px; }
+.tool-card { margin-top: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-soft); }
+.tool-card-header { display: flex; align-items: center; gap: 10px; }
+.tool-card-name { color: var(--text); font-family: var(--font-mono); font-size: 12px; font-weight: 650; overflow-wrap: anywhere; }
+.tool-card-status { margin-left: auto; color: var(--text-muted); font-size: 12px; }
+.tool-card-meta { margin-top: 6px; color: var(--text-muted); font-family: var(--font-mono); font-size: 11px; overflow-wrap: anywhere; }
+.tool-card-error { margin: 7px 0 0; color: var(--danger); line-height: 1.55; overflow-wrap: anywhere; }
+.tool-card-succeeded .tool-card-status { color: var(--success); }
+.tool-card-failed { border-color: #edc0c0; background: var(--danger-soft); }
+.tool-card-failed .tool-card-status { color: var(--danger); }
+.tool-card-running .tool-card-status { color: var(--accent); }
+.streaming-tools { display: flex; flex-direction: column; gap: 7px; }
 
 .result-block, .approval-inline, .inline-notice { margin-top: 14px; border: 1px solid var(--border-strong); border-radius: 7px; background: var(--surface); }
 .result-block summary, .approval-inline > .approval-top { display: flex; align-items: center; gap: 9px; min-height: 42px; padding: 9px 14px; border-bottom: 1px solid var(--border); cursor: pointer; list-style: none; }

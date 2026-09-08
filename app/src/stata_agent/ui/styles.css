@@ -218,6 +218,16 @@ button:disabled { cursor: not-allowed; }
 .message-busy { color: var(--text-muted); }
 .message-busy .message-text { color: var(--text-muted); }
 
+/* 极简 markdown 渲染 */
+.message .md-heading { margin: 10px 0 4px; font-weight: 650; line-height: 1.4; color: var(--text); }
+.message .md-heading { font-size: 15px; }
+.message .md-list { margin: 6px 0 4px; padding-left: 22px; color: var(--text); line-height: 1.7; }
+.message .md-list li { margin: 2px 0; }
+.message .md-code { margin: 8px 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-soft); overflow-x: auto; }
+.message .md-code code { font-family: ui-monospace, Consolas, monospace; font-size: 13px; color: var(--text); }
+.message .inline-code { padding: 1px 5px; border-radius: 4px; background: var(--surface-soft); font-family: ui-monospace, Consolas, monospace; font-size: 0.92em; }
+.message .message-text strong { font-weight: 650; }
+
 .result-block, .approval-inline, .inline-notice { margin-top: 14px; border: 1px solid var(--border-strong); border-radius: 7px; background: var(--surface); }
 .result-block summary, .approval-inline > .approval-top { display: flex; align-items: center; gap: 9px; min-height: 42px; padding: 9px 14px; border-bottom: 1px solid var(--border); cursor: pointer; list-style: none; }
 .result-block summary::-webkit-details-marker { display: none; }

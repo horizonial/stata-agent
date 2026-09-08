@@ -99,6 +99,7 @@ const state = {
   goalMode: false,
   draftText: "",
   streamingText: "",
+  streamingRendered: "",
   lastFingerprint: "",
   sending: false,
   refreshing: false,
@@ -353,9 +354,11 @@ async function refresh({ silent = false } = {}) {
     state.snapshot = snapshot;
     mergeEvents(Array.isArray(eventBody) ? eventBody : eventBody?.items || []);
     state.refreshFailed = false;
-    // 数据没变就跳过 render，避免每次轮询 clear+重建导致的闪烁/输入丢失
+    // 数据没变就跳过 render，避免每次轮询 clear+重建导致的闪烁/输入丢失。
+    // 关键：sending（流式进行中）期间绝不 render——流式渲染由 sendMessage 的 flush
+    // 局部更新负责，这里只更新 state.snapshot 数据；否则全量重建会把流式文本"快进"成整段。
     const fingerprint = _fingerprint();
-    if (fingerprint !== state.lastFingerprint || state.sending) {
+    if (!state.sending && fingerprint !== state.lastFingerprint) {
       render();
       state.lastFingerprint = fingerprint;
     }
@@ -540,6 +543,67 @@ function renderComposer() {
   return form;
 }
 
+function renderMarkdown(md) {
+  // 极简安全 markdown 渲染：纯 DOM 构建（createTextNode/el，天然防 XSS）。
+  // 处理：标题 #/##/###、无序列表 -/*、有序列表 1.、代码块 ```、加粗 **、行内代码 `。
+  const frag = document.createDocumentFragment();
+  const lines = String(md || "").split("\n");
+  let i = 0;
+  let inCode = false;
+  let codeBuf = [];
+  let listBuf = null;  // { ordered, items[] }
+
+  const inline = (text) => {
+    const nodes = [];
+    const re = /(\*\*[^*]+\*\*|`[^`]+`)/g;
+    let last = 0; let m;
+    while ((m = re.exec(text)) !== null) {
+      if (m.index > last) nodes.push(document.createTextNode(text.slice(last, m.index)));
+      const tok = m[0];
+      if (tok.startsWith("**")) nodes.push(el("strong", { text: tok.slice(2, -2) }));
+      else nodes.push(el("code", { className: "inline-code", text: tok.slice(1, -1) }));
+      last = m.index + tok.length;
+    }
+    if (last < text.length) nodes.push(document.createTextNode(text.slice(last)));
+    return nodes.length ? nodes : [document.createTextNode(text)];
+  };
+
+  const flushList = () => {
+    if (!listBuf) return;
+    const list = el(listBuf.ordered ? "ol" : "ul", { className: "md-list" });
+    listBuf.items.forEach((item) => list.append(el("li", {}, inline(item))));
+    frag.append(list);
+    listBuf = null;
+  };
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.trim().startsWith("```")) {
+      if (inCode) {
+        frag.append(el("pre", { className: "md-code" }, [el("code", { text: codeBuf.join("\n") })]));
+        codeBuf = []; inCode = false;
+      } else { inCode = true; codeBuf = []; }
+      i++; continue;
+    }
+    if (inCode) { codeBuf.push(line); i++; continue; }
+
+    const t = line.trim();
+    if (!t) { flushList(); i++; continue; }
+    const h = t.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { flushList(); frag.append(el(`h${Math.min(h[1].length, 4)}`, { className: "md-heading" }, inline(h[2]))); i++; continue; }
+    const ul = t.match(/^[-*]\s+(.*)$/);
+    if (ul) { if (!listBuf || listBuf.ordered) { flushList(); listBuf = { ordered: false, items: [] }; } listBuf.items.push(ul[1]); i++; continue; }
+    const ol = t.match(/^\d+\.\s+(.*)$/);
+    if (ol) { if (!listBuf || !listBuf.ordered) { flushList(); listBuf = { ordered: true, items: [] }; } listBuf.items.push(ol[1]); i++; continue; }
+    flushList();
+    frag.append(el("p", { className: "message-text" }, inline(t)));
+    i++;
+  }
+  flushList();
+  if (inCode) frag.append(el("pre", { className: "md-code" }, [el("code", { text: codeBuf.join("\n") })]));
+  return frag;
+}
+
 function messageMeta(message, role) {
   const meta = el("div", { className: "message-meta" });
   meta.append(el("span", { className: "message-author", text: role === "user" ? "你" : role === "system" ? "系统" : "Stata 研究助手" }));
@@ -574,7 +638,7 @@ function renderMessage(message, latest = false) {
     const candidate = message.ask && message.ask !== summary ? message.ask : message.text || summary;
     const content = role === "assistant" && summary.trim() === String(candidate).trim() ? "" : candidate;
     if (role === "assistant" && summary) body.append(el("h2", { className: "message-heading", text: summary }));
-    if (content) body.append(el("p", { className: "message-text", text: content }));
+    if (content) body.append(renderMarkdown(content));
     if (role === "assistant" && Array.isArray(message.acts) && message.acts.length) {
       const details = el("details", { className: "message-details" });
       details.append(el("summary", { text: "查看依据" }));
@@ -593,13 +657,10 @@ function renderBusyMessage() {
   article.append(el("span", { className: "message-avatar", text: "S" }));
   const body = el("div", { className: "message-body" });
   body.append(messageMeta({ created_at: Date.now() }, "assistant"));
-  // 流式：显示正在累积的文本 + 光标；否则显示"处理中"
-  if (state.streamingText) {
-    body.append(el("p", { className: "message-text", text: state.streamingText }));
-    body.append(el("span", { className: "stream-cursor", text: "▌" }));
-  } else {
-    body.append(el("p", { className: "message-text", text: "正在处理你的研究指示…" }));
-  }
+  // 流式文本放一个固定 data 属性节点，供 delta 到达时局部更新 textContent（不全量重建）
+  const p = el("p", { className: "message-text", dataset: { streamingText: "true" } });
+  p.textContent = state.streamingText || "正在处理你的研究指示…";
+  body.append(p);
   article.append(body);
   return article;
 }
@@ -1111,7 +1172,7 @@ async function sendMessage() {
   const controller = new AbortController();
   state.chatController?.abort();
   state.chatController = controller;
-  state.draftText = ""; state.sending = true; state.streamingText = ""; render();
+  state.draftText = ""; state.sending = true; state.streamingText = ""; state.streamingRendered = ""; render();
   try {
     const res = await fetch(workspaceURL("/api/chat/stream"), {
       method: "POST",
@@ -1123,10 +1184,23 @@ async function sendMessage() {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
-    // 节流：token 先累积，再用 rAF 批量上屏，避免每个 token 都整页重绘
-    let pending = "";
-    let raf = null;
-    const flush = () => { if (pending) { state.streamingText += pending; pending = ""; render(); } raf = null; };
+    // 流式渲染（codex 式）：token 直接 append 到单一 buffer `streamingText`；
+    // 一个 rAF 渲染循环每帧把 buffer 局部同步到 busy 节点 textContent，绝不 render() 全量重建。
+    let rafId = null;
+    const streamLoop = () => {
+      if (state.streamingText !== state.streamingRendered) {
+        state.streamingRendered = state.streamingText;
+        const node = $("[data-streaming-text]");
+        if (node) {
+          node.textContent = state.streamingText + "▌";
+          node.style.color = "var(--text)";  // 流式文本用正式颜色，非灰色占位
+          const scroll = $(".chat-scroll");
+          if (scroll) scroll.scrollTop = scroll.scrollHeight;  // 滚动跟随
+        } else render();  // 首帧：节点还没建，全量建一次
+      }
+      rafId = state.sending ? requestAnimationFrame(streamLoop) : null;
+    };
+    rafId = requestAnimationFrame(streamLoop);
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -1139,23 +1213,22 @@ async function sendMessage() {
         let data; try { data = JSON.parse(line.slice(6)); } catch { continue; }
         if (generation !== state.workspaceGeneration || workspace !== state.activeWorkspace) return;
         if (data.type === "token") {
-          pending += data.text;
-          if (!raf) raf = requestAnimationFrame(flush);
+          state.streamingText += data.text;  // 直接 append，rAF 循环负责渲染
         } else if (data.type === "tool_started") {
-          pending += `\n▸ ${data.name}…\n`;
-          if (!raf) raf = requestAnimationFrame(flush);
+          state.streamingText += `\n▸ ${data.name}…\n`;
         } else if (data.type === "tool_completed") {
-          pending += data.ok ? "  ✓ 完成\n" : "  ✕ 失败\n";
-          if (!raf) raf = requestAnimationFrame(flush);
+          state.streamingText += data.ok ? "  ✓ 完成\n" : "  ✕ 失败\n";
         } else if (data.type === "done") {
-          if (raf) { cancelAnimationFrame(raf); flush(); }
           if (data.state) state.snapshot = data.state;
         } else if (data.type === "error") {
           throw new Error(data.detail);
         }
       }
     }
-    if (raf) { cancelAnimationFrame(raf); flush(); }
+    if (rafId) cancelAnimationFrame(rafId);
+    // 最后一次同步（去掉光标），再拉正式 state
+    const node = $("[data-streaming-text]");
+    if (node) node.textContent = state.streamingText;
     await refresh({ silent: true });
   } catch (error) {
     if (error?.name !== "AbortError" && generation === state.workspaceGeneration) {
@@ -1166,9 +1239,21 @@ async function sendMessage() {
   finally {
     if (state.chatController === controller) state.chatController = null;
     if (generation === state.workspaceGeneration) {
+      // 就地转正：把流式 busy 消息原地转成正式消息（去光标、去灰色 class），
+      // 不 clear+重建整个视图，避免 done 瞬间的"页面跳一下"。
+      const node = $("[data-streaming-text]");
+      if (node) {
+        node.textContent = state.streamingText;  // 去掉光标 ▌
+        const article = node.closest(".message");
+        if (article) article.classList.remove("message-busy");
+      }
       state.sending = false;
       state.streamingText = "";
-      render();
+      // 只恢复 composer（发送按钮可点、提示复原），不整页重绘
+      const send = $(".composer .primary-button[type='submit']");
+      if (send) send.disabled = false;
+      const hint = $(".composer-hint");
+      if (hint) { hint.textContent = "Enter 发送 · Shift+Enter 换行"; hint.classList.remove("is-busy"); }
     }
   }
 }

@@ -253,13 +253,38 @@ def validate_url(url: Any) -> str | None:
     return None
 
 
-def _validate_code_paths(code: str, ctx: ToolContext | None) -> str | None:
-    """Catch obvious absolute paths embedded in executable Stata code."""
+# 相对路径穿越：`../`/`..\` 段（前面是引号/空白/等号/逗号，避免误伤 `a..b` 类标识符）
+_REL_TRAVERSAL = re.compile(r"(?<![\w.\-])(?:\.\.[\\/]+)+[^\s\"'<>`]*")
 
+
+def _strip_stata_comments(code: str) -> str:
+    """Remove Stata comments (block /* */, line //, whole-line *) before scanning."""
+    cleaned = re.sub(r"/\*.*?\*/", " ", code, flags=re.S)
+    lines = []
+    for raw in cleaned.splitlines():
+        line = raw.split("//", 1)[0]
+        stripped = line.strip()
+        if stripped.startswith("*"):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _validate_code_paths(code: str, ctx: ToolContext | None) -> str | None:
+    """Catch absolute and relative (`../`) paths embedded in executable Stata code.
+
+    Study code has no legitimate reason to reach outside its workspace root, so
+    any `..` traversal in a path-like token is a fail-closed deny.  Comments are
+    stripped first so a benign note does not trip the guard.
+    """
     for match in _ABS_PATH_IN_TEXT.finditer(code):
         error = validate_path(match.group(0).rstrip(",);"), ctx, kind="代码中的路径")
         if error:
             return error
+    cleaned = _strip_stata_comments(code)
+    rel = _REL_TRAVERSAL.search(cleaned)
+    if rel:
+        return f"代码中的相对路径穿越被拒：{rel.group(0)[:40]}"
     return None
 
 

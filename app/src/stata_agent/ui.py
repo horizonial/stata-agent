@@ -303,7 +303,9 @@ def _executor(store: SQLiteStore):
 
     configured = os.environ.get("STATA_AGENT_EXECUTOR", "").strip().lower()
     if configured == "stata":
-        run_root = DEFAULT_DB.parent / "runs"
+        # 绝对化 run_root：ToolEnforcer 的路径 containment 要求绝对路径，
+        # 且 Stata 的 cwd 在 stata-mcp，不能让相对路径导致越界/误判。
+        run_root = Path(DEFAULT_DB).resolve().parent / "runs"
         run_root.mkdir(parents=True, exist_ok=True)
         return StataExecutor(store, run_root=run_root, share_session=True)
     if configured in {"fake", "demo"} or (_demo_enabled() and not configured):

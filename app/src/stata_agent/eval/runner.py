@@ -303,8 +303,8 @@ def _scenario_l3_evidence_grounding() -> dict[str, Any]:
     }
 
 
-class _DeterministicChatProvider:
-    """Three-turn local provider used only by the offline L4 scenario."""
+class _ScriptedChatDouble:
+    """Three-turn local chat double used only by the offline L4 scenario."""
 
     provider = "local"
 
@@ -394,7 +394,7 @@ def _scenario_l4_fake_to_draft() -> dict[str, Any]:
             )
             result = run_loop(
                 store,
-                _DeterministicChatProvider(),
+                _ScriptedChatDouble(),
                 default_tools(),
                 ctx,
                 user_text="跑主回归",

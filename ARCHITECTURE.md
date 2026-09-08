@@ -118,19 +118,21 @@ SSE 流式输出 · 多工作区 UI · 有界内容哈希 RAG · 可匹配 Skill
 
 **尚未实现或需继续强化**：
 1. **模型代码准确性**：远端模型可能把 reg 命令跑偏，需 skill 细化、verify_result 主动复核或换更强模型。
-2. **Markdown 渲染**：前端目前纯文本，模型输出的 markdown 表格/代码块未渲染。
-3. **工具节点**：流式里 tool_started/completed 目前只是文本提示，未做独立节点卡片。
+2. **Markdown 表格**：前端已有极简 markdown 渲染器（标题/列表/加粗/行内代码/代码块，DOM 构建防 XSS），但 `| a | b |` 表格未支持。
+3. **工具节点**：流式里 tool_started/completed 目前只是文本提示（`▸ … ✓`），未做独立节点卡片。
 4. **会话复用稳定性**：真 Stata 连续跑偶发崩溃（已加失败降级，仍需观察）。
 5. **评测 harness**：L1–L4 未系统化；复现 golden 待建。
 6. **UI 附件/图片输入**、运行中强制 stop、审批“改要求”仍未接；SSE 断开只做尽力取消，不保证中断已开始的外部 Stata 调用。
 7. **自进化 skill**：evolve.py 还在 staging（promote 需人工），且 skill_candidate_md 生成的是旧 variants 格式，需对齐新 Skill 语义。
 
+**2026-09-09 已修并提交（`7abaf3a`）**：流式渲染（rAF 循环 + 局部更新 + 就地转正，done 无跳变/无灰色/滚动跟随）· markdown 渲染器（标题/列表/加粗/代码块）· system prompt 弱化实证身份（不强行拐研究）· tool_enforcer `../` 路径穿越拦截 · 新增 7 个测试文件（当前 187 过 4 skip）。
+
 ## 6. 给 codex 的接手清单
 
-1. **先跑通**：`cd app && python -m pytest`（109 过 4 skip）；`python -m stata_agent.ui`（8001）看 UI。
+1. **先跑通**：`cd app && python -m pytest`（187 过 4 skip）；`python -m stata_agent.ui`（8001）看 UI。
 2. **读设计**：`design/agent-tool-routing.md`（意图/工具/Skill 分层，最新方向）+ `design/rethink-autonomy.md`（为什么从"研究驾驶舱"改到"自主 agent"）。
-3. **别破坏的契约**：写权分离（模型不能签 card/claim）· 事件账本 append-only · 隐私门 · 工具 permission/enabled。
-4. **建议下一步**（按价值）：① Markdown 渲染前端；② 工具调用独立节点；③ 模型准确性(skill 细化/verify_result)；④ 评测 harness L1–L4；⑤ UI 附件/stop/审批改要求。
+3. **别破坏的契约**：写权分离（模型不能签 card/claim）· 事件账本 append-only · 隐私门 · 工具 permission/enabled · app.js 不得出现 `innerHTML`（防 XSS）。
+4. **建议下一步**（按价值）：① Markdown 表格；② 工具调用独立节点；③ 模型准确性(skill 细化/verify_result)；④ 评测 harness L1–L4；⑤ UI 附件/stop/审批改要求。
 5. **外部依赖路径**：stata-mcp 在 `C:\Users\user\stata-mcp`；文献库 `D:\work file\06_学位论文\一区\文献(1)`；key 在 `app/.env`（gitignored）。
 
 ## 7. 关键环境变量（app/.env）

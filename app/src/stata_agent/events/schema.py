@@ -39,6 +39,9 @@ EVENT_AMENDMENT = "amendment.recorded"
 EVENT_PHASE = "phase.transition"
 EVENT_CHECKPOINT = "checkpoint.snapshot"
 EVENT_COMPACTION = "compaction.boundary"
+# Context projection telemetry.  This event deliberately carries only layer
+# totals/source ids; it is not a transcript or a second research ledger.
+EVENT_CONTEXT_ASSEMBLED = "context.assembled"
 EVENT_HEALTH = "health.probe"
 EVENT_BUDGET = "budget.limit"
 EVENT_PRIVACY = "privacy.mode.changed"

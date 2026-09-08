@@ -174,9 +174,6 @@ def _memory_context(ctx: ToolContext, limit: int = 6) -> list[str]:
         return []
 
 
-_CONTEXT_ASSEMBLED_EVENT = "context.assembled"
-
-
 class _LegacyContextBudgetExceeded(RuntimeError):
     """Local fallback used only while the V2 context module is unavailable."""
 
@@ -299,38 +296,6 @@ def _assemble_initial_messages(
     if not isinstance(messages, list) or not all(isinstance(item, dict) for item in messages):
         raise RuntimeError("ContextAssembler 返回了无效 messages")
     return _ensure_current_user(list(messages), user_text), assembled
-
-
-def _record_context_manifest(store: SQLiteStore | None, ctx: ToolContext, assembled: Any) -> None:
-    """Append privacy-safe context assembly telemetry to the research ledger."""
-
-    if assembled is None:
-        return
-    items: list[dict[str, Any]] = []
-    for item in getattr(assembled, "manifest", ()) or ():
-        source_ids = getattr(item, "source_ids", ())
-        if isinstance(source_ids, str):
-            source_ids = (source_ids,)
-        elif not isinstance(source_ids, (list, tuple)):
-            source_ids = ()
-        items.append({
-            "layer": str(getattr(item, "layer", ""))[:80],
-            "source_ids": [str(source_id)[:160] for source_id in source_ids],
-            "estimated_tokens": int(getattr(item, "estimated_tokens", 0) or 0),
-            "truncated": bool(getattr(item, "truncated", False)),
-        })
-    _append_event(
-        store,
-        ctx,
-        _CONTEXT_ASSEMBLED_EVENT,
-        actor=ACTOR_ORCH,
-        source=ACTOR_ORCH,
-        payload={
-            "estimated_tokens": int(getattr(assembled, "estimated_tokens", 0) or 0),
-            "compacted_through_seq": getattr(assembled, "compacted_through_seq", None),
-            "items": items,
-        },
-    )
 
 
 def _bounded_messages(messages: list[dict], ctx: ToolContext, *, user_text: str) -> list[dict]:
@@ -597,7 +562,6 @@ def run_loop(
                 message="（上下文超过本轮预算，未调用模型。请缩短输入或先完成当前步骤。）",
             )
         return _finish(store, ctx, reply="上下文组装失败，本轮未调用模型。", reason="context_error")
-    _record_context_manifest(store, ctx, assembled)
     initial_message_count = len(messages)
 
     active: dict[str, Tool] = {}
@@ -712,7 +676,6 @@ def run_loop(
                 if rebuilt is not None:
                     messages, assembled = rebuilt
                     initial_message_count = len(messages) - len(previous_ephemeral)
-                    _record_context_manifest(store, ctx, assembled)
                     # The retry is still the same bounded provider step.  A
                     # second overflow is terminal by construction.
                     first_provider_call = False

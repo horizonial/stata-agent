@@ -40,7 +40,7 @@ class _Budget:
     reserve_output_tokens: int = 0
 
 
-def test_loop_uses_context_assembler_and_records_manifest(tmp_path, monkeypatch):
+def test_loop_uses_context_assembler(tmp_path, monkeypatch):
     module = types.ModuleType("stata_agent.harness.context_assembler")
 
     @dataclass(frozen=True)
@@ -78,16 +78,20 @@ def test_loop_uses_context_assembler_and_records_manifest(tmp_path, monkeypatch)
 
     assert result.reply == "ok"
     assert len(provider.calls) == 1
-    assembled = [event for event in store.scan("ui") if event.event_type == "context.assembled"]
-    assert assembled and assembled[-1].payload["items"][0]["source_ids"] == ["seq:2"]
-    assert assembled[-1].payload["estimated_tokens"] == 3
+    assert Assembler.calls and Assembler.calls[0]["ctx"] is ctx
     store.close()
 
 
 def test_context_budget_failure_happens_before_provider_io(tmp_path):
+    from stata_agent.harness.context_assembler import ContextBudget
+
     store = _store(tmp_path)
     provider = _Provider([{"content": "should not run", "tool_calls": None}])
-    ctx = ToolContext(idea="ui", store=store, context_budget=_Budget(max_input_tokens=8, reserve_output_tokens=4))
+    ctx = ToolContext(
+        idea="ui",
+        store=store,
+        context_budget=ContextBudget(max_input_tokens=8, reserve_output_tokens=4),
+    )
 
     result = run_loop(store, provider, {}, ctx, user_text="这是一条超过预算的当前用户消息" * 4)
 

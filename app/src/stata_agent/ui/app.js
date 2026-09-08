@@ -103,6 +103,9 @@ const state = {
   sending: false,
   refreshing: false,
   refreshController: null,
+  chatController: null,
+  traceController: null,
+  workspaceGeneration: 0,
   pollTimer: null,
   refreshFailed: false,
   selectedEvidence: null,
@@ -246,6 +249,33 @@ function workspaceQuery(extra = "") {
 }
 
 function workspaceURL(path, extra = "") { return `${path}?${workspaceQuery(extra)}`; }
+
+function cancelWorkspaceRequests() {
+  state.workspaceGeneration += 1;
+  state.chatController?.abort();
+  state.traceController?.abort();
+  state.refreshController?.abort();
+  state.chatController = null;
+  state.traceController = null;
+  state.refreshController = null;
+  state.sending = false;
+  state.streamingText = "";
+  state.events = [];
+  state.traceItems = [];
+  state.traceCursor = null;
+  state.snapshot = null;
+  state.lastFingerprint = "";
+}
+
+function switchWorkspace(id) {
+  if (!id || id === state.activeWorkspace) return;
+  cancelWorkspaceRequests();
+  state.activeWorkspace = id;
+  writeStorage("stata-agent.active-workspace", id);
+  state.page = "chat";
+  render();
+  refresh({ silent: true });
+}
 
 function activeWorkspaceRecord() {
   return state.workspaces.find((item) => item.id === state.activeWorkspace) || null;
@@ -902,8 +932,16 @@ function renderResultsView() {
 }
 
 async function loadTrace({ reset = false, renderAfter = false } = {}) {
-  if (reset) { state.traceItems = []; state.traceCursor = null; }
-  const params = [`limit=50`, `ws=${encodeURIComponent(state.activeWorkspace)}`];
+  state.traceController?.abort();
+  if (reset) {
+    state.traceItems = [];
+    state.traceCursor = null;
+  }
+  const controller = new AbortController();
+  state.traceController = controller;
+  const generation = state.workspaceGeneration;
+  const workspace = state.activeWorkspace;
+  const params = [`limit=50`, `ws=${encodeURIComponent(workspace)}`];
   if (state.traceQuery) params.push(`search=${encodeURIComponent(state.traceQuery)}`);
   if (state.traceCursor) params.push(`before_seq=${encodeURIComponent(state.traceCursor)}`);
   const group = state.traceFilter;
@@ -913,13 +951,18 @@ async function loadTrace({ reset = false, renderAfter = false } = {}) {
     else if (state.traceQuery) params[1] = `ws=${encodeURIComponent(state.activeWorkspace)}`;
   }
   try {
-    const body = await getJSON(`/api/trace?${params.join("&")}`);
+    const body = await getJSON(`/api/trace?${params.join("&")}`, { signal: controller.signal });
+    if (generation !== state.workspaceGeneration || workspace !== state.activeWorkspace) return;
     const rows = Array.isArray(body?.items) ? body.items : [];
     state.traceItems = reset ? rows : state.traceItems.concat(rows);
     state.traceTotal = Number(body?.total || state.traceItems.length);
     state.traceCursor = body?.next_before_seq ?? null;
     if (renderAfter) render();
-  } catch (error) { showToast(`Trace 暂时不可用：${error.message}`); }
+  } catch (error) {
+    if (error?.name !== "AbortError") showToast(`Trace 暂时不可用：${error.message}`);
+  } finally {
+    if (state.traceController === controller) state.traceController = null;
+  }
 }
 
 function eventEvidenceCard(event) {
@@ -1063,12 +1106,18 @@ async function sendMessage() {
   const input = $("[data-composer-input]");
   const text = (input?.value || state.draftText).trim();
   if (!text || state.sending) return;
+  const generation = state.workspaceGeneration;
+  const workspace = state.activeWorkspace;
+  const controller = new AbortController();
+  state.chatController?.abort();
+  state.chatController = controller;
   state.draftText = ""; state.sending = true; state.streamingText = ""; render();
   try {
     const res = await fetch(workspaceURL("/api/chat/stream"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, mode: state.goalMode ? "goal" : "interactive" }),
+      signal: controller.signal,
     });
     if (!res.ok || !res.body) throw new Error(`请求失败(${res.status})`);
     const reader = res.body.getReader();
@@ -1088,6 +1137,7 @@ async function sendMessage() {
         const line = raw.split("\n").find((l) => l.startsWith("data: "));
         if (!line) continue;
         let data; try { data = JSON.parse(line.slice(6)); } catch { continue; }
+        if (generation !== state.workspaceGeneration || workspace !== state.activeWorkspace) return;
         if (data.type === "token") {
           pending += data.text;
           if (!raf) raf = requestAnimationFrame(flush);
@@ -1107,8 +1157,20 @@ async function sendMessage() {
     }
     if (raf) { cancelAnimationFrame(raf); flush(); }
     await refresh({ silent: true });
-  } catch (error) { state.draftText = text; showToast(`本轮未完成：${error.message}`); }
-  finally { state.sending = false; state.streamingText = ""; render(); }
+  } catch (error) {
+    if (error?.name !== "AbortError" && generation === state.workspaceGeneration) {
+      state.draftText = text;
+      showToast(`本轮未完成：${error.message}`);
+    }
+  }
+  finally {
+    if (state.chatController === controller) state.chatController = null;
+    if (generation === state.workspaceGeneration) {
+      state.sending = false;
+      state.streamingText = "";
+      render();
+    }
+  }
 }
 
 async function resumeResearch() {
@@ -1133,8 +1195,8 @@ async function createWorkspace() {
   try {
     const result = await postJSON("/api/workspaces", { name: clean });
     const id = result?.workspace?.id;
-    if (id) { state.activeWorkspace = id; writeStorage("stata-agent.active-workspace", id); }
-    state.page = "chat"; await refresh({ silent: true }); showToast("已创建新工作区。");
+    if (id) switchWorkspace(id);
+    showToast("已创建新工作区。");
   } catch (error) { showToast(`新建工作区失败：${error.message}`); }
 }
 
@@ -1160,7 +1222,7 @@ function bindEvents() {
     if (!row) return;
     const id = row.dataset.workspaceId;
     if (!id || id === state.activeWorkspace) { setSidebarCollapsed(false); return; }
-    state.activeWorkspace = id; writeStorage("stata-agent.active-workspace", id); state.page = "chat"; refresh({ silent: true });
+    switchWorkspace(id);
   });
   $("#view-root")?.addEventListener("input", (event) => {
     const target = event.target instanceof HTMLTextAreaElement ? event.target : null;

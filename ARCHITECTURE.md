@@ -30,21 +30,21 @@ Agent Loop（通用，LLM + function calling，自主多步 + 防循环护栏 + 
 
 | 决策 | 要点 | 实现位置 |
 |---|---|---|
-| **意图路由** | 不做 research/chat 二分开关；LLM 靠 function calling + 工具描述自主决定调不调 | `harness/agent_loop.py` |
+| **意图路由** | 默认由 function calling 自主决定是否调工具；UI 的 `interactive`/`goal` 只是有界步数策略，不是两套研究链 | `harness/agent_loop.py` + `ui.py` |
 | **Tool 契约** | 工具=说明书(name/description/input_schema)+函数(handler)，夹 permission/enabled/timeout/result_to_context | `toolkit.py` |
 | **动态工具暴露** | 注册 11 个，单轮只发 enabled(ctx) 且被 Skill.allowed_tools 允许的 | `agent_loop.py` |
-| **Skill 在决策层** | 不是工具；causal-inference-mixtape(GitHub) 全文注入 system、约束工具池 | `skills/loader.py` + `skills/causal-inference-mixtape.md` |
+| **Skill 在决策层** | 不是工具；递归加载 `SKILL.md` frontmatter，先元数据匹配，命中后才注入正文；默认 skill 随 wheel 打包 | `skills/loader.py` + `skills/` |
 | **事件账本** | SQLite append-only 唯一真相；物化视图可重建；不存思维链存可审计决策 | `storage/sqlite_store.py` + `events/` |
 | **写权分离** | EvidenceCard/Claim 只能 validator/evidence_builder 签，模型不能直接写 | `tools/evidence_signer.py` + `events/append.py` |
 | **证据链** | 每个进稿数字 → result_id → card；正文只能引用已验证 claim | `writer/` + `evidence_signer.py` |
 | **隐私三档** | local_strict/approved_remote/mixed_sanitized；fallback 不跨边界 | `privacy/modes.py` + `providers/registry.py` |
-| **流式输出** | LLM 原始流 → 统一 AgentEvent(text_delta/tool_started/tool_completed) → SSE → 前端 rAF 节流 | `providers/deepseek.py` + `ui.py` + `ui/app.js` |
+| **流式输出** | LLM 原始流 → 统一 AgentEvent → 带 request_id/heartbeat/no-cache 的 SSE；完成前排空尾事件，切工作区取消旧请求 | `providers/deepseek.py` + `ui.py` + `ui/app.js` |
 | **防循环护栏** | 连续 3 次相同 run_stata 中断（确定性，不靠模型自觉） | `agent_loop.py` |
 | **幂等/恢复** | 同 input_hash 复用；断点续跑；writer lease/fence；reconcile | `executor.py` + `storage/` + `harness/recovery.py` |
 | **长会话** | token 计量 + 语义压缩(compaction.boundary) + 大结果摘要进账本 | `harness/safety.py` + `compaction.py` |
 | **记忆** | 项目约定/决定（约束非证据），与证据库分开 | `memory/memstore.py` |
 | **多工作区** | 每工作区=事件账本的 idea_id；`?ws=` 贯穿；registry 存元数据 | `ui.py` |
-| **RAG** | 双库+信任角色；词法+哈希向量混合(RRF)；摄取缓存幂等 | `rag/` |
+| **RAG** | 内容哈希 doc/chunk identity；chunk/page/file 有界；显式 source_role（默认 style-only）；缓存原子写、清理删除文件，索引可复用 | `rag/` |
 | **评测** | 五层 L0–L4 设计；L0/对抗有实现；复现 golden 自建入口 | `eval/` + `eval_golden/README.md` |
 
 ## 3. 代码地图（src/stata_agent/）
@@ -110,15 +110,19 @@ ui/index.html·app.js·styles.css  前端(纯原生，无框架)
 
 ## 5. 已完成 vs 遗留
 
-**已通并验证**：自主 loop（真 deepseek+真 Stata 端到端 DID 系数 2.81）· 11 工具 · skill 决策层 · 证据链写权分离 · 流式输出 · 多工作区 UI · RAG 真检索 · 防循环 · 断点续跑 · 压缩/记忆/分支 · 隐私三档 · L0 测试(109 个)。
+**当前已实现并由离线测试覆盖**：agent loop（provider 可插拔）· 工具/证据写权分离 ·
+SSE 流式输出 · 多工作区 UI · 有界内容哈希 RAG · 可匹配 Skill · 记忆与缓存的本地持久化 ·
+隐私模式读取。默认无 Stata 执行器，不会伪造回归结果；FakeExecutor 只在 demo 或显式
+`STATA_AGENT_EXECUTOR=fake` 下启用。真 deepseek/Stata 端到端依赖本机凭据与环境，不能当作
+默认能力或 CI 事实。
 
-**遗留（打磨/扩展，非阻塞）**：
-1. **模型代码准确性**：deepseek 偶发把 reg 命令跑偏（N/r2 错），需 skill 细化或 verify_result 主动复核或换更强模型。
+**尚未实现或需继续强化**：
+1. **模型代码准确性**：远端模型可能把 reg 命令跑偏，需 skill 细化、verify_result 主动复核或换更强模型。
 2. **Markdown 渲染**：前端目前纯文本，模型输出的 markdown 表格/代码块未渲染。
 3. **工具节点**：流式里 tool_started/completed 目前只是文本提示，未做独立节点卡片。
 4. **会话复用稳定性**：真 Stata 连续跑偶发崩溃（已加失败降级，仍需观察）。
 5. **评测 harness**：L1–L4 未系统化；复现 golden 待建。
-6. **UI 附件/图片输入**、**stop 中断**、**审批"改要求"** 未接。
+6. **UI 附件/图片输入**、运行中强制 stop、审批“改要求”仍未接；SSE 断开只做尽力取消，不保证中断已开始的外部 Stata 调用。
 7. **自进化 skill**：evolve.py 还在 staging（promote 需人工），且 skill_candidate_md 生成的是旧 variants 格式，需对齐新 Skill 语义。
 
 ## 6. 给 codex 的接手清单
@@ -134,7 +138,7 @@ ui/index.html·app.js·styles.css  前端(纯原生，无框架)
 ```
 DEEPSEEK_API_KEY          deepseek key（优先）
 STATA_AGENT_PRIVACY       local_strict / approved_remote / mixed_sanitized
-STATA_AGENT_EXECUTOR      stata(真) / 缺省(Fake)
+STATA_AGENT_EXECUTOR      stata(真) / fake(仅显式演示或测试) / 缺省(不可用)
 STATA_AGENT_LIBRARY       文献库目录（RAG）
 STATA_AGENT_SKILLS        skills 目录
 STATA_AGENT_DEMO          1=离线演示

@@ -11,8 +11,8 @@ and keeps the FastAPI layer small enough to hand over to the next maintainer.
 
 from __future__ import annotations
 
-import os
 import json
+import os
 import re
 import threading
 import time
@@ -25,8 +25,10 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .domain.action import ActionProposal, Act
+from .domain.action import Act, ActionProposal
 from .events.schema import (
+    ACTOR_ORCH,
+    ACTOR_USER,
     EVENT_AGENT_STEP,
     EVENT_APPROVAL_GRANT,
     EVENT_APPROVAL_REJECT,
@@ -34,35 +36,34 @@ from .events.schema import (
     EVENT_BUDGET,
     EVENT_HEALTH,
     EVENT_IDEA,
-    EVENT_MAIN_RESULT,
     EVENT_PHASE,
     EVENT_RUN_FAILED,
     EVENT_RUN_SUCCEEDED,
     EVENT_RUN_UNCERTAIN,
-    EVENT_SPEC_FREEZE,
     EVENT_USER,
-    ACTOR_ORCH,
-    ACTOR_USER,
     Event,
 )
 from .harness.research_turn import bootstrap_idea
 from .providers.mock import MockFixedProvider, MockReplayProvider
 from .runner import approve as runner_approve
-from .runner import run_until_gate
 from .storage.sqlite_store import SQLiteStore
+from .tools.executor import StataExecutor  # noqa: E402  （真 Stata 可选）
 from .tools.fake_executor import FakeExecutor
 from .writer.docx_out import claims_to_docx
 from .writer.ground import render_claim_sentence
 
-from .tools.executor import StataExecutor  # noqa: E402  （真 Stata 可选）
-
 DEFAULT_DB = Path(os.environ.get("STATA_AGENT_DB", "samples/ideas/ui/ledger.sqlite3"))
 _IDEA = "ui"
+_APP_ROOT = Path(__file__).resolve().parents[2]
 _UI_DIR = Path(__file__).with_name("ui")
 _INDEX_FILE = _UI_DIR / "index.html"
+_PACKAGE_SKILLS_DIR = Path(__file__).with_name("skills")
 
 _WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _WORKSPACE_REGISTRY_LOCK = threading.RLock()
+_RAG_CACHE: dict[tuple[str, str], Any] = {}
+_RAG_CACHE_LOCK = threading.RLock()
+_SKILL_ERRORS: list[str] = []
 
 app = FastAPI(title="stata-agent · research UI")
 app.mount("/static", StaticFiles(directory=str(_UI_DIR)), name="ui-static")
@@ -104,7 +105,38 @@ def _store() -> _LockedStore:
         raise
 
 
+class _HistoryStoreView:
+    """Store facade that hides the just-appended user event from loop history.
+
+    ``agent_loop`` appends the current user event itself to the message list
+    after reading durable history.  The UI persists that event before entering
+    the loop so the conversation remains ordered; this narrow facade prevents
+    that one event from being sent a second time without changing the ledger
+    or the shared loop implementation.
+    """
+
+    def __init__(self, store: SQLiteStore, *, hidden_seq: int):
+        self._store = store
+        self._hidden_seq = hidden_seq
+
+    def scan(self, idea_id: str, *args, **kwargs):
+        return (
+            event
+            for event in self._store.scan(idea_id, *args, **kwargs)
+            if event.seq != self._hidden_seq
+        )
+
+    def __getattr__(self, name: str):
+        return getattr(self._store, name)
+
+
 DEMO = os.environ.get("STATA_AGENT_DEMO") == "1"
+
+
+def _demo_enabled() -> bool:
+    """Read demo mode dynamically so tests/config reloads are deterministic."""
+
+    return DEMO or os.environ.get("STATA_AGENT_DEMO") == "1"
 
 
 def _workspace_registry_path() -> Path:
@@ -234,7 +266,7 @@ def _demo_seed(store: SQLiteStore, idea: str = _IDEA) -> None:
 
     仅当开了 STATA_AGENT_DEMO=1 且还没有 phase 事件时生效；正常模式不做任何越权推进。
     """
-    if not DEMO:
+    if not _demo_enabled():
         return
     if any(ev.event_type == EVENT_PHASE for ev in store.scan(idea)):
         return
@@ -249,7 +281,7 @@ def _provider():
         from .providers.registry import default_provider
 
         return default_provider()
-    if DEMO:
+    if _demo_enabled():
         # 无 LLM key 的离线演示：剧本走完 定 spec → 跑(fake) → 问是否出稿
         return MockReplayProvider([
             ActionProposal(decision_summary="先定主 spec",
@@ -267,12 +299,18 @@ def _provider():
 
 
 def _executor(store: SQLiteStore):
-    """执行器可选：env STATA_AGENT_EXECUTOR=stata 用真 Stata；默认 Fake（离线安全）。"""
-    if os.environ.get("STATA_AGENT_EXECUTOR") == "stata":
+    """Return an explicitly selected executor; never invent fake results live."""
+
+    configured = os.environ.get("STATA_AGENT_EXECUTOR", "").strip().lower()
+    if configured == "stata":
         run_root = DEFAULT_DB.parent / "runs"
         run_root.mkdir(parents=True, exist_ok=True)
         return StataExecutor(store, run_root=run_root, share_session=True)
-    return FakeExecutor(store)
+    if configured in {"fake", "demo"} or (_demo_enabled() and not configured):
+        return FakeExecutor(store)
+    # A missing/unknown executor is an unavailable capability.  In particular,
+    # a live LLM must not be handed FakeExecutor merely because Stata is absent.
+    return None
 
 
 def _privacy_mode() -> str:
@@ -285,7 +323,13 @@ def _config_info() -> dict:
     """给设置页展示的真实运行时配置（只读）。"""
     from .providers.registry import live_available
 
-    executor = "真 Stata" if os.environ.get("STATA_AGENT_EXECUTOR") == "stata" else "演示(Fake)"
+    executor_kind = os.environ.get("STATA_AGENT_EXECUTOR", "").strip().lower()
+    if executor_kind == "stata":
+        executor = "真 Stata"
+    elif executor_kind in {"fake", "demo"} or (_demo_enabled() and not executor_kind):
+        executor = "演示(Fake)"
+    else:
+        executor = "未配置"
     provider = "未配置"
     if live_available():
         provider = "deepseek" if os.environ.get("DEEPSEEK_API_KEY") else "qwen"
@@ -297,6 +341,7 @@ def _config_info() -> dict:
         "privacy_mode": _privacy_mode(),
         "library": lib or "(未配置文献库)",
         "skills": skills,
+        "skill_errors": list(_SKILL_ERRORS),
         "workspace_db": str(DEFAULT_DB),
     }
 
@@ -313,28 +358,47 @@ def _memory():
 
 
 def _rag():
-    """文献混合检索；目录缺失则 None。"""
+    """文献混合检索；目录缺失则 None and unchanged indexes are reused."""
     lib = os.environ.get("STATA_AGENT_LIBRARY", "").strip()
-    if not lib or not Path(lib).exists():
+    library = Path(lib).expanduser() if lib else None
+    if library is None or not library.exists():
         return None
+    cache_path = DEFAULT_DB.parent / "rag_cache.json"
+    key = (str(library.resolve()), str(cache_path.resolve()))
     try:
         from .rag.index import build_hybrid
 
-        return build_hybrid(lib, cache_path=DEFAULT_DB.parent / "rag_cache.json")
+        index = build_hybrid(library, cache_path=cache_path)
+        with _RAG_CACHE_LOCK:
+            _RAG_CACHE[key] = index
+        return index
     except Exception:  # noqa: BLE001
         return None
 
 
 def _skills() -> dict:
-    """加载 skills 目录（决策层方法论）。"""
+    """Load the configured skill root, including packaged defaults."""
+    global _SKILL_ERRORS
     from .skills.loader import load_skill_dir
 
-    skills_dir = os.environ.get("STATA_AGENT_SKILLS", "skills")
-    if not Path(skills_dir).exists():
+    configured = os.environ.get("STATA_AGENT_SKILLS", "").strip()
+    if configured:
+        skills_dir = Path(configured).expanduser()
+        if not skills_dir.is_absolute():
+            skills_dir = _APP_ROOT / skills_dir
+    else:
+        skills_dir = _APP_ROOT / "skills"
+        if not skills_dir.exists():
+            skills_dir = _PACKAGE_SKILLS_DIR
+    if not skills_dir.exists():
+        _SKILL_ERRORS = [f"{skills_dir}: skill directory does not exist"]
         return {}
     try:
-        return load_skill_dir(skills_dir)
-    except Exception:  # noqa: BLE001
+        loaded = load_skill_dir(skills_dir)
+        _SKILL_ERRORS = []
+        return loaded
+    except Exception as error:  # noqa: BLE001
+        _SKILL_ERRORS = [str(error)[:500]]
         return {}
 
 
@@ -471,7 +535,9 @@ def _approval_records(events: list[Event]) -> list[dict[str, Any]]:
                 "decided_at": None,
             }
         elif event.event_type in {EVENT_APPROVAL_GRANT, EVENT_APPROVAL_REJECT} and request_id in records:
-            records[request_id]["status"] = "approved" if event.event_type == EVENT_APPROVAL_GRANT else "rejected"
+            records[request_id]["status"] = (
+                "approved" if event.event_type == EVENT_APPROVAL_GRANT else "rejected"
+            )
             records[request_id]["decided_note"] = str(payload.get("note") or "")
             records[request_id]["decision_seq"] = event.seq
             records[request_id]["decided_at"] = event.created_at
@@ -692,7 +758,10 @@ def _summary(store: SQLiteStore, idea: str = _IDEA) -> dict[str, Any]:
         "pending_approvals": [item for item in approvals if item["status"] == "pending"],
         "approvals": approvals,
         "messages": _conversation(events),
-        "checkpoint": {"available": checkpoint_event is not None, "seq": checkpoint_event.seq if checkpoint_event else None},
+        "checkpoint": {
+            "available": checkpoint_event is not None,
+            "seq": checkpoint_event.seq if checkpoint_event else None,
+        },
         "draft_ready": bool(any(c.status == "supported" for c in proj.claims.values())),
         "capabilities": {
             "approvals": True,
@@ -708,7 +777,12 @@ def _summary(store: SQLiteStore, idea: str = _IDEA) -> dict[str, Any]:
     }
 
 
-def _draft_response(store: SQLiteStore, *, require_ready: bool = False, idea: str = _IDEA) -> StreamingResponse:
+def _draft_response(
+    store: SQLiteStore,
+    *,
+    require_ready: bool = False,
+    idea: str = _IDEA,
+) -> StreamingResponse:
     from .writer.draft_multi import draft_from_ledger
 
     proj = store.project(idea)
@@ -871,7 +945,11 @@ def trace(
         filtered = [row for row in rows if matches(row)]
         ordered = list(reversed(filtered))
         if before_seq is not None:
-            ordered = [row for row in ordered if row.get("seq") is not None and int(row["seq"]) < int(before_seq)]
+            ordered = [
+                row
+                for row in ordered
+                if row.get("seq") is not None and int(row["seq"]) < int(before_seq)
+            ]
         safe_limit = max(1, min(int(limit), 500))
         page = ordered[:safe_limit]
         next_before = page[-1]["seq"] if len(page) == safe_limit and page else None
@@ -987,7 +1065,13 @@ class ApprovalDecisionIn(BaseModel):
     note: str = ""
 
 
-def _decision(store: SQLiteStore, request_id: str, decision: str, note: str, idea: str = _IDEA) -> dict[str, Any]:
+def _decision(
+    store: SQLiteStore,
+    request_id: str,
+    decision: str,
+    note: str,
+    idea: str = _IDEA,
+) -> dict[str, Any]:
     records = {item["request_id"]: item for item in _approval_records(_event_list(store, idea))}
     record = records.get(request_id)
     if record is None:
@@ -1015,7 +1099,11 @@ def approvals(status: str = "pending", ws: str = _IDEA):
         records = _approval_records(_event_list(s, idea))
         if status != "all":
             records = [item for item in records if item["status"] == "pending"]
-        return {"pending": records} if status != "all" else {"items": records, "pending": [i for i in records if i["status"] == "pending"]}
+        return (
+            {"pending": records}
+            if status != "all"
+            else {"items": records, "pending": [i for i in records if i["status"] == "pending"]}
+        )
     finally:
         s.close()
 
@@ -1027,7 +1115,12 @@ def approve(body: ApproveIn, ws: str = _IDEA):
     try:
         result = _decision(s, body.request_id, body.decision, body.note, idea)
         # Keep the original small response fields while adding the richer state.
-        return {"ok": True, "event": result["event"], "event_seq": result["event_seq"], "state": result["state"]}
+        return {
+            "ok": True,
+            "event": result["event"],
+            "event_seq": result["event_seq"],
+            "state": result["state"],
+        }
     finally:
         s.close()
 
@@ -1043,16 +1136,26 @@ def approval_decision(request_id: str, body: ApprovalDecisionIn, ws: str = _IDEA
 
 
 def _resume_result(idea: str = _IDEA) -> dict[str, Any]:
-    s = _store()
+    """Resume through the same agent-loop path used by ``/api/chat``.
+
+    The legacy ``runner.run_until_gate`` path uses the old proposal provider
+    contract and is intentionally not reachable from the UI resume endpoint.
+    """
+
     try:
-        _demo_seed(s, idea)
-        res = run_until_gate(s, idea, None, _provider(), executor=_executor(s), max_steps=4)
-        snapshot = _summary(s, idea)
-        return {"reply": res[-1].reply if res else "", "status": snapshot["run_status"], "state": snapshot}
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail="续跑未完成：请查看 Trace 中的最近错误。") from e
-    finally:
-        s.close()
+        reply, ask, snapshot = _run_chat_sync(
+            idea,
+            "请从当前停点继续；如果需要我决定或补充信息，请明确提问。",
+            "goal",
+        )
+        return {
+            "reply": reply,
+            "ask": ask,
+            "status": snapshot["run_status"],
+            "state": snapshot,
+        }
+    except Exception as error:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail="续跑未完成：请查看 Trace 中的最近错误。") from error
 
 
 @app.post("/api/resume")
@@ -1177,43 +1280,94 @@ def health(ws: str = _IDEA):
     s = _store()
     try:
         summary = _summary(s, idea)
+        privacy = _privacy_mode()
+        config = summary.get("config") or {}
+        skill_errors = config.get("skill_errors") or []
         return {
-            "ok": bool(summary["health"]["ok"]),
-            "local_strict": True,
+            "ok": bool(summary["health"]["ok"]) and not skill_errors,
+            "local_strict": privacy == "local_strict",
+            "privacy_mode": privacy,
+            "network_available": privacy != "local_strict",
+            "executor": config.get("executor", "未配置"),
+            "skill_errors": skill_errors,
             "status": summary["run_status"],
-            "detail": summary["status_detail"],
+            "detail": skill_errors[0] if skill_errors else summary["status_detail"],
         }
     finally:
         s.close()
 
 
-def _run_chat_sync(idea: str, text: str, mode: str, on_event=None):
-    """跑一轮 chat 的核心（同步、阻塞），返回 (reply, ask, state_summary)。"""
+def _run_chat_sync(
+    idea: str,
+    text: str,
+    mode: str,
+    on_event=None,
+    *,
+    request_id: str | None = None,
+    cancel_event: threading.Event | None = None,
+):
+    """Run one chat turn and close any per-turn executor before returning."""
+
+    request_id = request_id or uuid.uuid4().hex
     s = _store()
+    executor = None
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            return "", None, _summary(s, idea)
         bootstrap_idea(s, idea, text)
         _touch_workspace_name(idea, text)
-        s.append(Event(idea_id=idea, event_type=EVENT_USER, actor=ACTOR_USER, source=ACTOR_USER,
-                       payload={"text": text}))
+        user_seq = s.append(
+            Event(
+                idea_id=idea,
+                event_type=EVENT_USER,
+                actor=ACTOR_USER,
+                source=ACTOR_USER,
+                payload={"text": text, "request_id": request_id},
+            )
+        )
 
         from .harness.agent_loop import run_loop
         from .toolkit import ToolContext, default_tools
 
         provider = _provider()
         pm = _privacy_mode()
+        executor = _executor(s)
         ctx = ToolContext(
-            idea=idea, store=s, executor=_executor(s),
+            idea=idea, store=s, executor=executor,
             rag=_rag(), memory=_memory(),
             run_root=(DEFAULT_DB.parent / "runs"),
             privacy_mode=pm,
             network_available=(pm != "local_strict"),
             phase=s.project(idea).phase,
         )
-        res = run_loop(s, provider, default_tools(), ctx, user_text=text,
-                       privacy_mode=pm, skills=_matched_skills(text), on_event=on_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return "", None, _summary(s, idea)
+        # ``interactive`` is deliberately one model step; ``goal`` may use
+        # the full bounded loop.  The distinction is now observable and is
+        # also reflected in the returned payload/UI toggle.
+        max_steps = 1 if mode == "interactive" else 12
+        loop_store = _HistoryStoreView(s, hidden_seq=user_seq)
+        res = run_loop(
+            loop_store,
+            provider,
+            default_tools(),
+            ctx,
+            user_text=text,
+            max_steps=max_steps,
+            privacy_mode=pm,
+            skills=_matched_skills(text),
+            on_event=on_event,
+        )
         reply = res.ask or res.reply or ""
         return reply, res.ask, _summary(s, idea)
     finally:
+        if executor is not None:
+            close = getattr(executor, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    pass
         s.close()
 
 
@@ -1227,16 +1381,17 @@ def chat(body: ChatIn, ws: str = _IDEA):
         raise HTTPException(status_code=413, detail="消息过长，请拆成几条研究指示。")
     if body.mode not in {"interactive", "goal"}:
         raise HTTPException(status_code=422, detail="mode 必须是 interactive|goal。")
+    request_id = uuid.uuid4().hex
     try:
-        reply, ask, state = _run_chat_sync(idea, text, body.mode)
-        return {"reply": reply, "mode": body.mode, "ask": ask, "state": state}
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail="本轮未完成：请查看 Trace 中的最近事件。") from e
+        reply, ask, state = _run_chat_sync(idea, text, body.mode, request_id=request_id)
+        return {"request_id": request_id, "reply": reply, "mode": body.mode, "ask": ask, "state": state}
+    except Exception as error:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail="本轮未完成：请查看 Trace 中的最近事件。") from error
 
 
 @app.post("/api/chat/stream")
 async def chat_stream(body: ChatIn, ws: str = _IDEA):
-    """SSE 真流式：LLM 边生成 token 边转发，工具调用发 tool_started/tool_completed。"""
+    """Stream one turn as SSE, preserving tail events before ``done``."""
     import asyncio
     import json as _json
     import queue as _queue
@@ -1249,50 +1404,100 @@ async def chat_stream(body: ChatIn, ws: str = _IDEA):
         raise HTTPException(status_code=413, detail="消息过长，请拆成几条研究指示。")
     if body.mode not in {"interactive", "goal"}:
         raise HTTPException(status_code=422, detail="mode 必须是 interactive|goal。")
+    request_id = uuid.uuid4().hex
 
     def sse(obj: dict) -> str:
-        return f"data: {_json.dumps(obj, ensure_ascii=False)}\n\n"
+        return f"data: {_json.dumps({**obj, 'request_id': request_id}, ensure_ascii=False)}\n\n"
 
     async def gen():
         yield sse({"type": "start"})
         evq: _queue.Queue = _queue.Queue()
+        cancel_event = threading.Event()
 
         def on_event(ev):
+            if cancel_event.is_set():
+                return
             evq.put(ev)
 
         def run():
             try:
-                return _run_chat_sync(idea, text, body.mode, on_event=on_event)
-            except Exception as e:  # noqa: BLE001
-                return None, None, {"__error__": str(e)[:200]}
+                return _run_chat_sync(
+                    idea,
+                    text,
+                    body.mode,
+                    on_event=on_event,
+                    request_id=request_id,
+                    cancel_event=cancel_event,
+                )
+            except Exception as error:  # noqa: BLE001
+                return None, None, {"__error__": str(error)[:200]}
 
         task = asyncio.create_task(asyncio.to_thread(run))
-        # 消费统一事件直到 loop 完成
-        while True:
-            if task.done():
-                reply, ask, state = task.result()
-                if state and "__error__" in state:
-                    yield sse({"type": "error", "detail": state["__error__"]})
-                else:
-                    yield sse({"type": "done", "ask": ask, "state": state})
-                break
-            drained = False
+        last_heartbeat = time.monotonic()
+
+        def drain():
+            events = []
             while True:
                 try:
-                    ev = evq.get_nowait()
+                    events.append(evq.get_nowait())
                 except _queue.Empty:
-                    break
-                drained = True
-                if ev["type"] == "text_delta":
-                    yield sse({"type": "token", "text": ev["text"]})
-                elif ev["type"] == "tool_started":
-                    yield sse({"type": "tool_started", "name": ev["name"]})
-                elif ev["type"] == "tool_completed":
-                    yield sse({"type": "tool_completed", "name": ev["name"], "ok": ev.get("ok")})
-            if not drained:
-                await asyncio.sleep(0.02)
+                    return events
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+        def render_event(ev: dict) -> str | None:
+            kind = ev.get("type")
+            if kind == "text_delta":
+                return sse({"type": "token", "text": ev.get("text", "")})
+            if kind == "tool_started":
+                return sse({"type": "tool_started", "name": ev.get("name", "")})
+            if kind == "tool_completed":
+                return sse({"type": "tool_completed", "name": ev.get("name", ""), "ok": ev.get("ok")})
+            return None
+
+        try:
+            while True:
+                pending = drain()
+                for event in pending:
+                    rendered = render_event(event)
+                    if rendered is not None:
+                        yield rendered
+                if task.done():
+                    # The worker enqueues callbacks before its future becomes
+                    # done.  Drain once more at the terminal boundary so the
+                    # last token/tool event can never be placed after done.
+                    for event in drain():
+                        rendered = render_event(event)
+                        if rendered is not None:
+                            yield rendered
+                    reply, ask, state = task.result()
+                    if state and "__error__" in state:
+                        yield sse({"type": "error", "detail": state["__error__"]})
+                    else:
+                        yield sse({"type": "done", "ask": ask, "state": state})
+                    break
+                now = time.monotonic()
+                if now - last_heartbeat >= 15:
+                    yield sse({"type": "heartbeat", "ts": int(now * 1000)})
+                    last_heartbeat = now
+                await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            # Starlette cancels an async generator when the client disconnects.
+            # The worker may already be in a provider call, but this flag stops
+            # forwarding and prevents not-yet-started UI work from proceeding.
+            cancel_event.set()
+            raise
+        finally:
+            cancel_event.set()
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "X-Request-ID": request_id,
+        },
+    )
 
 
 def main() -> None:

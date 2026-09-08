@@ -12,7 +12,7 @@ python -m pytest -q
 # CLI mock loop（你说一句/想一步/回一句，全落 events）
 printf '问题\n补料\n' | PYTHONPATH=src python -m stata_agent.cli --db .demo.sqlite3
 
-# live LLM 自动链（无 DEEPSEEK_API_KEY 时自动用 DASHSCOPE=qwen）
+# live LLM 自动链（必须显式授权隐私模式；无 key 不会伪造结果）
 #   真 Stata：python 里有 Stata + stata-mcp 才可
 PYTHONUTF8=1 PYTHONPATH=src python - <<'PY'
 from pathlib import Path
@@ -36,16 +36,25 @@ PY
   `PYTHONUTF8=1 PYTHONPATH=src STATA_AGENT_PRIVACY=approved_remote DEEPSEEK_API_KEY=sk-… python -m stata_agent.ui`
 - 建议把 key 放 Windows 用户环境变量（`setx DEEPSEEK_API_KEY sk-…`），别明文写进代码/聊天。
 - Stata：`C:\Program Files\Stata18` + stata-mcp 仓库 `C:\Users\user\stata-mcp`（`tools/stata_client.py` 默认指向其 .venv）。
-- 文献库（RAG 演示）：`D:\work file\06_学位论文\一区\文献(1)`（见 `tests/test_rag_registry.py`）。
+- 文献库（RAG）：设置 `STATA_AGENT_LIBRARY`；默认按 `style_only` 摄取，只有显式
+  `source_role=citable_evidence` 的索引块可作为证据引用。
 
 ## UI（只读物化视图 + 发消息，M4 方向）
 ```bash
 cd app
 PYTHONUTF8=1 PYTHONPATH=src python -m stata_agent.ui        # http://127.0.0.1:8001
 # 可选 env：STATA_AGENT_DB=<路径>；STATA_AGENT_UI_PORT=端口
-# 有 DEEPSEEK/DASHSCOPE key 自动用真 LLM；默认 FakeExecutor 不碰真 Stata
+# 有 DEEPSEEK/DASHSCOPE key 且显式授权后才用真 LLM；真 Stata 也需显式设置
+# STATA_AGENT_EXECUTOR=stata。FakeExecutor 仅用于 STATA_AGENT_DEMO=1 或
+# STATA_AGENT_EXECUTOR=fake 的演示/测试。
 ```
-端点：`/`(页) · `GET /api/state` · `GET /api/events` · `POST /api/chat {text}`
+端点：`/`(页) · `GET /api/state` · `GET /api/events` · `POST /api/chat {text}` ·
+`POST /api/chat/stream`（SSE，含 request_id/heartbeat） · `POST /api/resume`
+
+主链只有一条：`/api/chat`、SSE 和 `/api/resume` 都进入 `harness.agent_loop`；
+审批接口只写入审批事件，再通过同一条 resume 链继续。`interactive` 只执行
+一个 loop step，`goal` 使用本轮有界多步预算。旧 `runner.run_until_gate` 仅供
+兼容测试/库调用，不是 UI 路由。
 
 ## 包地图（src/stata_agent/）
 - `events/` 事件账本内核：schema/append(写入权)/upcast/reconcile
@@ -57,6 +66,7 @@ PYTHONUTF8=1 PYTHONPATH=src python -m stata_agent.ui        # http://127.0.0.1:8
 - `harness/` build_context + research_turn（单轮，可带 extra_context）
 - `tools/` stata_client(持久会话)/executor(真 Stata→事件)/evidence_signer(机器层→卡)/fake_executor
 - `skills/` SKILL.md 政策包加载 + ados 预检
-- `rag/` PDF 摄取(角色/chunk_id) + 词法检索（中文双字）
+- `rag/` 有界 PDF 摄取（内容哈希 doc/chunk identity、显式 source_role）+
+  原子增量缓存 + 词法/哈希向量混合检索
 - `writer/` 数字接地 round-trip + claims→.docx
 - `runner.py` cycle / run_until_gate（loop-until-gate 自动链）

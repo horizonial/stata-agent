@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from .ingest import SOURCE_ROLE_CITABLE, SOURCE_ROLE_STYLE, Chunk
+from .ingest import SOURCE_ROLE_CITABLE, Chunk
 
 
 class Library:
@@ -28,7 +28,10 @@ class Library:
         return chunk.source_role if chunk else None
 
     def is_citable(self, chunk_id: str) -> bool:
-        return self._chunks.get(chunk_id) is not None and self._chunks[chunk_id].source_role == SOURCE_ROLE_CITABLE
+        return (
+            self._chunks.get(chunk_id) is not None
+            and self._chunks[chunk_id].source_role == SOURCE_ROLE_CITABLE
+        )
 
     def __len__(self) -> int:
         return len(self._chunks)

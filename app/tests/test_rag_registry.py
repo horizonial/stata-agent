@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
 
-from stata_agent.rag.ingest import SOURCE_ROLE_CITABLE, SOURCE_ROLE_STYLE, Chunk, ingest_dir
-from stata_agent.rag.retriever import LexicalIndex, tokenize
 from stata_agent.providers.capabilities import qwen_dashscope_profile
 from stata_agent.providers.registry import default_provider
+from stata_agent.rag.ingest import SOURCE_ROLE_CITABLE, SOURCE_ROLE_STYLE, Chunk, ingest_dir
+from stata_agent.rag.retriever import LexicalIndex, tokenize
 
 
 def _chunks():
@@ -46,13 +45,14 @@ LIB = Path(r"D:/work file/06_学位论文/一区/文献(1)")
 
 @pytest.mark.skipif(not LIB.exists(), reason="本机无该文献库")
 def test_ingest_real_chinese_pdf_library():
-    chunks, meta = ingest_dir(LIB, max_files=2, max_pages=4)
+    chunks, meta = ingest_dir(LIB, source_role=SOURCE_ROLE_CITABLE, max_files=2, max_pages=4)
     assert chunks
     assert all(c.source_role == SOURCE_ROLE_CITABLE for c in chunks)
     assert all("error" not in m for m in meta.values())
 
 
 def test_qwen_profile_and_registry(monkeypatch):
+    from stata_agent.providers.deepseek import MissingApiKey
     from stata_agent.providers.registry import PrivacyBlock
 
     q = qwen_dashscope_profile()
@@ -60,7 +60,7 @@ def test_qwen_profile_and_registry(monkeypatch):
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
     monkeypatch.delenv("STATA_AGENT_PRIVACY", raising=False)
-    with pytest.raises(Exception):
+    with pytest.raises(MissingApiKey):
         default_provider()                      # 无 key
     monkeypatch.setenv("DASHSCOPE_API_KEY", "x")
     # 默认 local_strict：有远端 key 也不自动用

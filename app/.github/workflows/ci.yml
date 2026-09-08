@@ -8,5 +8,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e ".[dev,stata,rag,writing]"
-      - run: pytest -q            # live 项(skipif)默认跳过；真环境用 secret 触发
+      - run: python -m pip install -e ".[dev,ui,stata,rag,writing]"
+      - run: python -m ruff check src tests
+      - run: python -m mypy src
+      - run: python -m pytest -q            # live 项(skipif)默认跳过；真环境用 secret 触发
+      - run: python -m build --wheel
+      - name: wheel install and startup smoke test
+        shell: bash
+        run: |
+          smoke_dir="$(mktemp -d)"
+          python -m pip install --target "$smoke_dir" dist/*.whl
+          PYTHONPATH="$smoke_dir" python -c "from pathlib import Path; import stata_agent.ui as ui; assert ui._UI_DIR.joinpath('index.html').exists(); assert ui._PACKAGE_SKILLS_DIR.joinpath('SKILL.md').exists(); print('wheel startup smoke ok')"

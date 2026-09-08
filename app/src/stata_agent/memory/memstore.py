@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -44,7 +46,23 @@ class MemoryStore:
 
     def _save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(self._entries, ensure_ascii=False, indent=1), encoding="utf-8")
+        descriptor, temporary = tempfile.mkstemp(
+            dir=self._path.parent,
+            prefix=f".{self._path.name}.",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(self._entries, stream, ensure_ascii=False, indent=1)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self._path)
+        finally:
+            if os.path.exists(temporary):
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
 
     # ---------------------------------------------------------------- read
     def all(self) -> list[dict]:

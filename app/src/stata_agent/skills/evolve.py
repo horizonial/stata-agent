@@ -48,7 +48,10 @@ def skill_candidate_md(*, name: str, task: str, episode: list[EpisodeVariant],
     vs = [{"id": v.id, "label": v.label, "y": v.y, "cluster": v.cluster, "reason": v.reason}
           for v in episode]
     variants_json = json.dumps(vs, ensure_ascii=False, indent=2)
-    method_line = "用 处理×期后 交互识别（DID）；变量映射(treat/post/wave)由调用方注入，本 skill 只声明 y 与 cluster。"
+    method_line = (
+        "用 处理×期后 交互识别（DID）；变量映射(treat/post/wave)由调用方注入，"
+        "本 skill 只声明 y 与 cluster。"
+    )
     return f"""---
 name: {_slug(name)}
 version: 0.1.0

@@ -44,8 +44,8 @@ Agent Loop（通用，LLM + function calling，自主多步 + 防循环护栏 + 
 | **长会话** | `ContextAssembler` 按固定层级构造有界 projection；token 压力触发 append-only `compaction.boundary`，保留完整工具尾部与 manifest | `harness/context_assembler.py` + `compaction.py` + `agent_loop.py` |
 | **记忆** | Memory V2 按 workspace 隔离、检索相关约束并附 provenance；项目约定/决定是约束而非证据，与证据库分开；可选候选提取默认关闭且需审核 | `memory/memstore.py` + `memory/pipeline.py` + `toolkit.py` + `ui.py` |
 | **多工作区** | 每工作区=事件账本的 idea_id；`?ws=` 贯穿；registry 存元数据；V2 memory identity 由 canonical ledger/project root 哈希生成 | `ui.py` |
-| **应用层边界** | 框架无关的 ChatService、请求控制与 TaskQueue 端口已建立；FastAPI 接入留给 Phase 3 集成波次 | `application/` |
-| **状态迁移** | SQLite 显式版本迁移、记忆/候选仓库与 legacy JSON 幂等导入已建立；运行时切换尚未执行 | `storage/migrations.py` + `memory/sqlite_repository.py` |
+| **应用层边界** | ChatService、请求控制、TaskQueue 与 memory outbox dispatcher 均为框架无关服务；FastAPI 只负责 composition/lifecycle | `application/` + `ui.py` |
+| **状态迁移** | SQLite v2 统一管理 ledger、memory、workspace 与 durable outbox；legacy JSON 仅作只读、幂等导入源 | `storage/migrations.py` + `memory/sqlite_repository.py` |
 | **RAG** | 内容哈希 doc/chunk identity；chunk/page/file 有界；显式 source_role（默认 style-only）；缓存原子写、清理删除文件，索引可复用 | `rag/` |
 | **评测** | L1–L4 离线产品 scenario、稳定 golden、coverage/构建门禁均已接入 | `eval/` + `eval_golden/README.md` |
 
@@ -131,20 +131,23 @@ SSE 流式输出 · 多工作区 UI · 有界内容哈希 RAG · 可匹配 Skill
 默认能力或 CI 事实。
 
 **尚未实现或需继续强化**：
-1. **Phase 3 运行时接入**：ChatService、RequestControl、TaskQueue、SQLite Memory 和 WorkspaceService 均已接入 UI；FastAPI 生命周期会恢复未完成的记忆提取并有界关闭队列；旧 JSON 仅作为只读、幂等迁移源。下一步是 durable outbox 与真实 Windows 长会话验收。
-2. **模型代码准确性**：远端模型可能把 reg 命令跑偏，需 skill 细化、verify_result 主动复核或换更强模型。
-3. **真实环境验收**：真 Stata 长会话、远端模型隐私边界与独立 wheel Windows UI 仍需发布前人工验证。
-4. **附件/图片输入**：尚未建立上传沙箱、格式嗅探、大小限制和恶意文件测试。
-5. **自进化 skill**：evolve.py 还在 staging（promote 需人工），且 skill_candidate_md 生成的是旧 variants 格式，需对齐新 Skill 语义。
+1. **真实环境验收（P0）**：真 Stata 长会话、远端模型隐私边界、断网/重启恢复与独立 wheel Windows UI 仍需发布前人工验证。
+2. **模型代码准确性（P0）**：远端模型仍可能把 reg/检验命令跑偏，需细化 econometrics skill，并让 `verify_result` 对关键数字和模型设定主动复核。
+3. **Outbox 运维闭环（P1）**：SQLite outbox 已实现原子 intent、claim lease、持续重投、dead-letter 与健康指标；下一步是超长 provider 调用的 lease heartbeat、人工 redrive 和历史任务清理策略。
+4. **附件/图片输入（P1）**：尚未建立上传沙箱、格式嗅探、大小限制、恶意文件测试和 workspace 生命周期清理。
+5. **可观测性/支持（P1）**：需统一 request/operation/outbox correlation，增加结构化日志、错误导出包和真实运行 SLO。
+6. **交互体验（P2）**：工具调用独立节点、Markdown 表格细节、审批“修改后通过”、附件与 stop 状态仍需一次完整人工 UX 回归。
+7. **自进化 skill（P2）**：`evolve.py` 仍在 staging（promote 需人工），且 `skill_candidate_md` 的旧 variants 格式需对齐新 Skill 语义。
+8. **部署扩展（P3）**：只有出现多进程/多机 worker、任务量或运维隔离需求时，再实现 RQ/Redis adapter；当前 SQLite + 本地队列是桌面单机产品的默认方案。
 
-**2026-09-09 当前离线门禁**：327 collected，323 passed / 4 skipped；Ruff、Mypy、L1–L4 产品评测、77% branch coverage 与 wheel build 均通过。
+**2026-09-10 当前离线门禁**：346 collected，342 passed / 4 skipped；Ruff、Mypy、L1–L4 产品评测、77% branch coverage 与 wheel build 均通过。
 
 ## 6. 给 codex 的接手清单
 
-1. **先跑通**：`cd app && python -m pytest`（187 过 4 skip）；`python -m stata_agent.ui`（8001）看 UI。
+1. **先跑通**：`cd app && python -m pytest`（342 过 / 4 skip）；`python -m stata_agent.ui`（8001）看 UI。
 2. **读设计**：`design/agent-tool-routing.md`（意图/工具/Skill 分层，最新方向）+ `design/rethink-autonomy.md`（为什么从"研究驾驶舱"改到"自主 agent"）。
 3. **别破坏的契约**：写权分离（模型不能签 card/claim）· 事件账本 append-only · 隐私门 · 工具 permission/enabled · app.js 不得出现 `innerHTML`（防 XSS）。
-4. **建议下一步**（按价值）：① Markdown 表格；② 工具调用独立节点；③ 模型准确性(skill 细化/verify_result)；④ 评测 harness L1–L4；⑤ UI 附件/stop/审批改要求。
+4. **建议下一步**（按发布价值）：① Windows 真 Stata + 真 provider 长会话验收；② econometrics skill/`verify_result`；③ outbox heartbeat/redrive；④ 附件沙箱；⑤ 可观测性与 UX 收口。
 5. **外部依赖路径**：stata-mcp 在 `C:\Users\user\stata-mcp`；文献库 `D:\work file\06_学位论文\一区\文献(1)`；key 在 `app/.env`（gitignored）。
 
 ## 7. 关键环境变量（app/.env）

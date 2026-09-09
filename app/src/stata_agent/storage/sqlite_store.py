@@ -377,12 +377,26 @@ class SQLiteStore:
         for row in self._conn.execute("SELECT status,COUNT(*) FROM task_outbox GROUP BY status"):
             if row[0] in stats:
                 stats[str(row[0])] = int(row[1])
+        now = int(time.time())
+        operational = self._conn.execute(
+            "SELECT "
+            "SUM(CASE WHEN status=? AND available_at<=? THEN 1 ELSE 0 END) AS ready,"
+            "SUM(CASE WHEN status=? AND lease_until IS NOT NULL AND lease_until<=? THEN 1 ELSE 0 END) AS expired,"
+            "MIN(CASE WHEN status=? THEN created_at END) AS oldest_pending "
+            "FROM task_outbox",
+            (OUTBOX_PENDING, now, OUTBOX_PROCESSING, now, OUTBOX_PENDING),
+        ).fetchone()
+        oldest = operational["oldest_pending"] if operational is not None else None
+        stats["ready"] = int(operational["ready"] or 0) if operational is not None else 0
+        stats["expired_leases"] = int(operational["expired"] or 0) if operational is not None else 0
+        stats["oldest_pending_age_seconds"] = max(0, now - int(oldest)) if oldest is not None else 0
         return stats
 
     def claim_outbox(
         self,
         worker_id: str = "worker",
         *,
+        task_type: str | None = None,
         limit: int = 1,
         lease_seconds: int = 60,
         now: int | None = None,
@@ -390,6 +404,7 @@ class SQLiteStore:
         owner, count, duration = str(worker_id).strip(), int(limit), int(lease_seconds)
         if not owner or count <= 0 or duration <= 0:
             raise ValueError("worker_id, limit and lease_seconds must be positive")
+        selected_type = str(task_type or "").strip() or None
         timestamp = self._now(now)
         until = timestamp + duration
         claimed: list[OutboxRecord] = []
@@ -400,12 +415,17 @@ class SQLiteStore:
                 "(status=? OR (status=? AND lease_until IS NOT NULL AND lease_until<=?))",
                 (OUTBOX_FAILED, "max_attempts_exceeded", timestamp, OUTBOX_PENDING, OUTBOX_PROCESSING, timestamp),
             )
-            rows = self._conn.execute(
+            sql = (
                 "SELECT outbox_id FROM task_outbox WHERE available_at<=? AND attempt_count<max_attempts AND "
-                "(status=? OR (status=? AND lease_until IS NOT NULL AND lease_until<=?)) "
-                "ORDER BY created_at,outbox_id LIMIT ?",
-                (timestamp, OUTBOX_PENDING, OUTBOX_PROCESSING, timestamp, count),
-            ).fetchall()
+                "(status=? OR (status=? AND lease_until IS NOT NULL AND lease_until<=?))"
+            )
+            args: list[object] = [timestamp, OUTBOX_PENDING, OUTBOX_PROCESSING, timestamp]
+            if selected_type is not None:
+                sql += " AND task_type=?"
+                args.append(selected_type)
+            sql += " ORDER BY created_at,outbox_id LIMIT ?"
+            args.append(count)
+            rows = self._conn.execute(sql, args).fetchall()
             for row in rows:
                 token = uuid.uuid4().hex
                 changed = self._conn.execute(
@@ -425,10 +445,17 @@ class SQLiteStore:
         self,
         worker_id: str = "worker",
         *,
+        task_type: str | None = None,
         lease_seconds: int = 60,
         now: int | None = None,
     ) -> OutboxRecord | None:
-        rows = self.claim_outbox(worker_id, limit=1, lease_seconds=lease_seconds, now=now)
+        rows = self.claim_outbox(
+            worker_id,
+            task_type=task_type,
+            limit=1,
+            lease_seconds=lease_seconds,
+            now=now,
+        )
         return rows[0] if rows else None
 
     def _lease(self, item: str | OutboxRecord, token: str | None) -> tuple[str, str]:
@@ -467,6 +494,37 @@ class SQLiteStore:
             ).fetchone())
 
     complete = complete_outbox
+
+    def release_outbox(
+        self,
+        item: str | OutboxRecord,
+        lease_token: str | None = None,
+        *,
+        error: object | None = None,
+        delay_seconds: int = 0,
+        now: int | None = None,
+    ) -> OutboxRecord:
+        """Release an unstarted claim without consuming an execution attempt."""
+
+        outbox_id, token = self._lease(item, lease_token)
+        delay = int(delay_seconds)
+        if delay < 0:
+            raise ValueError("delay_seconds must be non-negative")
+        timestamp = self._now(now)
+        with self._write_transaction():
+            self._assert_lease(outbox_id, token, timestamp)
+            message = None if error is None else str(error).strip()[:512] or None
+            self._conn.execute(
+                "UPDATE task_outbox SET status=?,attempt_count=MAX(0,attempt_count-1),available_at=?,"
+                "lease_owner=NULL,lease_token=NULL,lease_until=NULL,last_error=?,updated_at=? "
+                "WHERE outbox_id=? AND lease_token=? AND lease_until>?",
+                (OUTBOX_PENDING, timestamp + delay, message, timestamp, outbox_id, token, timestamp),
+            )
+            return self._outbox(self._conn.execute(
+                "SELECT * FROM task_outbox WHERE outbox_id=?", (outbox_id,)
+            ).fetchone())
+
+    release = release_outbox
 
     def retry_outbox(
         self,

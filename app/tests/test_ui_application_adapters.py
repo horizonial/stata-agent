@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -134,6 +135,34 @@ def test_app_lifespan_starts_recovers_and_boundedly_stops_queue(monkeypatch):
         assert events == ["start", "recover"]
 
     assert events == ["start", "recover", ("shutdown", True, 1.0)]
+
+
+def test_memory_outbox_pump_loop_keeps_retrying_until_cancelled():
+    class Dispatcher:
+        def __init__(self):
+            self.calls = 0
+
+        def pump(self):
+            self.calls += 1
+
+    dispatcher = Dispatcher()
+
+    async def exercise() -> int:
+        task = asyncio.create_task(
+            ui._memory_outbox_pump_loop(dispatcher, interval_seconds=0.01)
+        )
+        try:
+            for _ in range(20):
+                if dispatcher.calls >= 2:
+                    break
+                await asyncio.sleep(0.01)
+            return dispatcher.calls
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    assert asyncio.run(exercise()) >= 2
 
 
 def test_ui_imports_legacy_memory_once_then_writes_only_sqlite(tmp_path, monkeypatch):

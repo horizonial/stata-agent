@@ -11,6 +11,7 @@ and keeps the FastAPI layer small enough to hand over to the next maintainer.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import os
@@ -19,7 +20,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from contextlib import asynccontextmanager, contextmanager, nullcontext
+from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ from .application.chat_service import ChatService, ChatTurnRequest
 from .application.local_task_queue import LocalTaskQueue
 from .application.memory_outbox import (
     MemoryOutboxClaim,
+    MemoryOutboxDeferred,
     MemoryOutboxDispatcher,
     MemoryOutboxIntent,
     SQLiteMemoryOutboxRepository,
@@ -119,13 +121,24 @@ async def _app_lifespan(_app: FastAPI):
     """Start local background work, recover durable intent, then stop boundedly."""
 
     _MEMORY_EXTRACTION_SCHEDULER.start()
+    pump_task: asyncio.Task[None] | None = None
     try:
         try:
             resume_memory_extractions()
         except Exception:  # noqa: BLE001 - recovery must not make the UI unavailable
             pass
+        from .config import memory_extraction_mode
+
+        if memory_extraction_mode() == "provider":
+            pump_task = asyncio.create_task(
+                _memory_outbox_pump_loop(_memory_outbox_dispatcher())
+            )
         yield
     finally:
+        if pump_task is not None:
+            pump_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await pump_task
         shutdown_memory_extractions(wait=True, timeout=1.0)
 
 
@@ -701,10 +714,10 @@ def _run_memory_outbox_claim(claim: MemoryOutboxClaim) -> None:
     if _provider_name(provider) != claim.intent.provider_name:
         # No terminal event is written.  The dispatcher will release the
         # lease, allowing a later process with the matching provider to retry.
-        return
+        raise MemoryOutboxDeferred("provider_identity_mismatch")
     _, extraction_provider = _feature_adapters(provider, claim.intent.privacy_mode)
     if extraction_provider is None:
-        return
+        raise MemoryOutboxDeferred("provider_unavailable_for_frozen_privacy")
     from .memory.pipeline import MemoryExtractionPipeline
 
     store = _store()
@@ -755,6 +768,21 @@ def _memory_outbox_dispatcher() -> MemoryOutboxDispatcher:
         terminal_checker=_memory_outbox_terminal,
         owner=f"ui:{os.getpid()}",
     )
+
+
+async def _memory_outbox_pump_loop(
+    dispatcher: MemoryOutboxDispatcher,
+    *,
+    interval_seconds: float = 1.0,
+) -> None:
+    """Continuously redeliver durable pending work while the app is alive."""
+
+    while True:
+        await asyncio.sleep(max(0.1, float(interval_seconds)))
+        try:
+            await asyncio.to_thread(dispatcher.pump)
+        except Exception:  # noqa: BLE001 - the next tick remains a recovery path
+            continue
 
 
 def _submit_memory_extraction_task(
@@ -2236,6 +2264,7 @@ def health(ws: str = _IDEA):
         privacy = _privacy_mode()
         config = summary.get("config") or {}
         skill_errors = config.get("skill_errors") or []
+        outbox_stats = s.outbox_stats()
         return {
             "ok": bool(summary["health"]["ok"]) and not skill_errors,
             "local_strict": privacy == "local_strict",
@@ -2244,6 +2273,7 @@ def health(ws: str = _IDEA):
             "executor": config.get("executor", "未配置"),
             "skill_errors": skill_errors,
             "status": summary["run_status"],
+            "memory_outbox": outbox_stats,
             "detail": skill_errors[0] if skill_errors else summary["status_detail"],
         }
     finally:

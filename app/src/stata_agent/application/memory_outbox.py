@@ -26,8 +26,10 @@ from .task_queue import TaskQueue, TaskSubmitResult, TaskSubmitStatus
 
 
 MEMORY_EXTRACTION_KIND = "memory.extraction"
-DEFAULT_OUTBOX_LEASE_SECONDS = 30.0
+DEFAULT_OUTBOX_LEASE_SECONDS = 300.0
 DEFAULT_OUTBOX_CLAIM_LIMIT = 4
+DEFAULT_OUTBOX_RETRY_SECONDS = 5.0
+DEFAULT_OUTBOX_ADMISSION_RETRY_SECONDS = 0.0
 
 
 class MemoryOutboxError(RuntimeError):
@@ -36,6 +38,10 @@ class MemoryOutboxError(RuntimeError):
 
 class MemoryOutboxLeaseError(MemoryOutboxError):
     """A completion/retry could not be applied to the claimed lease."""
+
+
+class MemoryOutboxDeferred(MemoryOutboxError):
+    """The claim is valid but cannot start under the current runtime policy."""
 
 
 @dataclass(frozen=True)
@@ -201,6 +207,19 @@ class MemoryOutboxRepository(Protocol):
 
         ...
 
+    def release(
+        self,
+        kind: str,
+        key: str,
+        lease_token: str,
+        *,
+        error_code: str,
+        delay_seconds: float = 0.0,
+    ) -> bool:
+        """Release an unstarted claim without consuming an attempt."""
+
+        ...
+
 
 Worker = Callable[[MemoryOutboxClaim], object]
 TerminalChecker = Callable[[MemoryOutboxClaim], bool]
@@ -298,6 +317,8 @@ class MemoryOutboxDispatcher:
         owner: str | None = None,
         lease_seconds: float = DEFAULT_OUTBOX_LEASE_SECONDS,
         claim_limit: int = DEFAULT_OUTBOX_CLAIM_LIMIT,
+        retry_seconds: float = DEFAULT_OUTBOX_RETRY_SECONDS,
+        admission_retry_seconds: float = DEFAULT_OUTBOX_ADMISSION_RETRY_SECONDS,
         kind: str = MEMORY_EXTRACTION_KIND,
     ) -> None:
         if not callable(worker):
@@ -308,6 +329,10 @@ class MemoryOutboxDispatcher:
             raise ValueError("lease_seconds must be positive")
         if isinstance(claim_limit, bool) or int(claim_limit) <= 0:
             raise ValueError("claim_limit must be positive")
+        if isinstance(retry_seconds, bool) or float(retry_seconds) < 0:
+            raise ValueError("retry_seconds must be non-negative")
+        if isinstance(admission_retry_seconds, bool) or float(admission_retry_seconds) < 0:
+            raise ValueError("admission_retry_seconds must be non-negative")
         self.repository = repository
         self.queue = queue
         self.worker = worker
@@ -315,6 +340,8 @@ class MemoryOutboxDispatcher:
         self.owner = str(owner or f"memory-outbox-{uuid.uuid4().hex}")
         self.lease_seconds = float(lease_seconds)
         self.claim_limit = int(claim_limit)
+        self.retry_seconds = float(retry_seconds)
+        self.admission_retry_seconds = float(admission_retry_seconds)
         self.kind = str(kind)
         if self.kind != MEMORY_EXTRACTION_KIND:
             raise ValueError(f"unsupported outbox kind: {self.kind!r}")
@@ -372,7 +399,7 @@ class MemoryOutboxDispatcher:
                     TaskSubmitStatus.CLOSED: "queue_closed",
                     TaskSubmitStatus.DUPLICATE: "queue_duplicate",
                 }.get(status, "queue_not_admitted")
-                if self._retry(claim, error_code=code):
+                if self._release(claim, error_code=code):
                     retried += 1
                     retained += 1
                 else:
@@ -415,6 +442,9 @@ class MemoryOutboxDispatcher:
             # original privacy mode and provider identity.  It must not read
             # current process configuration to relax those frozen fields.
             self.worker(claim)
+        except MemoryOutboxDeferred as exc:
+            self._release(claim, error_code=_error_code(exc, "runtime_deferred"))
+            return
         except Exception as exc:  # noqa: BLE001 - retry is the durable outcome
             self._retry(claim, error_code=_error_code(exc, "worker_error"))
             return
@@ -444,7 +474,18 @@ class MemoryOutboxDispatcher:
                 claim.key,
                 claim.lease_token,
                 error_code=error_code,
-                delay_seconds=0.0,
+                delay_seconds=self.retry_seconds,
+            )
+        )
+
+    def _release(self, claim: MemoryOutboxClaim, *, error_code: str) -> bool:
+        return bool(
+            self.repository.release(
+                self.kind,
+                claim.key,
+                claim.lease_token,
+                error_code=error_code,
+                delay_seconds=self.admission_retry_seconds,
             )
         )
 
@@ -470,6 +511,7 @@ class FakeMemoryOutboxRepository:
         self.claims: dict[str, MemoryOutboxClaim] = {}
         self.terminal: set[str] = set()
         self.retries: list[tuple[str, str]] = []
+        self.releases: list[tuple[str, str]] = []
         self.completions: list[str] = []
         self.backfill_count = 0
 
@@ -533,6 +575,23 @@ class FakeMemoryOutboxRepository:
         self.retries.append((key, error_code))
         return True
 
+    def release(
+        self,
+        kind: str,
+        key: str,
+        lease_token: str,
+        *,
+        error_code: str,
+        delay_seconds: float = 0.0,
+    ) -> bool:
+        del delay_seconds
+        claim = self.claims.get(key)
+        if claim is None or claim.intent.kind != kind or claim.lease_token != lease_token:
+            return False
+        self.status[key] = "pending"
+        self.releases.append((key, error_code))
+        return True
+
 
 class SQLiteMemoryOutboxRepository:
     """Adapt the generic application port to the SQLite task-outbox API.
@@ -573,7 +632,12 @@ class SQLiteMemoryOutboxRepository:
         provider = payload.get("provider_name") or payload.get("provider")
         # A legacy request that lacks either half of the freeze must not be
         # upgraded to a more permissive mode during recovery.
-        if not isinstance(mode, str) or not mode.strip() or not isinstance(provider, str) or not provider.strip():
+        if (
+            not isinstance(mode, str)
+            or not mode.strip()
+            or not isinstance(provider, str)
+            or not provider.strip()
+        ):
             return LOCAL_STRICT, "local"
         try:
             return normalize_mode(mode), provider.strip().lower()[:80]
@@ -695,6 +759,7 @@ class SQLiteMemoryOutboxRepository:
         try:
             records = store.claim_outbox(
                 str(owner),
+                task_type=kind,
                 limit=int(limit),
                 lease_seconds=max(1, int(lease_seconds)),
             )
@@ -772,14 +837,43 @@ class SQLiteMemoryOutboxRepository:
         finally:
             self._close(store)
 
+    def release(
+        self,
+        kind: str,
+        key: str,
+        lease_token: str,
+        *,
+        error_code: str,
+        delay_seconds: float = 0.0,
+    ) -> bool:
+        store = self._store_factory()
+        try:
+            record = store.get_outbox(idempotency_key=key)
+            if record is None or record.task_type != kind:
+                return False
+            store.release_outbox(
+                record,
+                lease_token,
+                error=error_code,
+                delay_seconds=max(0, int(delay_seconds)),
+            )
+            return True
+        except Exception:  # noqa: BLE001 - stale leases are not releases
+            return False
+        finally:
+            self._close(store)
+
 
 __all__ = [
+    "DEFAULT_OUTBOX_ADMISSION_RETRY_SECONDS",
     "DEFAULT_OUTBOX_CLAIM_LIMIT",
     "DEFAULT_OUTBOX_LEASE_SECONDS",
+    "DEFAULT_OUTBOX_RETRY_SECONDS",
     "FakeMemoryOutboxRepository",
     "MEMORY_EXTRACTION_KIND",
     "MemoryOutboxClaim",
     "MemoryOutboxDispatcher",
+    "MemoryOutboxDeferred",
     "MemoryOutboxError",
     "MemoryOutboxIntent",
     "MemoryOutboxLeaseError",

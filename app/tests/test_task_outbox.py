@@ -118,6 +118,10 @@ def test_outbox_enqueue_is_idempotent_and_backfill_is_atomic(tmp_path) -> None:
     assert duplicate.status is OutboxEnqueueStatus.DUPLICATE
     assert duplicate.record.outbox_id == first.record.outbox_id
     assert store.outbox_stats()[OUTBOX_PENDING] == 1
+    stats = store.outbox_stats()
+    assert stats["ready"] == 1
+    assert stats["expired_leases"] == 0
+    assert stats["oldest_pending_age_seconds"] >= 0
 
     with pytest.raises(OutboxConflictError):
         store.enqueue_outbox(_intent(task_type="other.task"), now=12)
@@ -213,4 +217,37 @@ def test_expired_lease_can_be_reclaimed_and_old_token_cannot_retry(tmp_path) -> 
     failed = store.retry_outbox(final_claim, error="still failing", now=108)
     assert failed.status == OUTBOX_FAILED
     assert store.claim_one("worker-d", now=109) is None
+    store.close()
+
+
+def test_release_preserves_attempt_budget_and_claim_filters_task_type(tmp_path) -> None:
+    store = SQLiteStore(str(tmp_path / "release.sqlite3"), writer_id="writer")
+    store.enqueue_outbox(_intent("memory:1", task_type="memory.extraction"), now=100)
+    store.enqueue_outbox(_intent("review:1", task_type="memory.review"), now=100)
+
+    claimed = store.claim_one(
+        "memory-worker",
+        task_type="memory.extraction",
+        lease_seconds=5,
+        now=100,
+    )
+    assert claimed is not None
+    assert claimed.task_type == "memory.extraction"
+    assert claimed.attempt_count == 1
+
+    released = store.release_outbox(claimed, error="queue_full", now=100)
+    assert released.status == OUTBOX_PENDING
+    assert released.attempt_count == 0
+    assert released.last_error == "queue_full"
+
+    claimed_again = store.claim_one(
+        "memory-worker",
+        task_type="memory.extraction",
+        lease_seconds=5,
+        now=100,
+    )
+    assert claimed_again is not None
+    assert claimed_again.outbox_id == claimed.outbox_id
+    assert claimed_again.attempt_count == 1
+    assert store.get_outbox(idempotency_key="review:1").status == OUTBOX_PENDING
     store.close()

@@ -7,6 +7,7 @@ import threading
 from stata_agent.application import (
     FakeMemoryOutboxRepository,
     MemoryOutboxDispatcher,
+    MemoryOutboxDeferred,
     MemoryOutboxIntent,
     MEMORY_EXTRACTION_KIND,
 )
@@ -138,7 +139,8 @@ def test_full_queue_releases_claim_back_to_pending():
     assert report.submitted == 0
     assert report.retained_pending == 1
     assert repository.status[_intent().key] == "pending"
-    assert repository.retries == [(_intent().key, "queue_full")]
+    assert repository.retries == []
+    assert repository.releases == [(_intent().key, "queue_full")]
 
     release.set()
     queue.shutdown(wait=True)
@@ -161,7 +163,33 @@ def test_closed_queue_releases_claim_back_to_pending():
     assert report.submitted == 0
     assert report.retained_pending == 1
     assert repository.status[_intent().key] == "pending"
-    assert repository.retries == [(_intent().key, "queue_closed")]
+    assert repository.retries == []
+    assert repository.releases == [(_intent().key, "queue_closed")]
+
+
+def test_runtime_policy_deferral_releases_without_recording_execution_failure():
+    repository = FakeMemoryOutboxRepository()
+    queue = LocalTaskQueue(max_pending=1)
+    finished = threading.Event()
+
+    def worker(_claim):
+        finished.set()
+        raise MemoryOutboxDeferred("provider_identity_mismatch")
+
+    dispatcher = _dispatcher(
+        repository,
+        queue,
+        worker=worker,
+        terminal_checker=lambda _claim: False,
+    )
+    dispatcher.ensure_intent(_intent())
+
+    assert dispatcher.pump().submitted == 1
+    assert finished.wait(1)
+    queue.shutdown(wait=True)
+    assert repository.status[_intent().key] == "pending"
+    assert repository.retries == []
+    assert repository.releases == [(_intent().key, "runtime_deferred")]
 
 
 def test_claim_freezes_privacy_and_provider_identity_for_worker():

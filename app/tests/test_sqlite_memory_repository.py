@@ -20,9 +20,9 @@ def test_migrations_are_idempotent_and_failure_rolls_back(tmp_path):
     connection = sqlite3.connect(database)
     runner = MigrationRunner(connection)
 
-    assert runner.run() == 1
-    assert runner.run() == 1
-    assert [item["version"] for item in runner.applied()] == [1]
+    assert runner.run() == 2
+    assert runner.run() == 2
+    assert [item["version"] for item in runner.applied()] == [1, 2]
     tables = {
         row[0]
         for row in connection.execute(
@@ -59,7 +59,7 @@ def test_migrations_are_idempotent_and_failure_rolls_back(tmp_path):
 def test_migrations_reject_downgrade_and_schema_history_drift(tmp_path):
     connection = sqlite3.connect(tmp_path / "drift.sqlite3")
     runner = MigrationRunner(connection)
-    assert runner.run() == 1
+    assert runner.run() == 2
 
     with pytest.raises(MigrationError, match="older than current"):
         runner.run(target_version=0)
@@ -81,7 +81,7 @@ def test_migrations_reject_downgrade_and_schema_history_drift(tmp_path):
 
 def test_repository_configures_sqlite_and_covers_schema(tmp_path):
     repository = SQLiteMemoryRepository(tmp_path / "memory.sqlite3", workspace_id="project-a", busy_timeout_ms=3210)
-    assert repository.schema_version == 1
+    assert repository.schema_version == 2
     assert repository.applied_migrations()[0]["name"] == "memory_storage_v1"
     assert repository.connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert repository.connection.execute("PRAGMA busy_timeout").fetchone()[0] == 3210

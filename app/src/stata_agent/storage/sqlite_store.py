@@ -1,8 +1,4 @@
-"""SQLite 账本实现 + 单写者租约/revision fence（DD-01 §3.1/§3.6/§3.8）。
-
-切片 0 目标：正确性优先（append 校验、幂等、fence、投影可重建），
-性能（拆列/批量）留到有量再优化。
-"""
+"""SQLite 账本实现 + durable task outbox。"""
 
 from __future__ import annotations
 
@@ -10,62 +6,31 @@ import json
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterable, Mapping
+from contextlib import contextmanager
 from typing import Iterator, Optional
 
 from ..domain.reducers import Projection, apply as _apply, fold as _fold
 from ..events.append import assert_sane_event
 from ..events.schema import Event
 from ..events.upcast import upcast
+from .migrations import MigrationRunner
 from .store import (
+    AppendOutboxResult,
     DuplicateFingerprint,
     LeaseConflict,
+    OUTBOX_COMPLETED,
+    OUTBOX_FAILED,
+    OUTBOX_PENDING,
+    OUTBOX_PROCESSING,
+    OutboxConflictError,
+    OutboxEnqueueResult,
+    OutboxEnqueueStatus,
+    OutboxIntent,
+    OutboxLeaseError,
+    OutboxRecord,
     StaleWrite,
 )
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS events (
-  event_id        TEXT PRIMARY KEY,
-  idea_id         TEXT NOT NULL,
-  seq             INTEGER NOT NULL,
-  branch_id       TEXT NOT NULL DEFAULT 'main',
-  prev_event_id   TEXT,
-  phase           TEXT,
-  event_type      TEXT NOT NULL,
-  schema_version  INTEGER NOT NULL DEFAULT 1,
-  actor           TEXT NOT NULL,
-  source          TEXT NOT NULL,
-  correlation_id  TEXT,
-  causation_id    TEXT,
-  operation_id    TEXT,
-  attempt_id      INTEGER NOT NULL DEFAULT 0,
-  fingerprint     TEXT,
-  confidence      TEXT NOT NULL DEFAULT 'judgment',
-  side_effect_state TEXT,
-  payload         TEXT NOT NULL DEFAULT '{}',
-  created_at      INTEGER NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_events_seq ON events(idea_id, seq);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_events_fp
-  ON events(idea_id, event_type, fingerprint) WHERE fingerprint IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_events_branch ON events(idea_id, branch_id, seq);
-
-CREATE TABLE IF NOT EXISTS writer_lease (
-  writer_id   TEXT PRIMARY KEY,
-  token       TEXT NOT NULL,
-  revision    INTEGER NOT NULL DEFAULT 0,
-  acquired_at INTEGER NOT NULL,
-  expires_at  INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS snapshots (
-  idea_id    TEXT NOT NULL,
-  as_of_seq  INTEGER NOT NULL,
-  kind       TEXT NOT NULL DEFAULT 'full',
-  blob       BLOB NOT NULL,
-  created_at INTEGER NOT NULL,
-  PRIMARY KEY (idea_id, as_of_seq, kind)
-);
-"""
 
 
 class SQLiteStore:
@@ -75,13 +40,28 @@ class SQLiteStore:
         self._path = path
         self._writer_id = writer_id
         self._token = uuid.uuid4().hex
-        self._conn = sqlite3.connect(path)
+        self._conn = sqlite3.connect(path, timeout=5.0, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
-        with self._conn:
-            self._conn.executescript(_SCHEMA)
+        self._migrations = MigrationRunner(self._conn)
+        self._migrations.run()
         self._acquire_lease(takeover=takeover)
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        return self._conn
+
+    @property
+    def schema_version(self) -> int:
+        return self._migrations.current_version
+
+    def migrate(self) -> int:
+        return self._migrations.run()
+
+    def applied_migrations(self) -> list[dict[str, object]]:
+        return self._migrations.applied()
 
     # ---------------------------------------------------------------- lease
     def _acquire_lease(self, *, takeover: bool) -> None:
@@ -120,9 +100,7 @@ class SQLiteStore:
             raise StaleWrite(f"writer={self._writer_id!r} 的租约已过期（fence）")
 
     def _bump_revision(self) -> None:
-        self._conn.execute(
-            "UPDATE writer_lease SET revision=revision+1 WHERE writer_id='master'"
-        )
+        self._conn.execute("UPDATE writer_lease SET revision=revision+1 WHERE writer_id='master'")
 
     @property
     def revision(self) -> int:
@@ -130,12 +108,48 @@ class SQLiteStore:
         return int(row["revision"]) if row else 0
 
     # ---------------------------------------------------------------- append
-    def append(self, event: Event) -> int:
-        with self._conn:
+    @contextmanager
+    def _write_transaction(self) -> Iterator[sqlite3.Connection]:
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield self._conn
+        except BaseException:
+            self._conn.rollback()
+            raise
+        else:
+            self._conn.commit()
+
+    def append(
+        self,
+        event: Event,
+        *,
+        outbox: OutboxIntent | None = None,
+        outbox_intent: OutboxIntent | None = None,
+    ) -> int:
+        if outbox is not None and outbox_intent is not None:
+            raise ValueError("pass at most one outbox intent")
+        with self._write_transaction():
             self._check_lease()
             projection = self.project(event.idea_id)
             self._validate_candidate(event, projection)
-            return self._insert_event(event)
+            seq = self._insert_event(event)
+            intent = outbox if outbox is not None else outbox_intent
+            if intent is not None:
+                self._enqueue_outbox(intent, event_seq=seq)
+            return seq
+
+    def append_with_outbox(self, event: Event, intent: OutboxIntent) -> AppendOutboxResult:
+        """Atomically append an event and ensure its durable intent."""
+
+        with self._write_transaction():
+            self._check_lease()
+            projection = self.project(event.idea_id)
+            self._validate_candidate(event, projection)
+            seq = self._insert_event(event)
+            result = self._enqueue_outbox(intent, event_seq=seq)
+            return AppendOutboxResult(seq, result)
+
+    append_event_with_outbox = append_with_outbox
 
     def append_many(self, events: list[Event]) -> int:
         """Atomically append a batch after folding every candidate event.
@@ -146,7 +160,7 @@ class SQLiteStore:
         """
         if not events:
             return 0
-        with self._conn:
+        with self._write_transaction():
             self._check_lease()
             projections: dict[str, Projection] = {}
             seen_fingerprints: set[tuple[str, str, str]] = set()
@@ -205,6 +219,286 @@ class SQLiteStore:
         self._set_last_seq(seq)
         self._bump_revision()
         return seq
+
+    # --------------------------------------------------------------- outbox
+    @staticmethod
+    def _now(value: int | None) -> int:
+        return int(time.time()) if value is None else int(value)
+
+    @staticmethod
+    def _safe_payload(payload: Mapping[str, object]) -> dict[str, object]:
+        blocked = {
+            "raw", "raw_text", "text", "content", "prompt", "response", "provider_response",
+            "output", "message", "messages", "transcript", "conversation", "body", "input", "result",
+        }
+
+        def clean(value: object) -> object:
+            if value is None or isinstance(value, (bool, int, float, str)):
+                return value[:512] if isinstance(value, str) else value
+            if isinstance(value, Mapping):
+                return {
+                    str(key): clean(child)
+                    for key, child in value.items()
+                    if not (
+                        (key_name := str(key).strip().lower().replace("-", "_")) in blocked
+                        or key_name.endswith(("_text", "_content", "_prompt", "_response", "_output"))
+                    )
+                }
+            if isinstance(value, (list, tuple)):
+                return [clean(child) for child in value]
+            raise TypeError(f"unsupported outbox payload type: {type(value).__name__}")
+
+        result = clean(payload)
+        if not isinstance(result, dict):
+            raise TypeError("payload must be a mapping")
+        return result
+
+    @classmethod
+    def _payload_text(cls, payload: Mapping[str, object]) -> tuple[str, dict[str, object]]:
+        safe = cls._safe_payload(payload)
+        try:
+            text = json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("outbox payload must be finite JSON metadata") from exc
+        if len(text.encode()) > 16_384:
+            raise ValueError("outbox payload exceeds 16 KiB")
+        return text, safe
+
+    @staticmethod
+    def _outbox(row: sqlite3.Row) -> OutboxRecord:
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        return OutboxRecord(
+            str(row["outbox_id"]), str(row["idempotency_key"]), str(row["task_type"]),
+            payload if isinstance(payload, dict) else {}, str(row["status"]), int(row["attempt_count"]),
+            int(row["max_attempts"]), int(row["available_at"]), row["lease_owner"], row["lease_token"],
+            int(row["lease_until"]) if row["lease_until"] is not None else None, row["last_error"],
+            int(row["event_seq"]) if row["event_seq"] is not None else None, int(row["created_at"]),
+            int(row["updated_at"]), int(row["completed_at"]) if row["completed_at"] is not None else None,
+        )
+
+    def _enqueue_outbox(
+        self,
+        intent: OutboxIntent,
+        *,
+        event_seq: int | None = None,
+        now: int | None = None,
+    ) -> OutboxEnqueueResult:
+        if not isinstance(intent, OutboxIntent):
+            raise TypeError("intent must be an OutboxIntent")
+        payload_text, safe = self._payload_text(intent.payload)
+        selected_seq = None if event_seq is None else int(event_seq)
+        if selected_seq is not None and selected_seq <= 0:
+            raise ValueError("event_seq must be positive")
+        row = self._conn.execute(
+            "SELECT * FROM task_outbox WHERE idempotency_key=?", (intent.idempotency_key,)
+        ).fetchone()
+        timestamp = self._now(now)
+        if row is not None:
+            current = self._outbox(row)
+            if current.task_type != intent.task_type or current.payload != safe:
+                raise OutboxConflictError(f"outbox key conflict: {intent.idempotency_key!r}")
+            if selected_seq is not None and current.event_seq not in (None, selected_seq):
+                raise OutboxConflictError(f"outbox event conflict: {intent.idempotency_key!r}")
+            if selected_seq is not None and current.event_seq is None:
+                self._conn.execute(
+                    "UPDATE task_outbox SET event_seq=?, updated_at=? WHERE outbox_id=?",
+                    (selected_seq, timestamp, current.outbox_id),
+                )
+                row = self._conn.execute(
+                    "SELECT * FROM task_outbox WHERE outbox_id=?", (current.outbox_id,)
+                ).fetchone()
+                current = self._outbox(row)
+            return OutboxEnqueueResult(OutboxEnqueueStatus.DUPLICATE, current)
+        outbox_id = uuid.uuid4().hex
+        self._conn.execute(
+            "INSERT INTO task_outbox(outbox_id,idempotency_key,task_type,payload,status,attempt_count,max_attempts,"
+            "available_at,lease_owner,lease_token,lease_until,last_error,event_seq,created_at,updated_at,completed_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (outbox_id, intent.idempotency_key, intent.task_type, payload_text, OUTBOX_PENDING, 0,
+             intent.max_attempts, int(intent.available_at or 0), None, None, None, None, selected_seq,
+             timestamp, timestamp, None),
+        )
+        row = self._conn.execute("SELECT * FROM task_outbox WHERE outbox_id=?", (outbox_id,)).fetchone()
+        return OutboxEnqueueResult(OutboxEnqueueStatus.ENQUEUED, self._outbox(row))
+
+    def enqueue_outbox(
+        self,
+        intent: OutboxIntent,
+        *,
+        event_seq: int | None = None,
+        now: int | None = None,
+    ) -> OutboxEnqueueResult:
+        with self._write_transaction():
+            self._check_lease()
+            return self._enqueue_outbox(intent, event_seq=event_seq, now=now)
+
+    ensure_outbox = enqueue_outbox
+
+    def backfill_outbox(self, intents: Iterable[OutboxIntent], *, now: int | None = None) -> list[OutboxEnqueueResult]:
+        with self._write_transaction():
+            self._check_lease()
+            return [self._enqueue_outbox(intent, now=now) for intent in intents]
+
+    backfill = backfill_outbox
+
+    def get_outbox(
+        self,
+        outbox_id: str | None = None,
+        *,
+        idempotency_key: str | None = None,
+    ) -> OutboxRecord | None:
+        if (outbox_id is None) == (idempotency_key is None):
+            raise ValueError("pass exactly one outbox id or idempotency key")
+        column, value = ("outbox_id", outbox_id) if outbox_id is not None else ("idempotency_key", idempotency_key)
+        row = self._conn.execute(f"SELECT * FROM task_outbox WHERE {column}=?", (value,)).fetchone()
+        return self._outbox(row) if row is not None else None
+
+    def list_outbox(self, *, status: str | None = None, limit: int | None = None) -> list[OutboxRecord]:
+        sql = "SELECT * FROM task_outbox"
+        args: list[object] = []
+        if status is not None:
+            sql += " WHERE status=?"
+            args.append(status)
+        sql += " ORDER BY created_at, outbox_id"
+        if limit is not None:
+            if int(limit) <= 0:
+                raise ValueError("limit must be positive")
+            sql += " LIMIT ?"
+            args.append(int(limit))
+        return [self._outbox(row) for row in self._conn.execute(sql, args).fetchall()]
+
+    def outbox_stats(self) -> dict[str, int]:
+        """Return stable durable counts for health/status surfaces."""
+
+        stats = {OUTBOX_PENDING: 0, OUTBOX_PROCESSING: 0, OUTBOX_COMPLETED: 0, OUTBOX_FAILED: 0}
+        for row in self._conn.execute("SELECT status,COUNT(*) FROM task_outbox GROUP BY status"):
+            if row[0] in stats:
+                stats[str(row[0])] = int(row[1])
+        return stats
+
+    def claim_outbox(
+        self,
+        worker_id: str = "worker",
+        *,
+        limit: int = 1,
+        lease_seconds: int = 60,
+        now: int | None = None,
+    ) -> list[OutboxRecord]:
+        owner, count, duration = str(worker_id).strip(), int(limit), int(lease_seconds)
+        if not owner or count <= 0 or duration <= 0:
+            raise ValueError("worker_id, limit and lease_seconds must be positive")
+        timestamp = self._now(now)
+        until = timestamp + duration
+        claimed: list[OutboxRecord] = []
+        with self._write_transaction():
+            self._conn.execute(
+                "UPDATE task_outbox SET status=?,lease_owner=NULL,lease_token=NULL,lease_until=NULL,"
+                "last_error=COALESCE(last_error,?),updated_at=? WHERE attempt_count>=max_attempts AND "
+                "(status=? OR (status=? AND lease_until IS NOT NULL AND lease_until<=?))",
+                (OUTBOX_FAILED, "max_attempts_exceeded", timestamp, OUTBOX_PENDING, OUTBOX_PROCESSING, timestamp),
+            )
+            rows = self._conn.execute(
+                "SELECT outbox_id FROM task_outbox WHERE available_at<=? AND attempt_count<max_attempts AND "
+                "(status=? OR (status=? AND lease_until IS NOT NULL AND lease_until<=?)) "
+                "ORDER BY created_at,outbox_id LIMIT ?",
+                (timestamp, OUTBOX_PENDING, OUTBOX_PROCESSING, timestamp, count),
+            ).fetchall()
+            for row in rows:
+                token = uuid.uuid4().hex
+                changed = self._conn.execute(
+                    "UPDATE task_outbox SET status=?,lease_owner=?,lease_token=?,lease_until=?,"
+                    "attempt_count=attempt_count+1,updated_at=? WHERE outbox_id=? AND available_at<=? "
+                    "AND attempt_count<max_attempts AND (status=? OR (status=? AND lease_until<=?))",
+                    (OUTBOX_PROCESSING, owner, token, until, timestamp, row["outbox_id"], timestamp,
+                     OUTBOX_PENDING, OUTBOX_PROCESSING, timestamp),
+                )
+                if changed.rowcount:
+                    claimed.append(self._outbox(self._conn.execute(
+                        "SELECT * FROM task_outbox WHERE outbox_id=?", (row["outbox_id"],)
+                    ).fetchone()))
+        return claimed
+
+    def claim_one(
+        self,
+        worker_id: str = "worker",
+        *,
+        lease_seconds: int = 60,
+        now: int | None = None,
+    ) -> OutboxRecord | None:
+        rows = self.claim_outbox(worker_id, limit=1, lease_seconds=lease_seconds, now=now)
+        return rows[0] if rows else None
+
+    def _lease(self, item: str | OutboxRecord, token: str | None) -> tuple[str, str]:
+        if isinstance(item, OutboxRecord):
+            token = token or item.lease_token
+            item = item.outbox_id
+        if not item or not token:
+            raise OutboxLeaseError("outbox id and lease token are required")
+        return str(item), str(token)
+
+    def _assert_lease(self, outbox_id: str, token: str, now: int) -> None:
+        row = self._conn.execute(
+            "SELECT status,lease_token,lease_until FROM task_outbox WHERE outbox_id=?", (outbox_id,)
+        ).fetchone()
+        if row is None or row["status"] != OUTBOX_PROCESSING or row["lease_token"] != token or row["lease_until"] is None or int(row["lease_until"]) <= now:
+            raise OutboxLeaseError(f"stale outbox lease: {outbox_id!r}")
+
+    def complete_outbox(
+        self,
+        item: str | OutboxRecord,
+        lease_token: str | None = None,
+        *,
+        now: int | None = None,
+    ) -> OutboxRecord:
+        outbox_id, token = self._lease(item, lease_token)
+        timestamp = self._now(now)
+        with self._write_transaction():
+            self._assert_lease(outbox_id, token, timestamp)
+            self._conn.execute(
+                "UPDATE task_outbox SET status=?,lease_owner=NULL,lease_token=NULL,lease_until=NULL,"
+                "completed_at=?,updated_at=? WHERE outbox_id=? AND lease_token=? AND lease_until>?",
+                (OUTBOX_COMPLETED, timestamp, timestamp, outbox_id, token, timestamp),
+            )
+            return self._outbox(self._conn.execute(
+                "SELECT * FROM task_outbox WHERE outbox_id=?", (outbox_id,)
+            ).fetchone())
+
+    complete = complete_outbox
+
+    def retry_outbox(
+        self,
+        item: str | OutboxRecord,
+        lease_token: str | None = None,
+        *,
+        error: object | None = None,
+        delay_seconds: int = 0,
+        now: int | None = None,
+    ) -> OutboxRecord:
+        outbox_id, token = self._lease(item, lease_token)
+        delay = int(delay_seconds)
+        if delay < 0:
+            raise ValueError("delay_seconds must be non-negative")
+        timestamp = self._now(now)
+        with self._write_transaction():
+            self._assert_lease(outbox_id, token, timestamp)
+            row = self._conn.execute(
+                "SELECT attempt_count,max_attempts FROM task_outbox WHERE outbox_id=?", (outbox_id,)
+            ).fetchone()
+            status = OUTBOX_FAILED if int(row["attempt_count"]) >= int(row["max_attempts"]) else OUTBOX_PENDING
+            message = None if error is None else str(error).strip()[:512] or None
+            self._conn.execute(
+                "UPDATE task_outbox SET status=?,available_at=?,lease_owner=NULL,lease_token=NULL,lease_until=NULL,"
+                "last_error=?,updated_at=? WHERE outbox_id=? AND lease_token=? AND lease_until>?",
+                (status, timestamp + delay, message, timestamp, outbox_id, token, timestamp),
+            )
+            return self._outbox(self._conn.execute(
+                "SELECT * FROM task_outbox WHERE outbox_id=?", (outbox_id,)
+            ).fetchone())
+
+    retry = retry_outbox
 
     # ---------------------------------------------------------------- query
     def scan(
@@ -301,7 +595,7 @@ class SQLiteStore:
 
 
 def _to_tuples(x):
-    """json 会把 tuple 存成 list；读回时还原成 tuple，保证与 summary() 可比。"""
+    """json 会把 tuple 存成 list；读回时还原成 tuple。"""
     if isinstance(x, list):
         return tuple(_to_tuples(i) for i in x)
     if isinstance(x, tuple):

@@ -33,6 +33,22 @@ class Migration:
     apply: MigrationFn
 
 
+def _ensure_column(
+    connection: sqlite3.Connection,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    """Add a missing legacy column without weakening the migration boundary."""
+
+    columns = {
+        str(row[1])
+        for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def _create_memory_schema(connection: sqlite3.Connection) -> None:
     """Create the first durable memory schema.
 
@@ -127,8 +143,127 @@ def _create_memory_schema(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
+def _create_ledger_and_outbox_schema(connection: sqlite3.Connection) -> None:
+    """Create the event ledger, writer lease, snapshots, and durable outbox.
+
+    This is deliberately a migration rather than a second bootstrap script in
+    :mod:`sqlite_store`.  ``IF NOT EXISTS`` keeps the change compatible with
+    databases created by the pre-migration ``SQLiteStore`` implementation.
+    Each statement is executed separately so the migration runner can roll the
+    whole schema change back if any statement fails.
+    """
+
+    statements = (
+        """
+        CREATE TABLE IF NOT EXISTS events (
+          event_id        TEXT PRIMARY KEY,
+          idea_id         TEXT NOT NULL,
+          seq             INTEGER NOT NULL,
+          branch_id       TEXT NOT NULL DEFAULT 'main',
+          prev_event_id   TEXT,
+          phase           TEXT,
+          event_type      TEXT NOT NULL,
+          schema_version  INTEGER NOT NULL DEFAULT 1,
+          actor           TEXT NOT NULL,
+          source          TEXT NOT NULL,
+          correlation_id  TEXT,
+          causation_id    TEXT,
+          operation_id    TEXT,
+          attempt_id      INTEGER NOT NULL DEFAULT 0,
+          fingerprint     TEXT,
+          confidence      TEXT NOT NULL DEFAULT 'judgment',
+          side_effect_state TEXT,
+          payload         TEXT NOT NULL DEFAULT '{}',
+          created_at      INTEGER NOT NULL
+        )
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_events_seq
+        ON events(idea_id, seq)
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_events_fp
+        ON events(idea_id, event_type, fingerprint)
+        WHERE fingerprint IS NOT NULL
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_events_branch
+        ON events(idea_id, branch_id, seq)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS writer_lease (
+          writer_id   TEXT PRIMARY KEY,
+          token       TEXT NOT NULL,
+          revision    INTEGER NOT NULL DEFAULT 0,
+          acquired_at INTEGER NOT NULL,
+          expires_at  INTEGER NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS snapshots (
+          idea_id    TEXT NOT NULL,
+          as_of_seq  INTEGER NOT NULL,
+          kind       TEXT NOT NULL DEFAULT 'full',
+          blob       BLOB NOT NULL,
+          created_at INTEGER NOT NULL,
+          PRIMARY KEY (idea_id, as_of_seq, kind)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS task_outbox (
+          outbox_id       TEXT PRIMARY KEY,
+          idempotency_key TEXT NOT NULL UNIQUE,
+          task_type       TEXT NOT NULL,
+          payload         TEXT NOT NULL DEFAULT '{}',
+          status          TEXT NOT NULL DEFAULT 'pending'
+                          CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+          attempt_count   INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+          max_attempts    INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts > 0),
+          available_at    INTEGER NOT NULL,
+          lease_owner     TEXT,
+          lease_token     TEXT,
+          lease_until     INTEGER,
+          last_error      TEXT,
+          event_seq       INTEGER,
+          created_at      INTEGER NOT NULL,
+          updated_at      INTEGER NOT NULL,
+          completed_at    INTEGER
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_task_outbox_claim
+        ON task_outbox(status, available_at, lease_until, created_at)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_task_outbox_event_seq
+        ON task_outbox(event_seq)
+        """,
+    )
+    for index, statement in enumerate(statements):
+        connection.execute(statement)
+        if index == 0:
+            # A few development snapshots predate the versioned ledger schema
+            # and contain a reduced ``events`` table.  Fill only additive
+            # columns so their rows remain readable before creating indexes.
+            for column, definition in (
+                ("branch_id", "TEXT NOT NULL DEFAULT 'main'"),
+                ("prev_event_id", "TEXT"),
+                ("phase", "TEXT"),
+                ("schema_version", "INTEGER NOT NULL DEFAULT 1"),
+                ("correlation_id", "TEXT"),
+                ("causation_id", "TEXT"),
+                ("operation_id", "TEXT"),
+                ("attempt_id", "INTEGER NOT NULL DEFAULT 0"),
+                ("fingerprint", "TEXT"),
+                ("confidence", "TEXT NOT NULL DEFAULT 'judgment'"),
+                ("side_effect_state", "TEXT"),
+            ):
+                _ensure_column(connection, "events", column, definition)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "memory_storage_v1", _create_memory_schema),
+    Migration(2, "ledger_and_task_outbox_v2", _create_ledger_and_outbox_schema),
 )
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version
 

@@ -44,8 +44,10 @@ Agent Loop（通用，LLM + function calling，自主多步 + 防循环护栏 + 
 | **长会话** | `ContextAssembler` 按固定层级构造有界 projection；token 压力触发 append-only `compaction.boundary`，保留完整工具尾部与 manifest | `harness/context_assembler.py` + `compaction.py` + `agent_loop.py` |
 | **记忆** | Memory V2 按 workspace 隔离、检索相关约束并附 provenance；项目约定/决定是约束而非证据，与证据库分开；可选候选提取默认关闭且需审核 | `memory/memstore.py` + `memory/pipeline.py` + `toolkit.py` + `ui.py` |
 | **多工作区** | 每工作区=事件账本的 idea_id；`?ws=` 贯穿；registry 存元数据；V2 memory identity 由 canonical ledger/project root 哈希生成 | `ui.py` |
+| **应用层边界** | 框架无关的 ChatService、请求控制与 TaskQueue 端口已建立；FastAPI 接入留给 Phase 3 集成波次 | `application/` |
+| **状态迁移** | SQLite 显式版本迁移、记忆/候选仓库与 legacy JSON 幂等导入已建立；运行时切换尚未执行 | `storage/migrations.py` + `memory/sqlite_repository.py` |
 | **RAG** | 内容哈希 doc/chunk identity；chunk/page/file 有界；显式 source_role（默认 style-only）；缓存原子写、清理删除文件，索引可复用 | `rag/` |
-| **评测** | 五层 L0–L4 设计；L0/对抗有实现；复现 golden 自建入口 | `eval/` + `eval_golden/README.md` |
+| **评测** | L1–L4 离线产品 scenario、稳定 golden、coverage/构建门禁均已接入 | `eval/` + `eval_golden/README.md` |
 
 ## 3. 代码地图（src/stata_agent/）
 
@@ -60,6 +62,10 @@ harness/recovery.py       reconcile 未决执行链
 harness/telemetry.py      两本账遥测(jsonl)
 harness/branch.py         分支 fork/切片/父链
 harness/research_turn.py  旧 research_turn(已弃用，UI 走 agent_loop)
+application/chat_service.py 框架无关的同步 chat use case + 资源生命周期
+application/request_control.py 线程安全的进程内请求控制
+application/task_queue.py 后台任务队列端口 + 明确提交结果
+application/local_task_queue.py 有界单 worker 本地适配器（非持久化）
 toolkit.py                11 工具 + ToolContext + Tool 契约
 skills/loader.py          Skill 加载/匹配(渐进披露)
 skills/evolve.py          自进化(stage→人工批准→promote 新版本)
@@ -71,6 +77,7 @@ domain/models.py          EvidenceCard/Claim/RunRecord/ResearchState
 domain/reducers.py        fold(事件→投影) + 非法序列拒绝
 domain/family.py          ExperimentFamily(成员/选主结果)
 storage/sqlite_store.py   事件账本 DDL + append/scan/project + writer lease/fence + 快照
+storage/migrations.py     显式、事务化、带历史漂移检测的 SQLite schema migration
 providers/deepseek.py     deepseek(chat/stream_chat) + qwen 兜底
 providers/registry.py     按 env 选 provider + 隐私门
 providers/capabilities.py ModelCapabilityProfile
@@ -98,6 +105,7 @@ writer/docx_out.py        claims/表格 → docx
 writer/draft_multi.py     多表初稿(draft_from_ledger)
 memory/memstore.py        V2 项目记忆(search/select/provenance/consolidate/prune)
 memory/pipeline.py        有界来源的异步候选提取（默认 off，需人工审核）
+memory/sqlite_repository.py SQLite 记忆/候选/workspace 底层仓库 + JSON 幂等导入
 privacy/modes.py          隐私三档 + 边界
 ui.py                     FastAPI 全部端点 + SSE 流式 + 多工作区 + config
 ui/index.html·app.js·styles.css  前端(纯原生，无框架)
@@ -121,15 +129,13 @@ SSE 流式输出 · 多工作区 UI · 有界内容哈希 RAG · 可匹配 Skill
 默认能力或 CI 事实。
 
 **尚未实现或需继续强化**：
-1. **模型代码准确性**：远端模型可能把 reg 命令跑偏，需 skill 细化、verify_result 主动复核或换更强模型。
-2. **Markdown 表格**：前端已有极简 markdown 渲染器（标题/列表/加粗/行内代码/代码块，DOM 构建防 XSS），但 `| a | b |` 表格未支持。
-3. **工具节点**：流式里 tool_started/completed 目前只是文本提示（`▸ … ✓`），未做独立节点卡片。
-4. **会话复用稳定性**：真 Stata 连续跑偶发崩溃（已加失败降级，仍需观察）。
-5. **评测 harness**：L1–L4 未系统化；复现 golden 待建。
-6. **UI 附件/图片输入**、运行中强制 stop、审批“改要求”仍未接；SSE 断开只做尽力取消，不保证中断已开始的外部 Stata 调用。
-7. **自进化 skill**：evolve.py 还在 staging（promote 需人工），且 skill_candidate_md 生成的是旧 variants 格式，需对齐新 Skill 语义。
+1. **Phase 3 运行时接入**：应用层、SQLite memory repository 和 TaskQueue 端口已完成第一波，尚未替换 `ui.py` 的旧编排、`memory.json` 运行时写入与旧 scheduler。
+2. **模型代码准确性**：远端模型可能把 reg 命令跑偏，需 skill 细化、verify_result 主动复核或换更强模型。
+3. **真实环境验收**：真 Stata 长会话、远端模型隐私边界与独立 wheel Windows UI 仍需发布前人工验证。
+4. **附件/图片输入**：尚未建立上传沙箱、格式嗅探、大小限制和恶意文件测试。
+5. **自进化 skill**：evolve.py 还在 staging（promote 需人工），且 skill_candidate_md 生成的是旧 variants 格式，需对齐新 Skill 语义。
 
-**2026-09-09 已修并提交（`7abaf3a`）**：流式渲染（rAF 循环 + 局部更新 + 就地转正，done 无跳变/无灰色/滚动跟随）· markdown 渲染器（标题/列表/加粗/代码块）· system prompt 弱化实证身份（不强行拐研究）· tool_enforcer `../` 路径穿越拦截 · 新增 7 个测试文件（当前 187 过 4 skip）。
+**2026-09-09 当前离线门禁**：307 collected，303 passed / 4 skipped；Ruff、Mypy、L1–L4 产品评测、76% branch coverage 与 wheel build 均通过。
 
 ## 6. 给 codex 的接手清单
 

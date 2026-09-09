@@ -6,11 +6,20 @@
 
 ## 当前基线
 
-- `main` 工作树干净，离线测试基线为 191 passed / 4 skipped（195 collected；live Stata/远端模型默认跳过）。
+- `main` 工作树干净，离线测试基线为 303 passed / 4 skipped（307 collected；live Stata/远端模型默认跳过）。
 - 事件账本、工具策略、隐私模式、证据链、SSE、多工作区、RAG、Skill 与 wheel 打包已有实现。
 - 上下文 V2 的 provider 摘要与记忆候选提取已接入：摘要默认 deterministic，记忆提取默认 off；
   显式开启后复用当前 provider，候选经工作区隔离审核 API 才会激活。
 - 当前主要风险集中在运行取消与资源生命周期、真实环境稳定性、交互状态表达，以及可重复的产品级评测/发布门禁。
+- Phase 3 第一波已建立 framework-neutral application 层、SQLite migration/memory repository 与可替换 TaskQueue 端口；当前仍是兼容增量，`ui.py` 与 `memory.json` 尚未切换。
+
+## Phase 3：应用边界与本地状态统一（进行中）
+
+- 已完成：ChatService、RequestControlRegistry、TaskQueue/LocalTaskQueue。
+- 已完成：事务化 schema migration、memory/candidate/workspace 表、候选原子审核、legacy JSON 幂等导入。
+- 下一波：从 `ui.py` 接入应用服务；将运行时记忆与 workspace registry 切到 SQLite；以 TaskQueue 端口替换旧 scheduler。
+- 完成定义：运行期不再写 `memory.json`，跨存储半成功路径消失，旧 JSON 可显式恢复，完整发布门禁与 belief-map 约束通过。
+- 详细契约：`design/PHASE3_APPLICATION_STORAGE.md`。
 
 ## P0：首轮产品化（当前执行）
 

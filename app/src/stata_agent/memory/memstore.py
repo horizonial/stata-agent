@@ -71,7 +71,7 @@ SCHEMA_VERSION = 2
 _SECRET_PATTERNS = (
     re.compile(
         r"(?:api[_ -]?key|secret(?:[_ -]?key)?|password|passwd|passphrase|"
-        r"access[_ -]?token|auth(?:orization)?|bearer|private[_ -]?key)"
+        r"access[_ -]?token|token|auth(?:orization)?|bearer|private[_ -]?key)"
         r"\s*[:=：＝]\s*\S+",
         re.IGNORECASE,
     ),
@@ -87,7 +87,8 @@ _SECRET_PATTERNS = (
 _LIVE_METRIC_PATTERNS = (
     re.compile(
         r"(?:\bp\b\s*[-_ ]?(?:value|值)?|p值|样本量|sample\s*(?:size|n)|\bn\b|"
-        r"r(?:2|²)|系数|coefficient|显著性|统计量|置信区间|confidence\s+interval)"
+        r"r(?:2|²)|系数|coefficient|coef|beta|estimate|std\.?\s*err(?:or)?|"
+        r"\bse\b|\bt\b|\bz\b|显著性|统计量|置信区间|confidence\s+interval)"
         r"\s*(?:is|为|=|:|：|＝)?\s*[-+]?\d+(?:\.\d+)?%?",
         re.IGNORECASE,
     ),
@@ -103,6 +104,11 @@ _EVIDENCE_PATTERNS = (
         r"(?:claim|evidence|evidence[-_ ]?card|run[-_ ]?id|证据|证据卡|"
         r"回归结果|结果表|数据显示|研究发现|数据表)"
         r"[^。.!?；;]{0,100}(?:=|是|为|显示|证明|支持|显著|significant|effect)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:result|results|finding|findings)\b"
+        r"[^.!?；;]{0,100}\b(?:show|shows|suggest|suggests|prove|proves|significant)\b",
         re.IGNORECASE,
     ),
     re.compile(r"\b(?:claim|evidence|card|run)[-_ ]?[A-Za-z0-9]+\b", re.IGNORECASE),
@@ -446,6 +452,18 @@ class MemoryStore:
                 raise MemoryCandidateRejected("evidence assertions belong in the ledger, not memory")
         return normalized
 
+    @staticmethod
+    def validate_text(text: str) -> str:
+        """Validate and normalize text before a caller sends it to a provider.
+
+        The write path has always used :meth:`_validate_text`; this small
+        public facade lets bounded intake pipelines apply the exact same
+        secret/live-metric/evidence guard before any model I/O.  It is an
+        alias rather than a second validator so the two paths cannot drift.
+        """
+
+        return MemoryStore._validate_text(text)
+
     def _make_record(
         self,
         text: str,
@@ -684,11 +702,18 @@ class MemoryStore:
         *,
         source_ids: Sequence[str] | str | None = None,
         provenance: Any = None,
+        workspace_id: str | Path | None = None,
+        workspace: str | Path | None = None,
         now: int | None = None,
     ) -> dict[str, Any] | None:
         candidate = self._find(candidate_id, include_candidates=True)
         if candidate is None or candidate.get("status") != STATUS_CANDIDATE:
             return None
+        selected_workspace = workspace_id if workspace_id is not None else workspace
+        if selected_workspace is not None:
+            normalized_workspace = _normalise_workspace(selected_workspace, self._workspace_id)
+            if candidate.get("workspace_id") != normalized_workspace:
+                return None
         merged_sources = _source_ids(candidate.get("source_ids"), provenance)
         merged_sources = _source_ids(merged_sources, source_ids)
         self._candidates = [entry for entry in self._candidates if entry.get("id") != candidate_id]
@@ -706,7 +731,21 @@ class MemoryStore:
         )
         return result
 
-    def reject_candidate(self, candidate_id: str) -> bool:
+    def reject_candidate(
+        self,
+        candidate_id: str,
+        *,
+        workspace_id: str | Path | None = None,
+        workspace: str | Path | None = None,
+    ) -> bool:
+        candidate = self._find(candidate_id, include_candidates=True)
+        if candidate is None or candidate.get("status") != STATUS_CANDIDATE:
+            return False
+        selected_workspace = workspace_id if workspace_id is not None else workspace
+        if selected_workspace is not None:
+            normalized_workspace = _normalise_workspace(selected_workspace, self._workspace_id)
+            if candidate.get("workspace_id") != normalized_workspace:
+                return False
         before = len(self._candidates)
         self._candidates = [entry for entry in self._candidates if entry.get("id") != candidate_id]
         if len(self._candidates) == before:
@@ -842,8 +881,52 @@ class MemoryStore:
             records = [entry for entry in self._entries if entry.get("workspace_id") == normalized]
         output = [_copy_record(entry) for entry in records]
         if include_candidates:
-            output.extend(_copy_record(entry) for entry in self._candidates)
+            candidates = self._candidates
+            if selected_workspace is not None:
+                candidates = [entry for entry in candidates if entry.get("workspace_id") == normalized]
+            output.extend(_copy_record(entry) for entry in candidates)
         return output
+
+    def candidates(
+        self,
+        *,
+        workspace_id: str | Path | None = None,
+        workspace: str | Path | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return pending candidates, isolated to the requested workspace.
+
+        Candidate records are deliberately not returned by ``search`` or
+        ``select_for_context``.  This helper gives review surfaces a small,
+        read-only projection without making ``all(include_candidates=True)``
+        accidentally cross a project boundary.
+        """
+
+        selected_workspace = workspace_id if workspace_id is not None else workspace
+        if selected_workspace is None:
+            records = self._candidates
+        else:
+            normalized = _normalise_workspace(selected_workspace, self._workspace_id)
+            records = [entry for entry in self._candidates if entry.get("workspace_id") == normalized]
+        return [_copy_record(entry) for entry in records if entry.get("status") == STATUS_CANDIDATE]
+
+    def candidate(
+        self,
+        candidate_id: str,
+        *,
+        workspace_id: str | Path | None = None,
+        workspace: str | Path | None = None,
+    ) -> dict[str, Any] | None:
+        """Read one pending candidate, returning ``None`` across workspaces."""
+
+        record = self._find(candidate_id, include_candidates=True)
+        if record is None or record.get("status") != STATUS_CANDIDATE:
+            return None
+        selected_workspace = workspace_id if workspace_id is not None else workspace
+        if selected_workspace is not None:
+            normalized = _normalise_workspace(selected_workspace, self._workspace_id)
+            if record.get("workspace_id") != normalized:
+                return None
+        return _copy_record(record)
 
     def _visible(
         self,

@@ -49,6 +49,17 @@ EVENT_FALLBACK = "provider.fallback"
 EVENT_RESTORED = "system.restored"
 EVENT_ARTIFACT = "artifact.stored"
 EVENT_FILES_DEL = "files.delete_request"
+# Optional model-assisted memory intake.  These events are audit metadata only:
+# they never participate in the research reducer and never carry model output.
+EVENT_MEMORY_EXTRACTION_REQUESTED = "memory.extraction.requested"
+EVENT_MEMORY_EXTRACTION_COMPLETED = "memory.extraction.completed"
+EVENT_MEMORY_EXTRACTION_NOOP = "memory.extraction.noop"
+EVENT_MEMORY_EXTRACTION_FAILED = "memory.extraction.failed"
+EVENT_MEMORY_EXTRACTION_DENIED = "memory.extraction.denied"
+# Short aliases mirror the existing ``*_REQ``/``*_DONE`` naming used by
+# callers while the full names remain the canonical public constants.
+EVENT_MEMORY_EXTRACTION_REQ = EVENT_MEMORY_EXTRACTION_REQUESTED
+EVENT_MEMORY_EXTRACTION_DONE = EVENT_MEMORY_EXTRACTION_COMPLETED
 
 # 执行链：run.requested → tool.call → tool.result → run.{succeeded,failed,uncertain}
 CHAIN_START = frozenset({EVENT_RUN_REQ, EVENT_TOOL_CALL})
@@ -78,7 +89,17 @@ SIGNING_SOURCES = frozenset({*CARD_SIGNING_SOURCES, *CLAIM_SIGNING_SOURCES})
 SIGNING_KINDS = frozenset({EVENT_CARD_SIGNED, EVENT_CLAIM_SIGNED, EVENT_CLAIM_RETRACT})
 
 # 需要 fingerprint（幂等）的事件（DD-01 §3.3）：工具执行
-FINGERPRINT_KINDS = frozenset({EVENT_TOOL_CALL, EVENT_RUN_REQ})
+FINGERPRINT_KINDS = frozenset(
+    {
+        EVENT_TOOL_CALL,
+        EVENT_RUN_REQ,
+        EVENT_MEMORY_EXTRACTION_REQUESTED,
+        EVENT_MEMORY_EXTRACTION_COMPLETED,
+        EVENT_MEMORY_EXTRACTION_NOOP,
+        EVENT_MEMORY_EXTRACTION_FAILED,
+        EVENT_MEMORY_EXTRACTION_DENIED,
+    }
+)
 
 
 class Event(BaseModel):

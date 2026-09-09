@@ -20,18 +20,36 @@ from ..events.schema import (
     EVENT_APPROVAL_REJECT,
     EVENT_APPROVAL_REQ,
     EVENT_COMPACTION,
+    EVENT_IDEA,
     EVENT_RUN_FAILED,
     EVENT_RUN_REQ,
     EVENT_RUN_SUCCEEDED,
     EVENT_RUN_UNCERTAIN,
     EVENT_SPEC_FREEZE,
+    EVENT_STEERING,
     EVENT_TOOL_CALL,
     EVENT_TOOL_DONE,
     EVENT_TOOL_INVOKED,
     EVENT_TOOL_RESULT,
+    EVENT_USER,
     Event,
 )
 from ..storage.sqlite_store import SQLiteStore
+from .summary_service import (
+    SUMMARY_MODES,
+    SUMMARY_PROMPT_VERSION,
+    MAX_SOURCE_CHARS,
+    MAX_SOURCE_ITEMS,
+    MAX_SOURCE_TEXT_CHARS,
+    CompactionSummaryProvider,
+    CompactionSummaryRequest,
+    SummarySource,
+    SummaryValidationError,
+    provenance_for_summary,
+    source_digest,
+    validate_model_summary,
+    validate_summary_source,
+)
 
 
 COMPACTION_VERSION = 2
@@ -128,7 +146,7 @@ def _normalise_v2(payload: dict[str, Any]) -> dict[str, Any]:
     retained = _as_int(retained, "retained_from_seq")
     if retained < from_seq or retained > to_seq + 1:
         raise CompactionValidationError("V2 retained_from_seq 必须落在 [from_seq, to_seq + 1]")
-    return {
+    normalized = {
         "version": COMPACTION_VERSION,
         "from_seq": from_seq,
         "to_seq": to_seq,
@@ -137,6 +155,42 @@ def _normalise_v2(payload: dict[str, Any]) -> dict[str, Any]:
         "retained_from_seq": retained,
         "reason": str(payload.get("reason") or "token_pressure"),
     }
+    # Optional model-summary metadata is deliberately a small allow-list.  It
+    # makes the source provenance/audit mode readable on replay while ensuring
+    # that the boundary normalizer never persists a prompt or provider body.
+    mode = payload.get("summary_mode")
+    if mode is not None:
+        if not isinstance(mode, str) or mode not in SUMMARY_MODES:
+            raise CompactionValidationError("summary_mode 无效")
+        normalized["summary_mode"] = mode
+    for key in ("provider", "provider_name", "prompt_version", "source_digest", "summary_error_code"):
+        value = payload.get(key)
+        if value is not None:
+            if not isinstance(value, str) or not value.strip() or len(value) > 256:
+                raise CompactionValidationError(f"{key} 无效")
+            normalized[key] = value
+    provenance = payload.get("summary_provenance")
+    if provenance is not None:
+        if not isinstance(provenance, dict) or set(provenance) - {
+            "objective", "constraints", "decisions", "open_items"
+        }:
+            raise CompactionValidationError("summary_provenance 无效")
+        clean_provenance: dict[str, list[str]] = {}
+        for field, refs in provenance.items():
+            if not isinstance(refs, list) or not all(
+                isinstance(ref, str) and ref.strip() and len(ref) <= 160 for ref in refs
+            ):
+                raise CompactionValidationError("summary_provenance source ids 无效")
+            clean_provenance[field] = list(dict.fromkeys(refs))
+        normalized["summary_provenance"] = clean_provenance
+    source_ids = payload.get("summary_source_ids")
+    if source_ids is not None:
+        if not isinstance(source_ids, list) or not all(
+            isinstance(ref, str) and ref.strip() and len(ref) <= 160 for ref in source_ids
+        ):
+            raise CompactionValidationError("summary_source_ids 无效")
+        normalized["summary_source_ids"] = list(dict.fromkeys(source_ids))
+    return normalized
 
 
 def normalize_boundary_payload(payload: Any) -> dict[str, Any]:
@@ -162,6 +216,8 @@ def _known_ids(events: Iterable[Event], proj: Projection | None = None) -> set[s
     for event in events:
         if event.event_id:
             known.add(str(event.event_id))
+        if _seq(event) > 0:
+            known.add(f"seq:{_seq(event)}")
         payload = event.payload if isinstance(event.payload, dict) else {}
         stack: list[Any] = [payload]
         while stack:
@@ -212,6 +268,19 @@ def validate_boundary(
             unknown = sorted(set(payload["summary"]["evidence_refs"]) - known)
             if unknown:
                 raise CompactionValidationError(f"summary 引用了不存在的 evidence id: {unknown}")
+            provenance = payload.get("summary_provenance")
+            if isinstance(provenance, dict):
+                source_refs = {
+                    str(ref)
+                    for refs in provenance.values()
+                    if isinstance(refs, list)
+                    for ref in refs
+                }
+                unknown_sources = sorted(source_refs - known)
+                if unknown_sources:
+                    raise CompactionValidationError(
+                        f"summary 引用了不存在的 source id: {unknown_sources}"
+                    )
         safe_end = _safe_cut(event_list, payload["to_seq"], lower=payload["from_seq"])
         if safe_end != payload["to_seq"]:
             raise CompactionValidationError("boundary to_seq 切分了未闭合的 semantic unit")
@@ -526,6 +595,110 @@ def _projection_at(events: list[Event], idea: str, seq: int) -> Projection:
     return fold(selected, idea_id=idea)
 
 
+def _summary_event_text(event: Event) -> str:
+    """Extract one small narrative field without forwarding raw payloads."""
+
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    keys: tuple[str, ...]
+    if event.event_type == EVENT_IDEA:
+        keys = ("question", "objective", "research_question")
+    elif event.event_type in {EVENT_USER, EVENT_STEERING}:
+        keys = ("text", "message", "content", "question")
+    elif event.event_type in {EVENT_APPROVAL_GRANT, EVENT_APPROVAL_REJECT}:
+        keys = ("note", "decision", "reason")
+    elif event.event_type == EVENT_APPROVAL_REQ:
+        keys = ("question", "action", "request_id")
+    elif event.event_type == EVENT_AGENT_STEP:
+        keys = ("decision_summary", "ask", "reply", "summary")
+    elif event.event_type == EVENT_SPEC_FREEZE:
+        keys = ("reason", "spec_id")
+    else:
+        return ""
+    return _first_text(payload, keys)[:MAX_SOURCE_TEXT_CHARS]
+
+
+def _summary_event_role(event: Event) -> str | None:
+    if event.event_type in {EVENT_IDEA, EVENT_USER, EVENT_STEERING}:
+        return "user_message"
+    if event.event_type == EVENT_APPROVAL_GRANT:
+        return "approved_decision"
+    if event.event_type == EVENT_APPROVAL_REJECT:
+        return "rejection_note"
+    if event.event_type in {EVENT_APPROVAL_REQ, EVENT_AGENT_STEP}:
+        return "assistant_message"
+    if event.event_type == EVENT_SPEC_FREEZE:
+        return "decision"
+    return None
+
+
+def _summary_sources(events: list[Event]) -> tuple[SummarySource, ...]:
+    """Build a bounded source set from narrative events only.
+
+    Tool/evidence events are intentionally absent.  We retain the first
+    objective source plus the newest narrative sources when the delta is
+    larger than the provider input budget.
+    """
+
+    candidates: list[SummarySource] = []
+    for event in events:
+        role = _summary_event_role(event)
+        if role is None:
+            continue
+        text = _summary_event_text(event)
+        if not text:
+            continue
+        seq = _seq(event)
+        if seq <= 0:
+            continue
+        candidates.append(SummarySource(source_id=f"seq:{seq}", role=role, text=text))
+    if len(candidates) > MAX_SOURCE_ITEMS:
+        candidates = [candidates[0], *candidates[-(MAX_SOURCE_ITEMS - 1):]]
+    bounded: list[SummarySource] = []
+    remaining = MAX_SOURCE_CHARS
+    for source in candidates:
+        if remaining <= 0:
+            break
+        text = source.text[: min(MAX_SOURCE_TEXT_CHARS, remaining)]
+        if not text:
+            continue
+        bounded.append(SummarySource(source_id=source.source_id, role=source.role, text=text))
+        remaining -= len(text)
+    return tuple(bounded)
+
+
+def _summary_provider_name(summarizer: object) -> str:
+    value = getattr(summarizer, "provider_name", None) or getattr(summarizer, "provider", None)
+    if value is None:
+        value = summarizer.__class__.__name__
+    return str(value).strip() or "unknown"
+
+
+def _model_summary_payload(
+    deterministic: dict[str, Any],
+    candidate: dict[str, object],
+) -> dict[str, Any]:
+    """Drop provenance wrappers while preserving the canonical V2 shape."""
+
+    def text_of(value: object) -> str:
+        return str(value.get("text", "")).strip() if isinstance(value, dict) else ""
+
+    def texts_of(value: object) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [text_of(item) for item in value if text_of(item)]
+
+    # The candidate owns narrative wording.  The state/evidence fields are
+    # copied only from the deterministic computation and never model output.
+    return {
+        "objective": text_of(candidate.get("objective")) or str(deterministic.get("objective") or ""),
+        "constraints": texts_of(candidate.get("constraints")),
+        "decisions": texts_of(candidate.get("decisions")),
+        "open_items": texts_of(candidate.get("open_items")),
+        "research_state": str(deterministic.get("research_state") or ""),
+        "evidence_refs": [str(ref) for ref in deterministic.get("evidence_refs", [])],
+    }
+
+
 def compact(
     store: SQLiteStore,
     idea: str,
@@ -534,6 +707,7 @@ def compact(
     phase_scope: str | None = None,
     retained_from_seq: int | None = None,
     upto_seq: int | None = None,
+    summarizer: CompactionSummaryProvider | None = None,
 ) -> dict[str, Any]:
     """Append one V2 boundary after the latest valid boundary.
 
@@ -584,6 +758,48 @@ def compact(
         delta_events,
         previous=previous_summary if isinstance(previous_summary, dict) else None,
     )
+    summary_metadata: dict[str, Any] = {}
+    model_provenance: dict[str, list[str]] | None = None
+    if summarizer is not None:
+        # Constructing the request is deterministic and bounded.  Sources are
+        # checked before invoking a custom provider too; adapters cannot be
+        # bypassed into receiving a secret, metric, evidence, or tool result.
+        sources = _summary_sources(delta_events)
+        request = CompactionSummaryRequest(
+            idea_id=idea,
+            from_seq=source_start,
+            to_seq=to_seq,
+            previous_summary=previous_summary if isinstance(previous_summary, dict) else {},
+            deterministic_summary=summary,
+            sources=sources,
+        )
+        summary_metadata = {
+            "summary_mode": "model_fallback",
+            "provider": _summary_provider_name(summarizer),
+            "provider_name": _summary_provider_name(summarizer),
+            "prompt_version": str(getattr(summarizer, "prompt_version", SUMMARY_PROMPT_VERSION)),
+            "source_digest": source_digest(request),
+        }
+        try:
+            if not sources:
+                raise SummaryValidationError("没有可用的叙事 source")
+            for source in sources:
+                validate_summary_source(source)
+            # Exactly one attempt.  Any provider exception is converted to a
+            # deterministic fallback below; no summary retry is hidden here.
+            model_candidate = validate_model_summary(request, summarizer.summarize(request))
+            summary = _model_summary_payload(summary, model_candidate)
+            model_provenance = provenance_for_summary(model_candidate)
+            summary_metadata["summary_mode"] = "model_validated"
+        except SummaryValidationError:
+            summary_metadata["summary_error_code"] = "validation_failed"
+        except Exception:
+            summary_metadata["summary_error_code"] = "provider_failure"
+        if model_provenance:
+            summary_metadata["summary_provenance"] = model_provenance
+            summary_metadata["summary_source_ids"] = list(dict.fromkeys(
+                source_id for refs in model_provenance.values() for source_id in refs
+            ))
     payload: dict[str, Any] = {
         "version": COMPACTION_VERSION,
         "from_seq": source_start,
@@ -593,9 +809,10 @@ def compact(
         "retained_from_seq": retained,
         "reason": str(reason or "token_pressure"),
     }
+    payload.update(summary_metadata)
     if phase_scope is not None:
         payload["phase_scope"] = str(phase_scope)
-    candidate = Event(
+    candidate_event = Event(
         idea_id=idea,
         event_type=EVENT_COMPACTION,
         actor=ACTOR_ORCH,
@@ -604,7 +821,7 @@ def compact(
         payload=payload,
     )
     normalize_boundary_payload(payload)
-    seq = store.append(candidate)
+    seq = store.append(candidate_event)
     stored_events = list(store.scan(idea))
     stored = next((event for event in reversed(stored_events) if event.event_type == EVENT_COMPACTION), None)
     if stored is not None:

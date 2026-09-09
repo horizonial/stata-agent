@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,13 @@ from pydantic import BaseModel
 from .application.local_task_queue import LocalTaskQueue
 from .application.request_control import RequestControlNotFound, RequestControlRegistry
 from .application.task_queue import TaskQueue, TaskSubmitResult
+from .application.workspace_service import (
+    CreateWorkspaceRequest,
+    WorkspaceConflictError,
+    WorkspaceNotFoundError,
+    WorkspaceService,
+    WorkspaceValidationError,
+)
 from .domain.action import Act, ActionProposal
 from .events.schema import (
     ACTOR_ORCH,
@@ -86,6 +93,7 @@ _RAG_CACHE_LOCK = threading.RLock()
 _SKILL_ERRORS: list[str] = []
 _MEMORY_MIGRATION_LOCK = threading.RLock()
 _MIGRATED_MEMORY_DATABASES: set[str] = set()
+_MIGRATED_WORKSPACE_DATABASES: set[str] = set()
 
 # Active stream controls are deliberately process-local.  The event ledger is
 # the durable source of research state; this small registry only lets a user
@@ -312,12 +320,11 @@ def _demo_enabled() -> bool:
 
 
 def _workspace_registry_path() -> Path:
-    """Return the transparent local workspace registry path.
+    """Return the read-only legacy workspace registry source.
 
-    Keeping the registry next to the ledger makes a copied local workspace
-    self-contained and lets tests redirect it together with ``DEFAULT_DB``.
-    ``STATA_AGENT_WORKSPACES`` is an escape hatch for operators who keep the
-    ledger and UI metadata in separate local directories.
+    SQLite is the runtime registry. ``STATA_AGENT_WORKSPACES`` remains an
+    import escape hatch so existing installations can migrate without moving
+    their old JSON file first.
     """
 
     configured = os.environ.get("STATA_AGENT_WORKSPACES", "").strip()
@@ -325,10 +332,18 @@ def _workspace_registry_path() -> Path:
 
 
 def _validate_workspace_id(value: str | None) -> str:
-    raw = str(value or _IDEA).strip()
-    if not _WORKSPACE_ID_RE.fullmatch(raw):
-        raise HTTPException(status_code=422, detail="工作区标识只允许字母、数字、下划线和连字符。")
-    return raw
+    try:
+        return WorkspaceService.validate_id(value, default=_IDEA)
+    except WorkspaceValidationError as error:
+        raise HTTPException(
+            status_code=422,
+            detail="工作区标识只允许字母、数字、下划线和连字符。",
+        ) from error
+
+
+def _workspace_root_base() -> Path:
+    configured = os.environ.get("STATA_AGENT_PROJECT_ROOT", "").strip()
+    return Path(configured).expanduser() if configured else Path(DEFAULT_DB).resolve().parent
 
 
 def _canonical_workspace_root(idea: str = _IDEA) -> Path:
@@ -341,9 +356,7 @@ def _canonical_workspace_root(idea: str = _IDEA) -> Path:
     """
 
     validated = _validate_workspace_id(idea)
-    configured = os.environ.get("STATA_AGENT_PROJECT_ROOT", "").strip()
-    base = Path(configured).expanduser() if configured else Path(DEFAULT_DB).resolve().parent
-    return (base / validated).resolve()
+    return (_workspace_root_base() / validated).resolve()
 
 
 def _workspace_id(idea: str = _IDEA) -> str:
@@ -359,16 +372,32 @@ def _workspace_id(idea: str = _IDEA) -> str:
 _memory_workspace_id = _workspace_id
 
 
-def _read_workspace_registry() -> list[dict[str, Any]]:
-    """Read the small local registry, creating the compatibility ``ui`` row."""
+@contextmanager
+def _open_workspace_service():
+    """Own one short-lived SQLite repository behind the application service."""
 
-    path = _workspace_registry_path()
+    from .memory.sqlite_repository import SQLiteMemoryRepository
+
+    DEFAULT_DB.parent.mkdir(parents=True, exist_ok=True)
+    repository = SQLiteMemoryRepository(DEFAULT_DB)
+    try:
+        yield WorkspaceService(repository, root_base=_workspace_root_base())
+    finally:
+        repository.close()
+
+
+def _migrate_legacy_workspaces_once(service: WorkspaceService) -> None:
+    """Import valid legacy JSON rows without modifying the source file."""
+
+    source = _workspace_registry_path()
+    database_key = str(DEFAULT_DB.expanduser().resolve(strict=False)).casefold()
     with _WORKSPACE_REGISTRY_LOCK:
+        if database_key in _MIGRATED_WORKSPACE_DATABASES:
+            return
         try:
-            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+            data = json.loads(source.read_text(encoding="utf-8")) if source.is_file() else []
         except (OSError, ValueError, TypeError):
             data = []
-        rows: list[dict[str, Any]] = []
         if isinstance(data, list):
             for item in data:
                 if not isinstance(item, dict):
@@ -376,33 +405,28 @@ def _read_workspace_registry() -> list[dict[str, Any]]:
                 ident = str(item.get("id") or "").strip()
                 if not _WORKSPACE_ID_RE.fullmatch(ident):
                     continue
-                rows.append({
-                    "id": ident,
-                    "workspace_id": _workspace_id(ident),
-                    "name": str(item.get("name") or ident)[:120],
-                    "created_at": int(item.get("created_at") or 0),
-                })
-        if not any(row["id"] == _IDEA for row in rows):
-            rows.insert(0, {"id": _IDEA, "name": "未命名研究", "created_at": int(time.time() * 1000)})
-            _write_workspace_registry(rows)
-        return rows
+                try:
+                    service.create(CreateWorkspaceRequest(
+                        id=ident,
+                        name=str(item.get("name") or ident)[:120],
+                        root=service.canonical_root(workspace_id=ident),
+                        now=int(item.get("created_at") or 0),
+                    ))
+                except (WorkspaceConflictError, WorkspaceValidationError, TypeError, ValueError):
+                    continue
+        _MIGRATED_WORKSPACE_DATABASES.add(database_key)
 
 
-def _write_workspace_registry(rows: list[dict[str, Any]]) -> None:
-    """Atomically persist workspace metadata without touching the event ledger."""
+def _read_workspace_registry() -> list[dict[str, Any]]:
+    """Read the SQLite registry, lazily importing legacy JSON once."""
 
-    path = _workspace_registry_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        tmp.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
-    finally:
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+    # Repository construction sets SQLite pragmas and applies migrations.  A
+    # short adapter lock prevents concurrent first-open calls from racing on
+    # those database-level setup statements; row mutations remain transactional.
+    with _WORKSPACE_REGISTRY_LOCK:
+        with _open_workspace_service() as service:
+            _migrate_legacy_workspaces_once(service)
+            return [record.as_dict() for record in service.list()]
 
 
 def _workspace_known(idea: str) -> bool:
@@ -414,11 +438,6 @@ def _resolve_workspace(ws: str | None) -> str:
     if not _workspace_known(idea):
         raise HTTPException(status_code=404, detail="工作区不存在，请先新建或从列表选择。")
     return idea
-
-
-def _workspace_slug(name: str) -> str:
-    base = re.sub(r"[^A-Za-z0-9_-]+", "-", name.lower()).strip("-_")[:48]
-    return base or f"workspace-{uuid.uuid4().hex[:8]}"
 
 
 def _workspace_entries(store: SQLiteStore) -> list[dict[str, Any]]:
@@ -451,15 +470,12 @@ def _workspace_entries(store: SQLiteStore) -> list[dict[str, Any]]:
 def _touch_workspace_name(idea: str, text: str) -> None:
     """Persist a useful display name after the first idea is declared."""
 
-    clean = " ".join(str(text or "").split())[:120]
-    if not clean:
-        return
     with _WORKSPACE_REGISTRY_LOCK:
-        rows = _read_workspace_registry()
-        for row in rows:
-            if row["id"] == idea and (not row.get("name") or row.get("name") == "未命名研究"):
-                row["name"] = clean
-                _write_workspace_registry(rows)
+        with _open_workspace_service() as service:
+            _migrate_legacy_workspaces_once(service)
+            try:
+                service.touch_name(idea, text)
+            except (WorkspaceNotFoundError, WorkspaceValidationError):
                 return
 
 
@@ -1356,41 +1372,24 @@ def workspaces():
 
 @app.post("/api/workspaces")
 def create_workspace(body: WorkspaceIn):
-    """Create a workspace in the transparent local registry.
+    """Create a workspace through the SQLite-backed application service.
 
     The registry is metadata only. Research state still enters the event
     ledger through ``/api/chat`` and runner/approval routes.
     """
 
-    name = " ".join(str(body.name or "").split())
-    if not name:
-        raise HTTPException(status_code=422, detail="工作区名称不能为空。")
-    if len(name) > 120:
-        raise HTTPException(status_code=422, detail="工作区名称不能超过 120 个字符。")
-    requested_id = body.id.strip() if isinstance(body.id, str) else ""
-    if requested_id:
-        idea = _validate_workspace_id(requested_id)
-    else:
-        idea = _workspace_slug(name)
-    with _WORKSPACE_REGISTRY_LOCK:
-        rows = _read_workspace_registry()
-        used = {row["id"] for row in rows}
-        if idea in used:
-            if requested_id:
-                raise HTTPException(status_code=409, detail="该工作区标识已经存在。")
-            stem = idea[:52]
-            suffix = 2
-            while f"{stem}-{suffix}" in used:
-                suffix += 1
-            idea = f"{stem}-{suffix}"
-        row = {
-            "id": idea,
-            "workspace_id": _workspace_id(idea),
-            "name": name,
-            "created_at": int(time.time() * 1000),
-        }
-        rows.append(row)
-        _write_workspace_registry(rows)
+    try:
+        with _WORKSPACE_REGISTRY_LOCK:
+            with _open_workspace_service() as service:
+                _migrate_legacy_workspaces_once(service)
+                record = service.create(CreateWorkspaceRequest(name=body.name, id=body.id))
+                row = record.as_dict()
+                rows = [item.as_dict() for item in service.list()]
+    except WorkspaceValidationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except WorkspaceConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    idea = row["id"]
     return {"workspace": {**row, "events": 0, "last_seq": None, "run_status": "idle", "pending_approvals": 0},
             "items": rows,
             "active": idea}

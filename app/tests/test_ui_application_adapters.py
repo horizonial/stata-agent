@@ -14,6 +14,7 @@ from stata_agent.events.schema import (
     EVENT_MEMORY_EXTRACTION_REQUESTED,
 )
 from stata_agent.memory.memstore import MemoryStore
+from stata_agent.memory.sqlite_repository import SQLiteMemoryRepository
 from stata_agent.storage.sqlite_store import SQLiteStore
 
 
@@ -137,6 +138,28 @@ def test_ui_imports_legacy_memory_once_then_writes_only_sqlite(tmp_path, monkeyp
     assert {item["text"] for item in records} == {"默认使用中文", "输出先给结论"}
     assert len(records) == 2
     assert source.read_bytes() == original_source
+
+
+def test_ui_imports_legacy_workspaces_then_stops_json_writes(tmp_path, monkeypatch):
+    source = tmp_path / "workspaces.json"
+    source.write_text(
+        json.dumps([{"id": "legacy", "name": "旧研究", "created_at": 1234}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    original_source = source.read_bytes()
+    client = _client(tmp_path, monkeypatch)
+
+    listed = client.get("/api/workspaces")
+    assert listed.status_code == 200
+    assert {item["id"] for item in listed.json()["items"]} == {"ui", "legacy"}
+
+    created = client.post("/api/workspaces", json={"id": "sqlite-only", "name": "新研究"})
+    assert created.status_code == 200
+    assert source.read_bytes() == original_source
+
+    with SQLiteMemoryRepository(ui.DEFAULT_DB) as repository:
+        ids = {str(item["metadata"]["id"]) for item in repository.list_workspaces()}
+    assert ids == {"ui", "legacy", "sqlite-only"}
 
 
 def test_durable_memory_request_survives_queue_full_and_resume(tmp_path, monkeypatch):

@@ -131,13 +131,13 @@ SSE 流式输出 · 多工作区 UI · 有界内容哈希 RAG · 可匹配 Skill
 默认能力或 CI 事实。
 
 **尚未实现或需继续强化**：
-1. **Phase 3 运行时接入**：ChatService、RequestControl、TaskQueue、SQLite Memory 和 WorkspaceService 均已接入 UI；旧 `memory.json` / `workspaces.json` 仅作为只读、幂等迁移源。下一步是 durable outbox、服务启动/关闭生命周期与真实 Windows 长会话验收。
+1. **Phase 3 运行时接入**：ChatService、RequestControl、TaskQueue、SQLite Memory 和 WorkspaceService 均已接入 UI；FastAPI 生命周期会恢复未完成的记忆提取并有界关闭队列；旧 JSON 仅作为只读、幂等迁移源。下一步是 durable outbox 与真实 Windows 长会话验收。
 2. **模型代码准确性**：远端模型可能把 reg 命令跑偏，需 skill 细化、verify_result 主动复核或换更强模型。
 3. **真实环境验收**：真 Stata 长会话、远端模型隐私边界与独立 wheel Windows UI 仍需发布前人工验证。
 4. **附件/图片输入**：尚未建立上传沙箱、格式嗅探、大小限制和恶意文件测试。
 5. **自进化 skill**：evolve.py 还在 staging（promote 需人工），且 skill_candidate_md 生成的是旧 variants 格式，需对齐新 Skill 语义。
 
-**2026-09-09 当前离线门禁**：326 collected，322 passed / 4 skipped；Ruff、Mypy、L1–L4 产品评测、77% branch coverage 与 wheel build 均通过。
+**2026-09-09 当前离线门禁**：327 collected，323 passed / 4 skipped；Ruff、Mypy、L1–L4 产品评测、77% branch coverage 与 wheel build 均通过。
 
 ## 6. 给 codex 的接手清单
 

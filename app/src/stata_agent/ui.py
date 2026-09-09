@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from contextlib import contextmanager, nullcontext
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -106,7 +106,23 @@ _REQUEST_CONTROL_TTL = 3600
 _REQUEST_CONTROL_REGISTRY = RequestControlRegistry(ttl_seconds=_REQUEST_CONTROL_TTL)
 _MEMORY_EXTRACTION_SCHEDULER: TaskQueue = LocalTaskQueue(max_pending=4, shutdown_timeout=1.0)
 
-app = FastAPI(title="stata-agent · research UI")
+
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    """Start local background work, recover durable intent, then stop boundedly."""
+
+    _MEMORY_EXTRACTION_SCHEDULER.start()
+    try:
+        try:
+            resume_memory_extractions()
+        except Exception:  # noqa: BLE001 - recovery must not make the UI unavailable
+            pass
+        yield
+    finally:
+        shutdown_memory_extractions(wait=True, timeout=1.0)
+
+
+app = FastAPI(title="stata-agent · research UI", lifespan=_app_lifespan)
 app.mount("/static", StaticFiles(directory=str(_UI_DIR)), name="ui-static")
 
 

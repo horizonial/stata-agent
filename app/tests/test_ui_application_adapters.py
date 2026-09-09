@@ -112,6 +112,25 @@ def test_ui_queue_does_not_retry_internal_type_error(monkeypatch):
     assert queue.calls == 1
 
 
+def test_app_lifespan_starts_recovers_and_boundedly_stops_queue(monkeypatch):
+    events = []
+
+    class LifecycleQueue:
+        def start(self):
+            events.append("start")
+
+        def shutdown(self, *, wait=True, timeout=None):
+            events.append(("shutdown", wait, timeout))
+
+    monkeypatch.setattr(ui, "_MEMORY_EXTRACTION_SCHEDULER", LifecycleQueue())
+    monkeypatch.setattr(ui, "resume_memory_extractions", lambda: events.append("recover") or 0)
+
+    with TestClient(ui.app):
+        assert events == ["start", "recover"]
+
+    assert events == ["start", "recover", ("shutdown", True, 1.0)]
+
+
 def test_ui_imports_legacy_memory_once_then_writes_only_sqlite(tmp_path, monkeypatch):
     monkeypatch.setattr(ui, "DEFAULT_DB", tmp_path / "ledger.sqlite3")
     workspace_id = ui._workspace_id("ui")

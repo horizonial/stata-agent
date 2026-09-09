@@ -9,7 +9,7 @@ importing the FastAPI module or a process-global database path.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -26,7 +26,13 @@ EventCallback = Callable[[dict[str, Any]], None]
 class StoreProtocol(Protocol):
     """Small store surface needed by the synchronous chat use case."""
 
-    def append(self, event: Event) -> Event:
+    def append(self, event: Event) -> int:
+        ...
+
+    def scan(self, idea_id: str, *args: Any, **kwargs: Any) -> Iterator[Event]:
+        ...
+
+    def project(self, idea_id: str) -> Any:
         ...
 
     def close(self) -> None:
@@ -45,6 +51,30 @@ ToolsFactory = Callable[[], Mapping[str, Tool]]
 Bootstrapper = Callable[[StoreProtocol, str, str], None]
 LoopRunner = Callable[..., LoopResult]
 ContextFactory = Callable[..., ToolContext]
+
+
+class _CurrentTurnHistoryView:
+    """Hide the already-persisted current user event from loop history.
+
+    ``run_loop`` appends ``user_text`` to the projected conversation itself.
+    The application service persists that event first for crash ordering, so
+    forwarding the raw store would send the same user message to the model
+    twice.  ToolContext still receives the real store for durable tool writes.
+    """
+
+    def __init__(self, store: StoreProtocol, *, hidden_seq: int) -> None:
+        self._store = store
+        self._hidden_seq = hidden_seq
+
+    def scan(self, idea_id: str, *args: Any, **kwargs: Any) -> Iterator[Event]:
+        return (
+            event
+            for event in self._store.scan(idea_id, *args, **kwargs)
+            if event.seq != self._hidden_seq
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
 
 
 @dataclass(frozen=True)
@@ -164,7 +194,7 @@ class ChatService:
                 return self._cancelled_result(request_id, cancellation)
 
             self._bootstrapper(store, request.idea, request.text)
-            store.append(
+            user_seq = store.append(
                 Event(
                     idea_id=request.idea,
                     event_type=EVENT_USER,
@@ -185,8 +215,9 @@ class ChatService:
                 cancellation=cancellation,
             )
             tools = dict(self._tools_factory())
+            loop_store = _CurrentTurnHistoryView(store, hidden_seq=user_seq)
             result = self._loop_runner(
-                store,
+                loop_store,
                 provider,
                 tools,
                 context,

@@ -24,8 +24,15 @@ class _Store:
         self.events = [] if self.events is None else self.events
 
     def append(self, event):
+        event.seq = len(self.events) + 1
         self.events.append(event)
-        return event
+        return event.seq
+
+    def scan(self, idea_id, *args, **kwargs):
+        return (event for event in self.events if event.idea_id == idea_id)
+
+    def project(self, idea_id):
+        return None
 
     def close(self) -> None:
         self.closed = True
@@ -134,6 +141,9 @@ def test_chat_service_runs_one_turn_and_closes_resources() -> None:
     assert store.events[0].payload == {"text": "hello", "request_id": "req-1"}
     assert calls["max_steps"] == 1
     assert calls["max_tool_calls"] == 32
+    assert calls["store"] is not store
+    assert list(calls["store"].scan("w1")) == []
+    assert calls["context"].store is store
     assert executor.closed
     assert store.closed
 

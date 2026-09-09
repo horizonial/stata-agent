@@ -2,6 +2,19 @@
 
 from .chat_service import ChatService, ChatTurnRequest, ChatTurnResult, PostTurnHook, StateFactory
 from .local_task_queue import LocalTaskQueue
+from .memory_outbox import (
+    DEFAULT_OUTBOX_CLAIM_LIMIT,
+    DEFAULT_OUTBOX_LEASE_SECONDS,
+    FakeMemoryOutboxRepository,
+    MEMORY_EXTRACTION_KIND,
+    MemoryOutboxClaim,
+    MemoryOutboxDispatcher,
+    MemoryOutboxError,
+    MemoryOutboxIntent,
+    MemoryOutboxLeaseError,
+    MemoryOutboxRepository,
+    OutboxDispatchReport,
+)
 from .request_control import RequestControlNotFound, RequestControlRegistry
 from .task_queue import (
     QueueStats,
@@ -33,6 +46,17 @@ __all__ = [
     "PostTurnHook",
     "StateFactory",
     "LocalTaskQueue",
+    "DEFAULT_OUTBOX_CLAIM_LIMIT",
+    "DEFAULT_OUTBOX_LEASE_SECONDS",
+    "FakeMemoryOutboxRepository",
+    "MEMORY_EXTRACTION_KIND",
+    "MemoryOutboxClaim",
+    "MemoryOutboxDispatcher",
+    "MemoryOutboxError",
+    "MemoryOutboxIntent",
+    "MemoryOutboxLeaseError",
+    "MemoryOutboxRepository",
+    "OutboxDispatchReport",
     "QueueStats",
     "RequestControlNotFound",
     "RequestControlRegistry",

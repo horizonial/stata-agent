@@ -29,6 +29,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .application.chat_service import ChatService, ChatTurnRequest
 from .application.local_task_queue import LocalTaskQueue
 from .application.request_control import RequestControlNotFound, RequestControlRegistry
 from .application.task_queue import TaskQueue, TaskSubmitResult
@@ -283,31 +284,6 @@ def _memory_transaction():
     """Compatibility scope; SQLite repositories provide real transactions."""
 
     return nullcontext()
-
-
-class _HistoryStoreView:
-    """Store facade that hides the just-appended user event from loop history.
-
-    ``agent_loop`` appends the current user event itself to the message list
-    after reading durable history.  The UI persists that event before entering
-    the loop so the conversation remains ordered; this narrow facade prevents
-    that one event from being sent a second time without changing the ledger
-    or the shared loop implementation.
-    """
-
-    def __init__(self, store: SQLiteStore, *, hidden_seq: int):
-        self._store = store
-        self._hidden_seq = hidden_seq
-
-    def scan(self, idea_id: str, *args, **kwargs):
-        return (
-            event
-            for event in self._store.scan(idea_id, *args, **kwargs)
-            if event.seq != self._hidden_seq
-        )
-
-    def __getattr__(self, name: str):
-        return getattr(self._store, name)
 
 
 DEMO = os.environ.get("STATA_AGENT_DEMO") == "1"
@@ -2175,6 +2151,75 @@ def health(ws: str = _IDEA):
         s.close()
 
 
+def _chat_bootstrap(store: Any, idea: str, text: str) -> None:
+    bootstrap_idea(store, idea, text)
+    _touch_workspace_name(idea, text)
+
+
+def _chat_context_factory(*, request, store, executor, cancellation, provider):
+    from .toolkit import ToolContext
+
+    privacy = request.privacy_mode or "local_strict"
+    summary_provider, _ = _feature_adapters(provider, privacy)
+    return ToolContext(
+        idea=request.idea,
+        store=store,
+        executor=executor,
+        workspace_id=request.workspace_id,
+        context_budget=request.context_budget,
+        compaction_summarizer=summary_provider,
+        rag=_rag(),
+        memory=_memory(),
+        run_root=(DEFAULT_DB.parent / "runs"),
+        privacy_mode=privacy,
+        network_available=(privacy != "local_strict"),
+        phase=store.project(request.idea).phase,
+        cancellation=cancellation,
+    )
+
+
+def _chat_post_turn(*, request, store, provider, context, result) -> None:
+    """Persist resumable memory-extraction intent before resources close."""
+
+    del context
+    privacy = request.privacy_mode or "local_strict"
+    _, extraction_provider = _feature_adapters(provider, privacy)
+    if extraction_provider is None or result.cancelled or result.terminal_reason in {
+        "cancelled",
+        "cancel_requested",
+        "privacy_denied",
+        "provider_error",
+        "provider_unsupported",
+        "context_error",
+        "context_budget",
+        "budget_invalid",
+    }:
+        return
+
+    from .memory.pipeline import MemoryExtractionPipeline
+
+    try:
+        with _memory_transaction():
+            prepared_request = MemoryExtractionPipeline().prepare(
+                store=store,
+                idea_id=request.idea,
+                workspace_id=request.workspace_id,
+            )
+    except Exception:
+        return
+    if prepared_request is not None:
+        _submit_memory_extraction_task(
+            key=f"{request.idea}:{request.workspace_id}:{prepared_request.fingerprint}",
+            callback=lambda: _run_memory_extraction_job(
+                idea=request.idea,
+                workspace_id=request.workspace_id,
+                provider=extraction_provider,
+                privacy_mode=privacy,
+                prepared_request=prepared_request,
+            ),
+        )
+
+
 def _run_chat_sync(
     idea: str,
     text: str,
@@ -2184,126 +2229,31 @@ def _run_chat_sync(
     request_id: str | None = None,
     cancel_event: threading.Event | None = None,
 ):
-    """Run one chat turn and close any per-turn executor before returning."""
+    """Adapt the UI runtime to the framework-neutral chat service."""
 
-    request_id = request_id or uuid.uuid4().hex
-    s = _store()
-    executor = None
-    memory = None
-    try:
-        if cancel_event is not None and cancel_event.is_set():
-            return "", None, _summary(s, idea)
-        bootstrap_idea(s, idea, text)
-        _touch_workspace_name(idea, text)
-        user_seq = s.append(
-            Event(
-                idea_id=idea,
-                event_type=EVENT_USER,
-                actor=ACTOR_USER,
-                source=ACTOR_USER,
-                payload={"text": text, "request_id": request_id},
-            )
-        )
-
-        from .harness.agent_loop import run_loop
-        from .toolkit import ToolContext, default_tools
-
-        provider = _provider()
-        pm = _privacy_mode()
-        executor = _executor(s)
-        workspace_id = _workspace_id(idea)
-        memory = _memory()
-        summary_provider, extraction_provider = _feature_adapters(provider, pm)
-        ctx = ToolContext(
-            idea=idea, store=s, executor=executor,
-            workspace_id=workspace_id,
-            context_budget=_context_budget(),
-            compaction_summarizer=summary_provider,
-            rag=_rag(), memory=memory,
-            run_root=(DEFAULT_DB.parent / "runs"),
-            privacy_mode=pm,
-            network_available=(pm != "local_strict"),
-            phase=s.project(idea).phase,
-        )
-        # Runtime-control may add a typed cancellation field later.  Setting
-        # the attribute keeps this UI compatible with both the current
-        # ToolContext and that future implementation without widening the
-        # toolkit ownership boundary.
-        if cancel_event is not None:
-            setattr(ctx, "cancel_event", cancel_event)
-        if cancel_event is not None and cancel_event.is_set():
-            return "", None, _summary(s, idea)
-        # ``interactive`` is deliberately one model step; ``goal`` may use
-        # the full bounded loop.  The distinction is now observable and is
-        # also reflected in the returned payload/UI toggle.
-        max_steps = 1 if mode == "interactive" else 12
-        loop_store = _HistoryStoreView(s, hidden_seq=user_seq)
-        res = run_loop(
-            loop_store,
-            provider,
-            default_tools(),
-            ctx,
-            user_text=text,
-            max_steps=max_steps,
-            privacy_mode=pm,
-            skills=_matched_skills(text),
-            on_event=on_event,
-        )
-        reply = res.ask or res.reply or ""
-        if (
-            extraction_provider is not None
-            and not res.cancelled
-            and res.terminal_reason
-            not in {
-                "cancelled",
-                "cancel_requested",
-                "privacy_denied",
-                "provider_error",
-                "provider_unsupported",
-                "context_error",
-                "context_budget",
-                "budget_invalid",
-            }
-        ):
-            # Prepare and append the request while this turn still owns the
-            # ledger lease.  Queue admission happens only after that durable
-            # boundary, so a crash or full queue leaves resumable work.
-            from .memory.pipeline import MemoryExtractionPipeline
-
-            prepared_request = None
-            try:
-                with _memory_transaction():
-                    prepared_request = MemoryExtractionPipeline().prepare(
-                        store=s,
-                        idea_id=idea,
-                        workspace_id=workspace_id,
-                    )
-            except Exception:
-                # The completed chat turn remains successful; an operator can
-                # retry preparation through the explicit resume hook.
-                prepared_request = None
-            if prepared_request is not None:
-                _submit_memory_extraction_task(
-                    key=f"{idea}:{workspace_id}:{prepared_request.fingerprint}",
-                    callback=lambda: _run_memory_extraction_job(
-                        idea=idea,
-                        workspace_id=workspace_id,
-                        provider=extraction_provider,
-                        privacy_mode=pm,
-                        prepared_request=prepared_request,
-                    ),
-                )
-        return reply, res.ask, _summary(s, idea)
-    finally:
-        _close_memory(memory)
-        if executor is not None:
-            close = getattr(executor, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:  # noqa: BLE001
-                    pass
-        s.close()
+    privacy = _privacy_mode()
+    service = ChatService(
+        store_factory=_store,
+        provider_factory=_provider,
+        executor_factory=_executor,
+        context_factory=_chat_context_factory,
+        bootstrapper=_chat_bootstrap,
+        post_turn_hook=_chat_post_turn,
+        state_factory=lambda store, workspace: _summary(store, workspace),
+    )
+    result = service.run(ChatTurnRequest(
+        idea=idea,
+        text=text,
+        mode=mode,
+        request_id=request_id,
+        cancellation=cancel_event,
+        on_event=on_event,
+        skills=_matched_skills(text),
+        privacy_mode=privacy,
+        workspace_id=_workspace_id(idea),
+        context_budget=_context_budget(),
+    ))
+    return result.reply, result.ask, result.state
 
 
 @app.post("/api/chat")

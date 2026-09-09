@@ -131,7 +131,7 @@ SSE 流式输出 · 多工作区 UI · 有界内容哈希 RAG · 可匹配 Skill
 默认能力或 CI 事实。
 
 **尚未实现或需继续强化**：
-1. **Phase 3 运行时接入**：RequestControl、TaskQueue、SQLite Memory 和 WorkspaceService 已接入 UI；旧 `memory.json` / `workspaces.json` 仅作为只读、幂等迁移源。下一步是把 chat 编排从 `ui.py` 收进已建立的 ChatService。
+1. **Phase 3 运行时接入**：ChatService、RequestControl、TaskQueue、SQLite Memory 和 WorkspaceService 均已接入 UI；旧 `memory.json` / `workspaces.json` 仅作为只读、幂等迁移源。下一步是 durable outbox、服务启动/关闭生命周期与真实 Windows 长会话验收。
 2. **模型代码准确性**：远端模型可能把 reg 命令跑偏，需 skill 细化、verify_result 主动复核或换更强模型。
 3. **真实环境验收**：真 Stata 长会话、远端模型隐私边界与独立 wheel Windows UI 仍需发布前人工验证。
 4. **附件/图片输入**：尚未建立上传沙箱、格式嗅探、大小限制和恶意文件测试。

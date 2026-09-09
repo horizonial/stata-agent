@@ -51,6 +51,8 @@ ToolsFactory = Callable[[], Mapping[str, Tool]]
 Bootstrapper = Callable[[StoreProtocol, str, str], None]
 LoopRunner = Callable[..., LoopResult]
 ContextFactory = Callable[..., ToolContext]
+PostTurnHook = Callable[..., None]
+StateFactory = Callable[[StoreProtocol, str], Any]
 
 
 class _CurrentTurnHistoryView:
@@ -112,6 +114,7 @@ class ChatTurnResult:
     reply: str
     ask: str | None
     loop_result: LoopResult
+    state: Any = None
 
     @property
     def cancelled(self) -> bool:
@@ -131,7 +134,9 @@ def _default_context(
     store: StoreProtocol,
     executor: Any | None,
     cancellation: Any,
+    provider: Any = None,
 ) -> ToolContext:
+    del provider
     return ToolContext(
         idea=request.idea,
         workspace_id=request.workspace_id,
@@ -162,6 +167,8 @@ class ChatService:
         tools_factory: ToolsFactory | None = None,
         loop_runner: LoopRunner = run_loop,
         bootstrapper: Bootstrapper | None = None,
+        post_turn_hook: PostTurnHook | None = None,
+        state_factory: StateFactory | None = None,
         goal_max_steps: int = 12,
         max_tool_calls: int = 32,
     ) -> None:
@@ -176,6 +183,8 @@ class ChatService:
         self._tools_factory = tools_factory or default_tools
         self._loop_runner = loop_runner
         self._bootstrapper = bootstrapper or _default_bootstrap
+        self._post_turn_hook = post_turn_hook
+        self._state_factory = state_factory
         self._goal_max_steps = goal_max_steps
         self._max_tool_calls = max_tool_calls
 
@@ -188,10 +197,11 @@ class ChatService:
         cancellation = request.cancellation or request.cancel_event
         store: StoreProtocol | None = None
         executor: Any | None = None
+        context: ToolContext | None = None
         try:
             store = self._store_factory()
             if is_cancel_requested(cancellation):
-                return self._cancelled_result(request_id, cancellation)
+                return self._cancelled_result(request_id, self._state(store, request.idea))
 
             self._bootstrapper(store, request.idea, request.text)
             user_seq = store.append(
@@ -204,7 +214,7 @@ class ChatService:
                 )
             )
             if is_cancel_requested(cancellation):
-                return self._cancelled_result(request_id, cancellation)
+                return self._cancelled_result(request_id, self._state(store, request.idea))
 
             provider = self._provider_factory()
             executor = self._executor_factory(store)
@@ -213,6 +223,7 @@ class ChatService:
                 store=store,
                 executor=executor,
                 cancellation=cancellation,
+                provider=provider,
             )
             tools = dict(self._tools_factory())
             loop_store = _CurrentTurnHistoryView(store, hidden_seq=user_seq)
@@ -230,13 +241,25 @@ class ChatService:
                 on_event=callback,
                 cancellation=cancellation,
             )
+            if self._post_turn_hook is not None:
+                self._post_turn_hook(
+                    request=request,
+                    store=store,
+                    provider=provider,
+                    context=context,
+                    result=result,
+                )
             return ChatTurnResult(
                 request_id=request_id,
                 reply=str(result.ask or result.reply or ""),
                 ask=result.ask,
                 loop_result=result,
+                state=self._state(store, request.idea),
             )
         finally:
+            memory = getattr(context, "memory", None)
+            if memory is not executor and memory is not store:
+                self._close(memory)
             self._close(executor)
             self._close(store)
 
@@ -255,7 +278,7 @@ class ChatService:
             raise ValueError("mode must be interactive or goal")
 
     @staticmethod
-    def _cancelled_result(request_id: str, cancellation: Any) -> ChatTurnResult:
+    def _cancelled_result(request_id: str, state: Any = None) -> ChatTurnResult:
         loop_result = LoopResult(
             reply="",
             terminal_reason="cancelled",
@@ -266,7 +289,13 @@ class ChatService:
             reply="",
             ask=None,
             loop_result=loop_result,
+            state=state,
         )
+
+    def _state(self, store: StoreProtocol, idea: str) -> Any:
+        if self._state_factory is None:
+            return None
+        return self._state_factory(store, idea)
 
     @staticmethod
     def _close(resource: Any | None) -> None:
@@ -291,7 +320,9 @@ __all__ = [
     "EventCallback",
     "ExecutorFactory",
     "LoopRunner",
+    "PostTurnHook",
     "ProviderFactory",
+    "StateFactory",
     "StoreFactory",
     "StoreProtocol",
     "ToolsFactory",

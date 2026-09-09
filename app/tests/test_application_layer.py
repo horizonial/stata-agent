@@ -108,6 +108,7 @@ def test_request_control_registry_disconnect_and_latest_active_are_thread_safe()
 def test_chat_service_runs_one_turn_and_closes_resources() -> None:
     store = _Store()
     executor = _Executor()
+    memory = _Executor()
     calls: dict[str, object] = {}
 
     def run_loop(store_arg, provider, tools, context, **kwargs):
@@ -123,11 +124,20 @@ def test_chat_service_runs_one_turn_and_closes_resources() -> None:
             idea=kwargs["request"].idea,
             store=kwargs["store"],
             executor=kwargs["executor"],
+            memory=memory,
             cancellation=kwargs["cancellation"],
         ),
         tools_factory=lambda: {},
         loop_runner=run_loop,
         bootstrapper=lambda _store, _idea, _text: None,
+        post_turn_hook=lambda **kwargs: calls.update({
+            "hook_provider": kwargs["provider"],
+            "hook_store_open": not kwargs["store"].closed,
+        }),
+        state_factory=lambda state_store, idea: {
+            "idea": idea,
+            "events": len(list(state_store.scan(idea))),
+        },
     )
 
     result = service.run(ChatTurnRequest(idea="w1", text="hello", request_id="req-1"))
@@ -137,6 +147,7 @@ def test_chat_service_runs_one_turn_and_closes_resources() -> None:
     assert result.ask is None
     assert result.tool_calls == 2
     assert result.terminal_reason == "model_stop"
+    assert result.state == {"idea": "w1", "events": 1}
     assert store.events and store.events[0].event_type == "user.message"
     assert store.events[0].payload == {"text": "hello", "request_id": "req-1"}
     assert calls["max_steps"] == 1
@@ -144,6 +155,9 @@ def test_chat_service_runs_one_turn_and_closes_resources() -> None:
     assert calls["store"] is not store
     assert list(calls["store"].scan("w1")) == []
     assert calls["context"].store is store
+    assert calls["hook_provider"] == "provider"
+    assert calls["hook_store_open"] is True
+    assert memory.closed
     assert executor.closed
     assert store.closed
 

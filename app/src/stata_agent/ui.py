@@ -18,6 +18,7 @@ import re
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,9 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .application.local_task_queue import LocalTaskQueue
+from .application.request_control import RequestControlNotFound, RequestControlRegistry
+from .application.task_queue import TaskQueue, TaskSubmitResult
 from .domain.action import Act, ActionProposal
 from .events.schema import (
     ACTOR_ORCH,
@@ -52,7 +56,6 @@ from .events.schema import (
     Event,
 )
 from .harness.research_turn import bootstrap_idea
-from .harness.memory_scheduler import MemoryExtractionScheduler
 from .privacy.modes import (
     MIXED_SANITIZED,
     PrivacyViolation,
@@ -84,13 +87,12 @@ _SKILL_ERRORS: list[str] = []
 # Active stream controls are deliberately process-local.  The event ledger is
 # the durable source of research state; this small registry only lets a user
 # address one in-flight HTTP request without accidentally stopping another
-# workspace.  Terminal rows remain briefly so repeated stop requests return a
-# stable answer instead of flipping between 404 and success.
+# workspace.  The application-layer registry owns locking, TTL pruning, and
+# lifecycle transitions; this module keeps only the transport adapter names
+# used by existing routes and tests.
 _REQUEST_CONTROL_TTL = 3600
-_REQUEST_CONTROL_TERMINAL = frozenset({"completed", "failed", "cancelled"})
-_REQUEST_CONTROLS: dict[str, dict[str, Any]] = {}
-_REQUEST_CONTROLS_LOCK = threading.RLock()
-_MEMORY_EXTRACTION_SCHEDULER = MemoryExtractionScheduler(max_pending=4, shutdown_timeout=1.0)
+_REQUEST_CONTROL_REGISTRY = RequestControlRegistry(ttl_seconds=_REQUEST_CONTROL_TTL)
+_MEMORY_EXTRACTION_SCHEDULER: TaskQueue = LocalTaskQueue(max_pending=4, shutdown_timeout=1.0)
 
 app = FastAPI(title="stata-agent · research UI")
 app.mount("/static", StaticFiles(directory=str(_UI_DIR)), name="ui-static")
@@ -148,31 +150,11 @@ _UI_STORE_LOCK = threading.RLock()
 
 
 def _prune_request_controls(now: float | None = None) -> None:
-    now = time.time() if now is None else now
-    with _REQUEST_CONTROLS_LOCK:
-        expired = [
-            request_id
-            for request_id, control in _REQUEST_CONTROLS.items()
-            if control.get("status") in _REQUEST_CONTROL_TERMINAL
-            and now - float(control.get("finished_at") or control.get("created_at") or now) > _REQUEST_CONTROL_TTL
-        ]
-        for request_id in expired:
-            _REQUEST_CONTROLS.pop(request_id, None)
+    _REQUEST_CONTROL_REGISTRY.prune(now)
 
 
 def _register_request_control(request_id: str, idea: str, cancel_event: threading.Event) -> None:
-    _prune_request_controls()
-    with _REQUEST_CONTROLS_LOCK:
-        _REQUEST_CONTROLS[request_id] = {
-            "request_id": request_id,
-            "idea": idea,
-            "cancel_event": cancel_event,
-            "status": "running",
-            "cancel_requested": False,
-            "cancel_reason": None,
-            "created_at": time.time(),
-            "finished_at": None,
-        }
+    _REQUEST_CONTROL_REGISTRY.register(request_id, idea, cancel_event)
 
 
 def _request_control_public(control: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -180,7 +162,7 @@ def _request_control_public(control: dict[str, Any] | None) -> dict[str, Any] | 
         return None
     return {
         "request_id": control.get("request_id"),
-        "workspace": control.get("idea"),
+        "workspace": control.get("workspace") or control.get("idea"),
         "status": control.get("status"),
         "cancel_requested": bool(control.get("cancel_requested")),
         "cancel_reason": control.get("cancel_reason"),
@@ -190,59 +172,29 @@ def _request_control_public(control: dict[str, Any] | None) -> dict[str, Any] | 
 
 
 def _finish_request_control(request_id: str, *, status: str) -> None:
-    with _REQUEST_CONTROLS_LOCK:
-        control = _REQUEST_CONTROLS.get(request_id)
-        if control is None:
-            return
-        # A terminal result wins over a late disconnect callback.  This makes
-        # a stop racing the final SSE frame deterministic for the client.
-        if control.get("status") in _REQUEST_CONTROL_TERMINAL:
-            return
-        control["status"] = status
-        control["finished_at"] = time.time()
+    # The registry preserves the first terminal result, so a late disconnect
+    # callback cannot overwrite a completed/failed/cancelled request.
+    _REQUEST_CONTROL_REGISTRY.finish(request_id, status)
 
 
 def _request_cancel(request_id: str, idea: str, *, reason: str = "user") -> dict[str, Any]:
-    _prune_request_controls()
-    with _REQUEST_CONTROLS_LOCK:
-        control = _REQUEST_CONTROLS.get(request_id)
-        if control is None or control.get("idea") != idea:
-            raise HTTPException(status_code=404, detail="运行请求不存在或已过期。")
-        if control.get("status") in _REQUEST_CONTROL_TERMINAL:
-            return _request_control_public(control) or {}
-        control["cancel_requested"] = True
-        control["cancel_reason"] = reason
-        control["status"] = "cancelling"
-        control["cancel_event"].set()
-        return _request_control_public(control) or {}
+    try:
+        control = _REQUEST_CONTROL_REGISTRY.cancel(request_id, idea, reason=reason)
+    except (RequestControlNotFound, ValueError) as error:
+        raise HTTPException(status_code=404, detail="运行请求不存在或已过期。") from error
+    return _request_control_public(control) or {}
 
 
 def _mark_request_disconnected(request_id: str) -> None:
-    with _REQUEST_CONTROLS_LOCK:
-        control = _REQUEST_CONTROLS.get(request_id)
-        if control is None or control.get("status") in _REQUEST_CONTROL_TERMINAL:
-            return
-        control["cancel_requested"] = True
-        control["cancel_reason"] = "disconnect"
-        control["status"] = "cancelling"
-        control["cancel_event"].set()
+    _REQUEST_CONTROL_REGISTRY.disconnect(request_id)
 
 
 def _request_control_snapshot(request_id: str) -> dict[str, Any] | None:
-    _prune_request_controls()
-    with _REQUEST_CONTROLS_LOCK:
-        return _request_control_public(_REQUEST_CONTROLS.get(request_id))
+    return _request_control_public(_REQUEST_CONTROL_REGISTRY.snapshot(request_id))
 
 
 def _latest_active_request(idea: str) -> dict[str, Any] | None:
-    _prune_request_controls()
-    with _REQUEST_CONTROLS_LOCK:
-        rows = [
-            control
-            for control in _REQUEST_CONTROLS.values()
-            if control.get("idea") == idea and control.get("status") not in _REQUEST_CONTROL_TERMINAL
-        ]
-        return max(rows, key=lambda item: float(item.get("created_at") or 0), default=None)
+    return _REQUEST_CONTROL_REGISTRY.latest_active(idea)
 
 
 class _LockedStore:
@@ -685,6 +637,34 @@ def _run_memory_extraction_job(
                 pass
 
 
+def _submit_memory_extraction_task(
+    *,
+    key: str,
+    callback: Callable[[], object],
+) -> bool:
+    """Submit one memory callback through the application queue port.
+
+    ``TaskQueue`` returns a typed ``TaskSubmitResult``.  The UI's historical
+    helpers intentionally keep their boolean contract because queue admission
+    is only an internal implementation detail here.  A narrow legacy-call
+    fallback keeps existing test doubles and downstream adapters that still
+    expose ``submit(callback, key=...)`` source-compatible while the default
+    runtime uses the application-layer ``submit(key, callback)`` contract.
+    """
+
+    submitter: Any = getattr(_MEMORY_EXTRACTION_SCHEDULER, "submit")
+    try:
+        result = submitter(key, callback)
+    except TypeError as error:
+        try:
+            result = submitter(callback, key=key)
+        except TypeError:
+            raise error
+    if isinstance(result, TaskSubmitResult):
+        return result.accepted
+    return bool(result)
+
+
 def _schedule_memory_extraction(
     *,
     idea: str,
@@ -700,14 +680,14 @@ def _schedule_memory_extraction(
     if extraction_provider is None:
         return False
     key = f"{idea}:{workspace_id}"
-    return _MEMORY_EXTRACTION_SCHEDULER.submit(
-        lambda: _run_memory_extraction_job(
+    return _submit_memory_extraction_task(
+        key=key,
+        callback=lambda: _run_memory_extraction_job(
             idea=idea,
             workspace_id=workspace_id,
             provider=extraction_provider,
             privacy_mode=privacy_mode,
         ),
-        key=key,
     )
 
 
@@ -2270,15 +2250,15 @@ def _run_chat_sync(
                 # retry preparation through the explicit resume hook.
                 prepared_request = None
             if prepared_request is not None:
-                _MEMORY_EXTRACTION_SCHEDULER.submit(
-                    lambda: _run_memory_extraction_job(
+                _submit_memory_extraction_task(
+                    key=f"{idea}:{workspace_id}:{prepared_request.fingerprint}",
+                    callback=lambda: _run_memory_extraction_job(
                         idea=idea,
                         workspace_id=workspace_id,
                         provider=extraction_provider,
                         privacy_mode=pm,
                         prepared_request=prepared_request,
                     ),
-                    key=f"{idea}:{workspace_id}:{prepared_request.fingerprint}",
                 )
         return reply, res.ask, _summary(s, idea)
     finally:

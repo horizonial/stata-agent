@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 import stata_agent.ui as ui
+from stata_agent.application import RequestControlRegistry
 from stata_agent.events.schema import (
     ACTOR_AGENT,
     ACTOR_ORCH,
@@ -77,7 +78,7 @@ def test_sse_tool_events_are_structured_and_not_assistant_text(monkeypatch):
 
 def test_stop_is_request_scoped_and_idempotent(monkeypatch):
     monkeypatch.setattr(ui, "_resolve_workspace", lambda ws: "ui")
-    ui._REQUEST_CONTROLS.clear()
+    monkeypatch.setattr(ui, "_REQUEST_CONTROL_REGISTRY", RequestControlRegistry())
     import threading
 
     event = threading.Event()
@@ -92,7 +93,6 @@ def test_stop_is_request_scoped_and_idempotent(monkeypatch):
     terminal = ui.control_stop(ui.StopIn(request_id="req-1"))
     assert terminal["status"] == "cancelled"
     assert terminal["cancel_requested"] is True
-    ui._REQUEST_CONTROLS.clear()
 
 
 def test_approval_modify_audits_user_steering_and_decision(tmp_path, monkeypatch):

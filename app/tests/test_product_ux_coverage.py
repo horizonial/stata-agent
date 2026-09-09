@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -11,6 +10,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import stata_agent.ui as ui
+from stata_agent.application import RequestControlRegistry
 from stata_agent.events.schema import ACTOR_AGENT, EVENT_APPROVAL_REQ, EVENT_TOOL_INVOKED, Event
 from stata_agent.storage.sqlite_store import SQLiteStore
 
@@ -30,7 +30,12 @@ def _rows(response) -> list[dict]:
 
 
 def test_request_controls_scope_terminal_wins_and_expire(monkeypatch):
-    ui._REQUEST_CONTROLS.clear()
+    now = [1000.0]
+    monkeypatch.setattr(
+        ui,
+        "_REQUEST_CONTROL_REGISTRY",
+        RequestControlRegistry(ttl_seconds=ui._REQUEST_CONTROL_TTL, clock=lambda: now[0]),
+    )
     first_event = threading.Event()
     second_event = threading.Event()
     ui._register_request_control("req-ui", "ui", first_event)
@@ -48,16 +53,14 @@ def test_request_controls_scope_terminal_wins_and_expire(monkeypatch):
     assert snapshot and snapshot["status"] == "completed"
     assert ui._latest_active_request("ui") is None
 
-    with ui._REQUEST_CONTROLS_LOCK:
-        ui._REQUEST_CONTROLS["req-ui"]["finished_at"] = time.time() - ui._REQUEST_CONTROL_TTL - 1
+    now[0] += ui._REQUEST_CONTROL_TTL + 1
     ui._prune_request_controls()
     assert ui._request_control_snapshot("req-ui") is None
-    ui._REQUEST_CONTROLS.clear()
 
 
 def test_stop_endpoint_no_active_and_unknown_request_have_stable_error(monkeypatch):
     monkeypatch.setattr(ui, "_resolve_workspace", lambda ws: "ui")
-    ui._REQUEST_CONTROLS.clear()
+    monkeypatch.setattr(ui, "_REQUEST_CONTROL_REGISTRY", RequestControlRegistry())
     idle = ui.control_stop(ui.StopIn())
     assert idle == {"ok": True, "request_id": None, "workspace": "ui", "status": "idle", "cancel_requested": False}
 
@@ -101,7 +104,7 @@ def test_sse_error_uses_api_error_shape(monkeypatch):
 
 def test_sse_disconnect_marks_request_cancelling(monkeypatch):
     monkeypatch.setattr(ui, "_resolve_workspace", lambda ws: "ui")
-    ui._REQUEST_CONTROLS.clear()
+    monkeypatch.setattr(ui, "_REQUEST_CONTROL_REGISTRY", RequestControlRegistry())
     monkeypatch.setattr(ui, "_run_chat_sync", lambda *args, **kwargs: ("ok", None, {}))
     response = asyncio.run(ui.chat_stream(ui.ChatIn(text="hello")))
 
@@ -118,7 +121,6 @@ def test_sse_disconnect_marks_request_cancelling(monkeypatch):
     # so the contract does not depend on that implementation detail.
     ui._mark_request_disconnected(request_id)
     assert ui._request_control_snapshot(request_id)["status"] == "cancelling"
-    ui._REQUEST_CONTROLS.clear()
 
 
 def test_approval_modify_validation_and_duplicate_are_auditable(tmp_path, monkeypatch):

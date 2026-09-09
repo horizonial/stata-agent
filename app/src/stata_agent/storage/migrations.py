@@ -148,8 +148,8 @@ class MigrationRunner:
     def _validate_migrations(self) -> None:
         previous = 0
         for migration in self._migrations:
-            if migration.version <= previous:
-                raise MigrationError("migration versions must be strictly increasing")
+            if migration.version != previous + 1:
+                raise MigrationError("migration versions must be contiguous and start at one")
             if migration.version <= 0 or not migration.name.strip():
                 raise MigrationError("migration versions must be positive and named")
             previous = migration.version
@@ -210,6 +210,23 @@ class MigrationRunner:
                     "SELECT version, name FROM schema_migrations ORDER BY version"
                 )
             }
+            known = {migration.version: migration.name for migration in self._migrations}
+            for version, name in applied.items():
+                expected_name = known.get(version)
+                if expected_name is None:
+                    raise MigrationError(
+                        f"database schema version {version} is newer than this application"
+                    )
+                if name != expected_name:
+                    raise MigrationError(
+                        f"migration {version} name mismatch: database={name!r}, "
+                        f"application={expected_name!r}"
+                    )
+            current = max(applied, default=0)
+            if target < current:
+                raise MigrationError(
+                    f"target schema version {target} is older than current version {current}"
+                )
             for migration in self._migrations:
                 if migration.version > target or migration.version in applied:
                     continue

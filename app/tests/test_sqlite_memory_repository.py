@@ -12,7 +12,7 @@ from stata_agent.memory.sqlite_repository import (
     STATUS_ACTIVE,
     SQLiteMemoryRepository,
 )
-from stata_agent.storage.migrations import Migration, MigrationRunner
+from stata_agent.storage.migrations import Migration, MigrationError, MigrationRunner
 
 
 def test_migrations_are_idempotent_and_failure_rolls_back(tmp_path):
@@ -54,6 +54,29 @@ def test_migrations_are_idempotent_and_failure_rolls_back(tmp_path):
         "('schema_migrations', 'first', 'should_be_rolled_back')"
     ).fetchall() == []
     failed_connection.close()
+
+
+def test_migrations_reject_downgrade_and_schema_history_drift(tmp_path):
+    connection = sqlite3.connect(tmp_path / "drift.sqlite3")
+    runner = MigrationRunner(connection)
+    assert runner.run() == 1
+
+    with pytest.raises(MigrationError, match="older than current"):
+        runner.run(target_version=0)
+
+    connection.execute(
+        "UPDATE schema_migrations SET name='rewritten-history' WHERE version=1"
+    )
+    connection.commit()
+    with pytest.raises(MigrationError, match="name mismatch"):
+        runner.run()
+    connection.close()
+
+    with pytest.raises(MigrationError, match="contiguous"):
+        MigrationRunner(
+            sqlite3.connect(":memory:"),
+            (Migration(2, "starts-late", lambda conn: None),),
+        )
 
 
 def test_repository_configures_sqlite_and_covers_schema(tmp_path):

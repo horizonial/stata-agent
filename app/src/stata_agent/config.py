@@ -10,6 +10,52 @@ from pathlib import Path
 
 _loaded = False
 
+COMPACTION_SUMMARY_ENV = "STATA_AGENT_COMPACTION_SUMMARY"
+MEMORY_EXTRACTION_ENV = "STATA_AGENT_MEMORY_EXTRACTION"
+COMPACTION_SUMMARY_MODES = frozenset({"deterministic", "provider"})
+MEMORY_EXTRACTION_MODES = frozenset({"off", "provider"})
+
+
+def _configured_choice(
+    name: str,
+    default: str,
+    allowed: frozenset[str],
+    *,
+    environ: dict[str, str] | None = None,
+) -> str:
+    """Read an optional feature switch and fail closed on invalid values."""
+
+    env = os.environ if environ is None else environ
+    value = str(env.get(name, default) or default).strip().lower()
+    return value if value in allowed else default
+
+
+def compaction_summary_mode(*, environ: dict[str, str] | None = None) -> str:
+    """Return ``deterministic`` unless provider summaries are explicitly enabled."""
+
+    return _configured_choice(
+        COMPACTION_SUMMARY_ENV,
+        "deterministic",
+        COMPACTION_SUMMARY_MODES,
+        environ=environ,
+    )
+
+
+def memory_extraction_mode(*, environ: dict[str, str] | None = None) -> str:
+    """Return ``off`` unless background provider extraction is explicitly enabled."""
+
+    return _configured_choice(
+        MEMORY_EXTRACTION_ENV,
+        "off",
+        MEMORY_EXTRACTION_MODES,
+        environ=environ,
+    )
+
+
+# Descriptive aliases for callers that prefer configuration-oriented names.
+configured_compaction_summary = compaction_summary_mode
+configured_memory_extraction = memory_extraction_mode
+
 
 def app_root() -> Path:
     # src/stata_agent/config.py -> parents: config? config.py 在 src/stata_agent/ 下

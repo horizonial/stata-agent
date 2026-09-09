@@ -49,6 +49,14 @@ from .events.schema import (
     Event,
 )
 from .harness.research_turn import bootstrap_idea
+from .harness.memory_scheduler import MemoryExtractionScheduler
+from .privacy.modes import (
+    MIXED_SANITIZED,
+    PrivacyViolation,
+    is_remote,
+    normalize_mode,
+    sanitize_messages,
+)
 from .providers.mock import MockFixedProvider, MockReplayProvider
 from .runner import approve as runner_approve
 from .storage.sqlite_store import SQLiteStore
@@ -79,6 +87,7 @@ _REQUEST_CONTROL_TTL = 3600
 _REQUEST_CONTROL_TERMINAL = frozenset({"completed", "failed", "cancelled"})
 _REQUEST_CONTROLS: dict[str, dict[str, Any]] = {}
 _REQUEST_CONTROLS_LOCK = threading.RLock()
+_MEMORY_EXTRACTION_SCHEDULER = MemoryExtractionScheduler(max_pending=4, shutdown_timeout=1.0)
 
 app = FastAPI(title="stata-agent · research UI")
 app.mount("/static", StaticFiles(directory=str(_UI_DIR)), name="ui-static")
@@ -486,6 +495,71 @@ def _provider():
     )
 
 
+def _provider_name(provider: Any) -> str:
+    value = getattr(provider, "provider_name", None) or getattr(provider, "provider", None)
+    return str(value or provider.__class__.__name__).strip().lower()
+
+
+class _PrivacyChatAdapter:
+    """Reuse one selected provider while applying feature-specific privacy gates."""
+
+    def __init__(self, provider: Any, *, privacy_mode: str) -> None:
+        chat = getattr(provider, "chat", None)
+        if not callable(chat):
+            raise TypeError("provider does not support chat")
+        self._provider = provider
+        self._privacy_mode = privacy_mode
+        self.provider_name = _provider_name(provider)
+        explicit = getattr(provider, "is_remote", None)
+        self.is_remote = (
+            explicit
+            if isinstance(explicit, bool)
+            else is_remote(self.provider_name)
+            or self.provider_name in {"remote", "cloud", "http", "https"}
+        )
+
+    def chat(self, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+        mode = normalize_mode(self._privacy_mode)
+        if self.is_remote and mode == "local_strict":
+            raise PrivacyViolation("local_strict 禁止 provider-assisted context/memory calls")
+        request_messages = messages
+        if self.is_remote and mode == MIXED_SANITIZED:
+            request_messages = sanitize_messages(
+                messages,
+                mode=mode,
+                provider=self.provider_name,
+            )
+        return self._provider.chat(request_messages, **kwargs)
+
+
+def _feature_adapters(provider: Any, privacy_mode: str) -> tuple[Any, Any]:
+    """Build optional summary/extraction adapters around the current provider.
+
+    Construction is local-only.  Neither adapter calls the provider until the
+    corresponding overflow or background job is explicitly reached.
+    """
+
+    from .config import compaction_summary_mode, memory_extraction_mode
+
+    summary_adapter = None
+    extraction_adapter = None
+    if not callable(getattr(provider, "chat", None)):
+        return summary_adapter, extraction_adapter
+    if compaction_summary_mode() == "provider":
+        from .harness.summary_service import ChatCompactionSummaryProvider
+
+        summary_adapter = ChatCompactionSummaryProvider(
+            _PrivacyChatAdapter(provider, privacy_mode=privacy_mode),
+        )
+    if memory_extraction_mode() == "provider":
+        from .memory.pipeline import ChatMemoryExtractionProvider
+
+        extraction_adapter = ChatMemoryExtractionProvider(
+            _PrivacyChatAdapter(provider, privacy_mode=privacy_mode),
+        )
+    return summary_adapter, extraction_adapter
+
+
 def _executor(store: SQLiteStore):
     """Return an explicitly selected executor; never invent fake results live."""
 
@@ -512,6 +586,7 @@ def _privacy_mode() -> str:
 def _config_info() -> dict:
     """给设置页展示的真实运行时配置（只读）。"""
     from .providers.registry import live_available
+    from .config import compaction_summary_mode, memory_extraction_mode
 
     executor_kind = os.environ.get("STATA_AGENT_EXECUTOR", "").strip().lower()
     if executor_kind == "stata":
@@ -533,6 +608,8 @@ def _config_info() -> dict:
         "skills": skills,
         "skill_errors": list(_SKILL_ERRORS),
         "workspace_db": str(DEFAULT_DB),
+        "compaction_summary": compaction_summary_mode(),
+        "memory_extraction": memory_extraction_mode(),
     }
 
 
@@ -545,6 +622,139 @@ def _memory():
         return MemoryStore(path)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _run_memory_extraction_job(
+    *,
+    idea: str,
+    workspace_id: str,
+    provider: Any,
+    privacy_mode: str,
+) -> None:
+    """Open fresh per-job resources; a failed intake never changes chat output."""
+
+    store = None
+    try:
+        # _store serializes takeover of SQLiteStore's single-writer lease with
+        # UI requests.  The worker never captures the request's store/memory.
+        store = _store()
+        memory = _memory()
+        if memory is None:
+            return
+        from .memory.pipeline import MemoryExtractionPipeline
+
+        MemoryExtractionPipeline().run_once(
+            store=store,
+            memory=memory,
+            idea_id=idea,
+            workspace_id=workspace_id,
+            provider=provider,
+            privacy_mode=privacy_mode,
+        )
+    except Exception:
+        # The pipeline records stable failure/denial events where possible;
+        # scheduler failures remain isolated from the already delivered turn.
+        return
+    finally:
+        if store is not None:
+            try:
+                store.close()
+            except Exception:
+                pass
+
+
+def _schedule_memory_extraction(
+    *,
+    idea: str,
+    workspace_id: str,
+    provider: Any,
+    privacy_mode: str,
+) -> bool:
+    from .config import memory_extraction_mode
+
+    if memory_extraction_mode() != "provider":
+        return False
+    _, extraction_provider = _feature_adapters(provider, privacy_mode)
+    if extraction_provider is None:
+        return False
+    key = f"{idea}:{workspace_id}"
+    return _MEMORY_EXTRACTION_SCHEDULER.submit(
+        lambda: _run_memory_extraction_job(
+            idea=idea,
+            workspace_id=workspace_id,
+            provider=extraction_provider,
+            privacy_mode=privacy_mode,
+        ),
+        key=key,
+    )
+
+
+def resume_memory_extractions(ws: str | None = None) -> int:
+    """Queue requested jobs that lack a matching terminal event.
+
+    This explicit hook is used by process-resume code and does not run at
+    import time.  It only queues work when the operator has enabled provider
+    extraction; the pipeline itself performs the final fingerprint check.
+    """
+
+    from .config import memory_extraction_mode
+    from .events.schema import (
+        EVENT_MEMORY_EXTRACTION_COMPLETED,
+        EVENT_MEMORY_EXTRACTION_DENIED,
+        EVENT_MEMORY_EXTRACTION_FAILED,
+        EVENT_MEMORY_EXTRACTION_NOOP,
+        EVENT_MEMORY_EXTRACTION_REQUESTED,
+    )
+
+    if memory_extraction_mode() != "provider":
+        return 0
+    idea = _resolve_workspace(ws) if ws is not None else None
+    store = _store()
+    try:
+        ideas = [idea] if idea is not None else [row["id"] for row in _read_workspace_registry()]
+        pending: list[tuple[str, str]] = []
+        terminal_types = {
+            EVENT_MEMORY_EXTRACTION_COMPLETED,
+            EVENT_MEMORY_EXTRACTION_DENIED,
+            EVENT_MEMORY_EXTRACTION_FAILED,
+            EVENT_MEMORY_EXTRACTION_NOOP,
+        }
+        for current in dict.fromkeys(ideas):
+            events = list(store.scan(current))
+            terminal = {
+                str(event.fingerprint or (event.payload or {}).get("fingerprint") or "")
+                for event in events
+                if event.event_type in terminal_types
+            }
+            for event in events:
+                if event.event_type != EVENT_MEMORY_EXTRACTION_REQUESTED:
+                    continue
+                payload = event.payload or {}
+                fingerprint = str(event.fingerprint or payload.get("fingerprint") or "")
+                if fingerprint and fingerprint not in terminal:
+                    pending.append((current, str(payload.get("workspace_id") or _workspace_id(current))))
+    finally:
+        store.close()
+    if not pending:
+        return 0
+    provider = _provider()
+    privacy_mode = _privacy_mode()
+    queued = 0
+    for current, workspace_id in pending:
+        if _schedule_memory_extraction(
+            idea=current,
+            workspace_id=workspace_id,
+            provider=provider,
+            privacy_mode=privacy_mode,
+        ):
+            queued += 1
+    return queued
+
+
+def shutdown_memory_extractions(*, wait: bool = True, timeout: float | None = None) -> None:
+    """Bounded shutdown hook for application teardown/tests."""
+
+    _MEMORY_EXTRACTION_SCHEDULER.shutdown(wait=wait, timeout=timeout)
 
 
 def _context_budget():
@@ -1253,92 +1463,6 @@ class ChatIn(BaseModel):
     mode: str = "interactive"  # interactive=提问即停；goal=自动跑到需你决定/硬停才停
 
 
-_GREETINGS = {"你好", "您好", "hello", "hi", "hey", "在吗", "在么", "喂", "早上好", "晚上好", "哈喽"}
-
-
-def _clean(text: str) -> str:
-    return "".join(ch for ch in text.strip().lower() if ch.isalnum())
-
-
-def _is_greeting(text: str) -> bool:
-    c = _clean(text)
-    return c in _GREETINGS or (len(c) <= 4 and any(g in c for g in ("你好", "hello", "hi")))
-
-
-_RESEARCH_HINTS = ("研究", "回归", "双重差分", "did", "验证", "检验", "估计", "机制",
-                   "稳健", "异质性", "异质", "面板", "文献", "假设", "样本", "数据",
-                   "主回归", "跑一下", "帮我跑", "spec", "论文", "初稿", "可行")
-
-
-def _is_research(text: str) -> bool:
-    """离线兜底：只有明确提到研究动词/对象才算 research（有 LLM 时用意图识别替代）。"""
-    low = text.lower()
-    return any(h in low for h in _RESEARCH_HINTS)
-
-
-def _classify_intent(provider, text: str, history: list[dict]) -> str:
-    """意图识别（先于一切路由）：research=要用数据/文献做实证分析/跑回归/出初稿；
-    其余（闲聊/解释/写东西/问问题…）一律 chat。无 LLM 时退回关键词兜底。"""
-    if hasattr(provider, "chat"):
-        sys_msg = (
-            "你是路由器。判断下一条用户消息意图，只输出一个词：research 或 chat。\n"
-            "research = 用户明确要你针对数据做实证分析/跑回归/写论文初稿/验证某个假设/做研究计划。\n"
-            "chat = 其余一切：寒暄、提问、解释概念、写代码/文字、闲聊，哪怕提到数据或研究相关词。\n"
-            "只输出 research 或 chat，不要解释。"
-        )
-        msgs = [{"role": "system", "content": sys_msg}]
-        msgs.extend(history[-6:])
-        if not msgs or msgs[-1].get("role") != "user":
-            msgs.append({"role": "user", "content": text})
-        try:
-            out = provider.chat(msgs).strip().lower()
-            if "research" in out:
-                return "research"
-            return "chat"
-        except Exception:  # noqa: BLE001
-            pass
-    return "research" if _is_research(text) else "chat"
-
-
-def _chat_reply(provider, messages: list[dict]) -> str:
-    """普通聊天回复：直接调 LLM.chat；无 chat 能力的 provider 走演示文案。"""
-    if hasattr(provider, "chat"):
-        try:
-            reply = provider.chat(messages)
-            if isinstance(reply, str) and reply.strip():
-                return reply.strip()
-        except Exception as e:  # noqa: BLE001
-            return f"（这次没接上模型，稍后再试。细节：{str(e)[:120]}）"
-    return "（演示模式：这里会是我的自然回复。配好 LLM key 后就是正常对话。）"
-
-
-def _history_messages(store, idea: str, limit: int = 12) -> list[dict]:
-    """把账本里的对话投影成 openai 消息（普通聊天用；研究动作不进历史太多）。"""
-    out: list[dict] = []
-    for e in store.scan(idea):
-        p = e.payload or {}
-        if e.event_type == "user.message":
-            out.append({"role": "user", "content": str(p.get("text") or "")})
-        elif e.event_type == "agent_step" and not p.get("research"):
-            content = str(p.get("ask") or p.get("decision_summary") or "")
-            if content:
-                out.append({"role": "assistant", "content": content})
-    return out[-limit:]
-
-
-def _onboarding(*, has_idea: bool, mode: str) -> str:
-    base = ("你好，我是你的研究 agent——先当普通对话用，随便聊都行；"
-            "想让我做研究时再给研究问题 + 数据（例如：验证最低工资对就业的影响，数据见…）。")
-    tip = ("\n请这样给一句，例如：\n"
-           "· 想验证『最低工资提高会减少快餐店就业吗』，数据在 …（长表：店×期，含处理组/期后/结果列）\n"
-           "· 或先问我能做什么 / 看右侧状态。")
-    if has_idea:
-        base += ("\n注意：当前研究问题还是空的（可能之前只说了寒暄）。"
-                 "请重开一个新 idea 或直接给出真实研究问题与数据，我会从建档开始。")
-    mode_note = f"\n当前为「{('目标' if mode=='goal' else '交互')}」模式。" if mode else ""
-    return base + tip + mode_note
-
-
 class ApproveIn(BaseModel):
     request_id: str
     decision: str  # approve | reject
@@ -1347,6 +1471,10 @@ class ApproveIn(BaseModel):
 
 class ApprovalDecisionIn(BaseModel):
     decision: str
+    note: str = ""
+
+
+class MemoryCandidateDecisionIn(BaseModel):
     note: str = ""
 
 
@@ -1464,6 +1592,127 @@ def approvals(status: str = "pending", ws: str = _IDEA):
         s.close()
 
 
+def _memory_review(
+    candidate_id: str,
+    *,
+    idea: str,
+    decision: str,
+    note: str = "",
+) -> dict[str, Any]:
+    """Apply one same-workspace candidate decision and append its audit event."""
+
+    from .memory.memstore import MemoryStore
+
+    normalized_note = str(note or "").strip()
+    if len(normalized_note) > 4000:
+        raise HTTPException(status_code=413, detail="记忆审核说明不能超过 4000 个字符。")
+    workspace_id = _workspace_id(idea)
+    s = _store()
+    try:
+        memory = _memory()
+        if not isinstance(memory, MemoryStore):
+            raise HTTPException(status_code=503, detail="项目记忆当前不可用。")
+        candidate = memory.candidate(candidate_id, workspace_id=workspace_id)
+        if candidate is None:
+            # Do not reveal whether the id belongs to another workspace.
+            raise HTTPException(status_code=404, detail="记忆候选不存在或不属于当前工作区。")
+        source_ids = [str(item) for item in candidate.get("source_ids") or []]
+        if decision == "accept":
+            result = memory.accept_candidate(
+                candidate_id,
+                workspace_id=workspace_id,
+                source_ids=source_ids,
+            )
+            if result is None:
+                raise HTTPException(status_code=404, detail="记忆候选不存在或不属于当前工作区。")
+            status = "accepted"
+        else:
+            if not memory.reject_candidate(candidate_id, workspace_id=workspace_id):
+                raise HTTPException(status_code=404, detail="记忆候选不存在或不属于当前工作区。")
+            result = None
+            status = "rejected"
+
+        # Candidate review is UI metadata, so use a forward-compatible event
+        # string instead of changing the canonical event schema/reducer.
+        event_type = f"memory.candidate.{status}"
+        event_seq = s.append(
+            Event(
+                idea_id=idea,
+                event_type=event_type,
+                actor=ACTOR_USER,
+                source=ACTOR_USER,
+                payload={
+                    "candidate_id": candidate_id,
+                    "workspace_id": workspace_id,
+                    "source_ids": source_ids,
+                    "note": normalized_note,
+                },
+            )
+        )
+    finally:
+        s.close()
+    return {
+        "ok": True,
+        "candidate_id": candidate_id,
+        "status": status,
+        "workspace": idea,
+        "workspace_id": workspace_id,
+        "event": event_type,
+        "event_seq": event_seq,
+        "memory": result,
+    }
+
+
+@app.get("/api/memory/candidates")
+def memory_candidates(ws: str = _IDEA):
+    """List pending model-extracted candidates for exactly one workspace."""
+
+    idea = _resolve_workspace(ws)
+    s = _store()
+    try:
+        memory = _memory()
+        workspace_id = _workspace_id(idea)
+        items = memory.candidates(workspace_id=workspace_id) if memory is not None else []
+        return {
+            "items": items,
+            "candidates": items,
+            "workspace": idea,
+            "workspace_id": workspace_id,
+        }
+    finally:
+        s.close()
+
+
+@app.post("/api/memory/candidates/{candidate_id}/accept")
+def accept_memory_candidate(
+    candidate_id: str,
+    body: MemoryCandidateDecisionIn | None = None,
+    ws: str = _IDEA,
+):
+    idea = _resolve_workspace(ws)
+    return _memory_review(
+        candidate_id,
+        idea=idea,
+        decision="accept",
+        note=body.note if body else "",
+    )
+
+
+@app.post("/api/memory/candidates/{candidate_id}/reject")
+def reject_memory_candidate(
+    candidate_id: str,
+    body: MemoryCandidateDecisionIn | None = None,
+    ws: str = _IDEA,
+):
+    idea = _resolve_workspace(ws)
+    return _memory_review(
+        candidate_id,
+        idea=idea,
+        decision="reject",
+        note=body.note if body else "",
+    )
+
+
 @app.post("/api/approve")
 def approve(body: ApproveIn, ws: str = _IDEA):
     idea = _resolve_workspace(ws)
@@ -1518,12 +1767,20 @@ def _resume_result(idea: str = _IDEA) -> dict[str, Any]:
 def resume(ws: str = _IDEA):
     """Continue from the current durable projection without new input."""
 
-    return _resume_result(_resolve_workspace(ws))
+    idea = _resolve_workspace(ws)
+    resumed_memory_jobs = resume_memory_extractions(idea)
+    result = _resume_result(idea)
+    result["memory_extraction_jobs"] = resumed_memory_jobs
+    return result
 
 
 @app.post("/api/control/resume")
 def control_resume(ws: str = _IDEA):
-    return _resume_result(_resolve_workspace(ws))
+    idea = _resolve_workspace(ws)
+    resumed_memory_jobs = resume_memory_extractions(idea)
+    result = _resume_result(idea)
+    result["memory_extraction_jobs"] = resumed_memory_jobs
+    return result
 
 
 @app.post("/api/control/stop")
@@ -1704,10 +1961,12 @@ def _run_chat_sync(
         executor = _executor(s)
         workspace_id = _workspace_id(idea)
         memory = _memory()
+        summary_provider, extraction_provider = _feature_adapters(provider, pm)
         ctx = ToolContext(
             idea=idea, store=s, executor=executor,
             workspace_id=workspace_id,
             context_budget=_context_budget(),
+            compaction_summarizer=summary_provider,
             rag=_rag(), memory=memory,
             run_root=(DEFAULT_DB.parent / "runs"),
             privacy_mode=pm,
@@ -1739,6 +1998,32 @@ def _run_chat_sync(
             on_event=on_event,
         )
         reply = res.ask or res.reply or ""
+        if (
+            extraction_provider is not None
+            and not res.cancelled
+            and res.terminal_reason
+            not in {
+                "cancelled",
+                "cancel_requested",
+                "privacy_denied",
+                "provider_error",
+                "provider_unsupported",
+                "context_error",
+                "context_budget",
+                "budget_invalid",
+            }
+        ):
+            # The callback opens a fresh SQLiteStore/MemoryStore in the worker;
+            # queue admission and extraction never delay this response.
+            _MEMORY_EXTRACTION_SCHEDULER.submit(
+                lambda: _run_memory_extraction_job(
+                    idea=idea,
+                    workspace_id=workspace_id,
+                    provider=extraction_provider,
+                    privacy_mode=pm,
+                ),
+                key=f"{idea}:{workspace_id}:{request_id}",
+            )
         return reply, res.ask, _summary(s, idea)
     finally:
         if executor is not None:

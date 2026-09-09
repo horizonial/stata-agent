@@ -115,3 +115,7 @@ v0.4 已关闭：ledger.jsonl vs SQLite 冲突、thought 持久化、本地隐�
 - `research/codex_report.md` —— codex 调研交付报告（2026-09-03，SPEC v0.4 的修订依据，从 docx 转存）
 - `research/borrow_from_coding_agents.md` —— 借鉴引入笔记（2026-09-07，从 pi/codex/claude-code/claw-code 学习册提取可借鉴项 → SPEC 映射 + codex 记忆系统复查；v0.5 候选清单见其 §6）
 - MCP 执行层：`C:\Users\user\stata-mcp`（DESIGN.md 记录 7 轮审计；README 中英优劣势）
+
+模型辅助摘要与记忆提取默认关闭。可显式设置 `STATA_AGENT_COMPACTION_SUMMARY=provider`
+在溢出压缩时复用当前 provider，或设置 `STATA_AGENT_MEMORY_EXTRACTION=provider`
+在成功回合后异步提取待审核候选；对应默认值分别为 `deterministic` 和 `off`。

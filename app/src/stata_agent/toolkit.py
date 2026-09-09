@@ -33,6 +33,10 @@ class ToolContext:
     # Optional ContextBudget instance (or a compatible object/dict).  The
     # loop passes it to ContextAssembler; ``None`` selects its safe default.
     context_budget: Any = None
+    # Optional provider-neutral summary adapter.  The UI only sets this when
+    # the operator explicitly enables provider-assisted compaction; the loop
+    # otherwise keeps deterministic compaction as the fail-safe.
+    compaction_summarizer: Any = None
     store: Any = None
     rag: Any = None           # HybridRetriever | None
     executor: Any = None      # StataExecutor | FakeExecutor | None

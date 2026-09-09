@@ -42,7 +42,7 @@ Agent Loop（通用，LLM + function calling，自主多步 + 防循环护栏 + 
 | **防循环护栏** | 连续 3 次相同 run_stata 中断（确定性，不靠模型自觉） | `agent_loop.py` |
 | **幂等/恢复** | 同 input_hash 复用；断点续跑；writer lease/fence；reconcile | `executor.py` + `storage/` + `harness/recovery.py` |
 | **长会话** | `ContextAssembler` 按固定层级构造有界 projection；token 压力触发 append-only `compaction.boundary`，保留完整工具尾部与 manifest | `harness/context_assembler.py` + `compaction.py` + `agent_loop.py` |
-| **记忆** | Memory V2 按 workspace 隔离、检索相关约束并附 provenance；项目约定/决定是约束而非证据，与证据库分开 | `memory/memstore.py` + `toolkit.py` + `runner.py` |
+| **记忆** | Memory V2 按 workspace 隔离、检索相关约束并附 provenance；项目约定/决定是约束而非证据，与证据库分开；可选候选提取默认关闭且需审核 | `memory/memstore.py` + `memory/pipeline.py` + `toolkit.py` + `ui.py` |
 | **多工作区** | 每工作区=事件账本的 idea_id；`?ws=` 贯穿；registry 存元数据；V2 memory identity 由 canonical ledger/project root 哈希生成 | `ui.py` |
 | **RAG** | 内容哈希 doc/chunk identity；chunk/page/file 有界；显式 source_role（默认 style-only）；缓存原子写、清理删除文件，索引可复用 | `rag/` |
 | **评测** | 五层 L0–L4 设计；L0/对抗有实现；复现 golden 自建入口 | `eval/` + `eval_golden/README.md` |
@@ -54,6 +54,8 @@ harness/agent_loop.py     通用 loop + ContextAssembler 接入 + 防循环 + �
 harness/safety.py         预算 / 健康探针 / estimate_tokens
 harness/context_assembler.py V2 分层上下文 projection + token budget/manifest
 harness/compaction.py     语义压缩(compaction.boundary)
+harness/summary_service.py 可选模型摘要适配器（默认 deterministic）
+harness/memory_scheduler.py 单 worker 有界后台记忆任务
 harness/recovery.py       reconcile 未决执行链
 harness/telemetry.py      两本账遥测(jsonl)
 harness/branch.py         分支 fork/切片/父链
@@ -95,6 +97,7 @@ writer/figure.py          figure 证据卡 + Word 插图
 writer/docx_out.py        claims/表格 → docx
 writer/draft_multi.py     多表初稿(draft_from_ledger)
 memory/memstore.py        V2 项目记忆(search/select/provenance/consolidate/prune)
+memory/pipeline.py        有界来源的异步候选提取（默认 off，需人工审核）
 privacy/modes.py          隐私三档 + 边界
 ui.py                     FastAPI 全部端点 + SSE 流式 + 多工作区 + config
 ui/index.html·app.js·styles.css  前端(纯原生，无框架)
@@ -146,4 +149,6 @@ STATA_AGENT_LIBRARY       文献库目录（RAG）
 STATA_AGENT_SKILLS        skills 目录
 STATA_AGENT_DEMO          1=离线演示
 STATA_AGENT_UI_PORT       端口（默认 8001）
+STATA_AGENT_COMPACTION_SUMMARY deterministic（默认）/ provider（仅溢出时复用当前 provider）
+STATA_AGENT_MEMORY_EXTRACTION  off（默认）/ provider（成功回合后异步提取候选）
 ```

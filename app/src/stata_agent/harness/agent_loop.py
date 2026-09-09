@@ -411,7 +411,12 @@ def _compact_and_reassemble(
     except ImportError:
         return None
     try:
-        compaction_module.compact(store, ctx.idea, reason="token_pressure")
+        compaction_module.compact(
+            store,
+            ctx.idea,
+            reason="token_pressure",
+            summarizer=getattr(ctx, "compaction_summarizer", None),
+        )
         messages, assembled = _assemble_initial_messages(
             store,
             ctx,

@@ -12,6 +12,19 @@ from .task_queue import (
     TaskSubmitResult,
     TaskSubmitStatus,
 )
+from .workspace_service import (
+    CreateWorkspaceRequest,
+    DEFAULT_WORKSPACE_ID,
+    DEFAULT_WORKSPACE_NAME,
+    MAX_WORKSPACE_ID_LENGTH,
+    MAX_WORKSPACE_NAME_LENGTH,
+    WorkspaceConflictError,
+    WorkspaceNotFoundError,
+    WorkspaceRecord,
+    WorkspaceRepository,
+    WorkspaceService,
+    WorkspaceValidationError,
+)
 
 __all__ = [
     "ChatService",
@@ -27,4 +40,15 @@ __all__ = [
     "TaskQueue",
     "TaskSubmitResult",
     "TaskSubmitStatus",
+    "CreateWorkspaceRequest",
+    "DEFAULT_WORKSPACE_ID",
+    "DEFAULT_WORKSPACE_NAME",
+    "MAX_WORKSPACE_ID_LENGTH",
+    "MAX_WORKSPACE_NAME_LENGTH",
+    "WorkspaceConflictError",
+    "WorkspaceNotFoundError",
+    "WorkspaceRecord",
+    "WorkspaceRepository",
+    "WorkspaceService",
+    "WorkspaceValidationError",
 ]

@@ -4,6 +4,7 @@ import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
 from fastapi.testclient import TestClient
 
 import stata_agent.ui as ui
@@ -12,6 +13,7 @@ from stata_agent.events.schema import (
     EVENT_MEMORY_EXTRACTION_NOOP,
     EVENT_MEMORY_EXTRACTION_REQUESTED,
 )
+from stata_agent.memory.memstore import MemoryStore
 from stata_agent.storage.sqlite_store import SQLiteStore
 
 
@@ -89,6 +91,52 @@ def test_ui_queue_adapter_preserves_typed_admission_and_lifecycle(monkeypatch):
     assert ui._submit_memory_extraction_task(key="resumed", callback=resumed.set)
     ui.shutdown_memory_extractions(wait=True)
     assert resumed.is_set()
+
+
+def test_ui_queue_does_not_retry_internal_type_error(monkeypatch):
+    class BrokenQueue:
+        def __init__(self):
+            self.calls = 0
+
+        def submit(self, key, callback):
+            del key, callback
+            self.calls += 1
+            raise TypeError("queue implementation failed")
+
+    queue = BrokenQueue()
+    monkeypatch.setattr(ui, "_MEMORY_EXTRACTION_SCHEDULER", queue)
+
+    with pytest.raises(TypeError, match="queue implementation failed"):
+        ui._submit_memory_extraction_task(key="one", callback=lambda: None)
+    assert queue.calls == 1
+
+
+def test_ui_imports_legacy_memory_once_then_writes_only_sqlite(tmp_path, monkeypatch):
+    monkeypatch.setattr(ui, "DEFAULT_DB", tmp_path / "ledger.sqlite3")
+    workspace_id = ui._workspace_id("ui")
+    source = tmp_path / "memory.json"
+    legacy = MemoryStore(source, workspace_id=workspace_id)
+    legacy.add("默认使用中文", workspace_id=workspace_id, source_ids=["seq:1"])
+    original_source = source.read_bytes()
+
+    first = ui._memory()
+    assert first is not None
+    try:
+        assert [item["text"] for item in first.all(workspace_id=workspace_id)] == ["默认使用中文"]
+        first.add("输出先给结论", workspace_id=workspace_id, source_ids=["seq:2"])
+    finally:
+        ui._close_memory(first)
+
+    second = ui._memory()
+    assert second is not None
+    try:
+        records = second.all(workspace_id=workspace_id)
+    finally:
+        ui._close_memory(second)
+
+    assert {item["text"] for item in records} == {"默认使用中文", "输出先给结论"}
+    assert len(records) == 2
+    assert source.read_bytes() == original_source
 
 
 def test_durable_memory_request_survives_queue_full_and_resume(tmp_path, monkeypatch):

@@ -106,6 +106,8 @@ writer/draft_multi.py     多表初稿(draft_from_ledger)
 memory/memstore.py        V2 项目记忆(search/select/provenance/consolidate/prune)
 memory/pipeline.py        有界来源的异步候选提取（默认 off，需人工审核）
 memory/sqlite_repository.py SQLite 记忆/候选/workspace 底层仓库 + JSON 幂等导入
+memory/sqlite_store.py    MemoryStore 兼容门面；UI 运行时只写 SQLite
+application/              Chat/Workspace/RequestControl/TaskQueue 应用边界与本地适配器
 privacy/modes.py          隐私三档 + 边界
 ui.py                     FastAPI 全部端点 + SSE 流式 + 多工作区 + config
 ui/index.html·app.js·styles.css  前端(纯原生，无框架)
@@ -129,13 +131,13 @@ SSE 流式输出 · 多工作区 UI · 有界内容哈希 RAG · 可匹配 Skill
 默认能力或 CI 事实。
 
 **尚未实现或需继续强化**：
-1. **Phase 3 运行时接入**：应用层、SQLite memory repository 和 TaskQueue 端口已完成第一波，尚未替换 `ui.py` 的旧编排、`memory.json` 运行时写入与旧 scheduler。
+1. **Phase 3 运行时接入**：RequestControl、TaskQueue 和 SQLite Memory 已接入 UI；旧 `memory.json` 仅作为只读、幂等迁移源。下一步是把 chat 编排与 workspace registry 从 `ui.py` 收进已建立的应用服务。
 2. **模型代码准确性**：远端模型可能把 reg 命令跑偏，需 skill 细化、verify_result 主动复核或换更强模型。
 3. **真实环境验收**：真 Stata 长会话、远端模型隐私边界与独立 wheel Windows UI 仍需发布前人工验证。
 4. **附件/图片输入**：尚未建立上传沙箱、格式嗅探、大小限制和恶意文件测试。
 5. **自进化 skill**：evolve.py 还在 staging（promote 需人工），且 skill_candidate_md 生成的是旧 variants 格式，需对齐新 Skill 语义。
 
-**2026-09-09 当前离线门禁**：307 collected，303 passed / 4 skipped；Ruff、Mypy、L1–L4 产品评测、76% branch coverage 与 wheel build 均通过。
+**2026-09-09 当前离线门禁**：325 collected，321 passed / 4 skipped；Ruff、Mypy、L1–L4 产品评测、77% branch coverage 与 wheel build 均通过。
 
 ## 6. 给 codex 的接手清单
 

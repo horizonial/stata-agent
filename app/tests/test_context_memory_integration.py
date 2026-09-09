@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import pytest
 
 import stata_agent.ui as ui
+from stata_agent.application import LocalTaskQueue
 from stata_agent.events.schema import (
     ACTOR_AGENT,
     EVENT_IDEA,
@@ -192,7 +193,7 @@ def test_default_features_make_no_extra_provider_call(tmp_path, monkeypatch):
     monkeypatch.setattr(ui, "_executor", lambda _store: None)
     monkeypatch.setattr(ui, "_rag", lambda: None)
     monkeypatch.setattr(ui, "_memory", lambda: None)
-    scheduler = MemoryExtractionScheduler(max_pending=1)
+    scheduler = LocalTaskQueue(max_pending=1)
     monkeypatch.setattr(ui, "_MEMORY_EXTRACTION_SCHEDULER", scheduler)
 
     class Provider:
@@ -255,7 +256,7 @@ def test_memory_extraction_response_does_not_wait_for_worker(tmp_path, monkeypat
     monkeypatch.setattr(ui, "_executor", lambda _store: None)
     monkeypatch.setattr(ui, "_rag", lambda: None)
     monkeypatch.setattr(ui, "_memory", lambda: None)
-    scheduler = MemoryExtractionScheduler(max_pending=1)
+    scheduler = LocalTaskQueue(max_pending=1)
     monkeypatch.setattr(ui, "_MEMORY_EXTRACTION_SCHEDULER", scheduler)
     started = threading.Event()
     release = threading.Event()
@@ -292,7 +293,7 @@ def test_enabled_extraction_opens_fresh_store_and_memory(tmp_path, monkeypatch):
     monkeypatch.setenv("STATA_AGENT_WORKSPACES", str(tmp_path / "workspaces.json"))
     monkeypatch.setattr(ui, "_executor", lambda _store: None)
     monkeypatch.setattr(ui, "_rag", lambda: None)
-    scheduler = MemoryExtractionScheduler(max_pending=1)
+    scheduler = LocalTaskQueue(max_pending=1)
     monkeypatch.setattr(ui, "_MEMORY_EXTRACTION_SCHEDULER", scheduler)
     instances = []
 
@@ -449,7 +450,7 @@ def test_ui_prepares_before_queue_and_resume_consumes_request(tmp_path, monkeypa
         def __init__(self):
             self.callbacks = []
 
-        def submit(self, callback, *, key):
+        def submit(self, key, callback):
             self.callbacks.append((key, callback))
             return True
 

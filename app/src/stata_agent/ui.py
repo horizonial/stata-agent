@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +84,8 @@ _WORKSPACE_REGISTRY_LOCK = threading.RLock()
 _RAG_CACHE: dict[tuple[str, str], Any] = {}
 _RAG_CACHE_LOCK = threading.RLock()
 _SKILL_ERRORS: list[str] = []
+_MEMORY_MIGRATION_LOCK = threading.RLock()
+_MIGRATED_MEMORY_DATABASES: set[str] = set()
 
 # Active stream controls are deliberately process-local.  The event ledger is
 # the durable source of research state; this small registry only lets a user
@@ -227,18 +230,51 @@ def _store() -> _LockedStore:
         raise
 
 
-def _memory_path() -> Path:
-    """Return the single process-local durable memory file."""
+def _legacy_memory_path() -> Path:
+    """Return the read-only source used for an explicit V1 memory import."""
 
     return DEFAULT_DB.parent / "memory.json"
 
 
-def _memory_lock() -> Any:
-    """Return MemoryStore's shared path lock for UI/job coordination."""
+def _migrate_legacy_memory_once() -> dict[str, Any] | None:
+    """Import a legacy JSON store into SQLite once per database process.
 
-    from .memory.memstore import memory_path_lock
+    The repository import is transactional and fingerprint-idempotent.  The
+    source file is never renamed or modified, so operators retain a recoverable
+    rollback artifact while all new writes go exclusively to SQLite.
+    """
 
-    return memory_path_lock(_memory_path())
+    source = _legacy_memory_path()
+    if not source.is_file():
+        return None
+    database_key = str(DEFAULT_DB.expanduser().resolve(strict=False)).casefold()
+    with _MEMORY_MIGRATION_LOCK:
+        if database_key in _MIGRATED_MEMORY_DATABASES:
+            return None
+        from .memory.sqlite_repository import SQLiteMemoryRepository
+
+        DEFAULT_DB.parent.mkdir(parents=True, exist_ok=True)
+        with SQLiteMemoryRepository(DEFAULT_DB) as repository:
+            report = repository.import_json(source)
+        _MIGRATED_MEMORY_DATABASES.add(database_key)
+        return report
+
+
+def _close_memory(memory: Any) -> None:
+    """Best-effort close for SQLite memory handles and lightweight test doubles."""
+
+    close = getattr(memory, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - cleanup must not hide the primary result
+            pass
+
+
+def _memory_transaction():
+    """Compatibility scope; SQLite repositories provide real transactions."""
+
+    return nullcontext()
 
 
 class _HistoryStoreView:
@@ -585,9 +621,10 @@ def _config_info() -> dict:
 def _memory():
     """项目记忆（约束，非证据）；没有就 None，工具会优雅降级。"""
     try:
-        from .memory.memstore import MemoryStore
+        from .memory.sqlite_store import SQLiteMemoryStore
 
-        return MemoryStore(_memory_path())
+        _migrate_legacy_memory_once()
+        return SQLiteMemoryStore(DEFAULT_DB)
     except Exception:  # noqa: BLE001
         return None
 
@@ -603,33 +640,31 @@ def _run_memory_extraction_job(
     """Open fresh per-job resources; a failed intake never changes chat output."""
 
     store = None
+    memory = None
     try:
         # _store serializes takeover of SQLiteStore's single-writer lease with
         # UI requests.  The worker never captures the request's store/memory.
         store = _store()
-        # MemoryStore instances reload under this same path lock.  Keeping
-        # the lock around the complete job also serializes provider-derived
-        # candidate writes with UI review/approval mutations.
-        with _memory_lock():
-            memory = _memory()
-            if memory is None:
-                return
-            from .memory.pipeline import MemoryExtractionPipeline
+        memory = _memory()
+        if memory is None:
+            return
+        from .memory.pipeline import MemoryExtractionPipeline
 
-            MemoryExtractionPipeline().run_once(
-                store=store,
-                memory=memory,
-                idea_id=idea,
-                workspace_id=workspace_id,
-                provider=provider,
-                privacy_mode=privacy_mode,
-                prepared_request=prepared_request,
-            )
+        MemoryExtractionPipeline().run_once(
+            store=store,
+            memory=memory,
+            idea_id=idea,
+            workspace_id=workspace_id,
+            provider=provider,
+            privacy_mode=privacy_mode,
+            prepared_request=prepared_request,
+        )
     except Exception:
         # The pipeline records stable failure/denial events where possible;
         # scheduler failures remain isolated from the already delivered turn.
         return
     finally:
+        _close_memory(memory)
         if store is not None:
             try:
                 store.close()
@@ -644,22 +679,14 @@ def _submit_memory_extraction_task(
 ) -> bool:
     """Submit one memory callback through the application queue port.
 
-    ``TaskQueue`` returns a typed ``TaskSubmitResult``.  The UI's historical
-    helpers intentionally keep their boolean contract because queue admission
-    is only an internal implementation detail here.  A narrow legacy-call
-    fallback keeps existing test doubles and downstream adapters that still
-    expose ``submit(callback, key=...)`` source-compatible while the default
-    runtime uses the application-layer ``submit(key, callback)`` contract.
+    ``TaskQueue`` returns a typed ``TaskSubmitResult``.  The UI keeps its
+    historical boolean contract because queue admission is an internal detail.
+    Adapters must implement the application port's ``submit(key, callback)``
+    signature; retrying on ``TypeError`` could accidentally submit twice when a
+    queue implementation raises from inside its own method.
     """
 
-    submitter: Any = getattr(_MEMORY_EXTRACTION_SCHEDULER, "submit")
-    try:
-        result = submitter(key, callback)
-    except TypeError as error:
-        try:
-            result = submitter(callback, key=key)
-        except TypeError:
-            raise error
+    result = _MEMORY_EXTRACTION_SCHEDULER.submit(key, callback)
     if isinstance(result, TaskSubmitResult):
         return result.accepted
     return bool(result)
@@ -1558,19 +1585,21 @@ def _decision(
     if decision not in {"approve", "reject"}:
         raise HTTPException(status_code=422, detail="decision 必须是 approve|reject|modify。")
     if decision == "approve" and note:
-        # runner.approve appends the grant and then writes the optional
-        # decision memory.  Keep that mutation under the same path lock as
-        # extraction/review so a concurrent worker cannot replace memory.json.
-        with _memory_lock():
+        # SQLite owns concurrency and transaction boundaries for the optional
+        # decision memory; the ledger remains the approval audit source.
+        memory = _memory()
+        try:
             event_kind = runner_approve(
                 store,
                 request_id,
                 decision=decision,
                 note=note,
                 idea=idea,
-                memory=_memory(),
+                memory=memory,
                 workspace_id=_workspace_id(idea),
             )
+        finally:
+            _close_memory(memory)
     else:
         event_kind = runner_approve(
             store,
@@ -1690,10 +1719,11 @@ def _memory_review(
             return None
 
     s = _store()
+    memory = None
     try:
-        # All UI/job memory mutations acquire this path lock in the same order
-        # (ledger lease first, memory lock second), preventing lost updates.
-        with _memory_lock():
+        # SQLite transactions serialize memory mutations.  The compatibility
+        # scope avoids perturbing the review recovery protocol's structure.
+        with _memory_transaction():
             memory = _memory()
             if not isinstance(memory, MemoryStore):
                 raise HTTPException(status_code=503, detail="项目记忆当前不可用。")
@@ -1869,6 +1899,7 @@ def _memory_review(
                 )
                 raise HTTPException(status_code=503, detail="记忆审核记录暂不可写，请稍后重试。") from error
     finally:
+        _close_memory(memory)
         s.close()
     return {
         "ok": True,
@@ -1888,6 +1919,7 @@ def memory_candidates(ws: str = _IDEA):
 
     idea = _resolve_workspace(ws)
     s = _store()
+    memory = None
     try:
         memory = _memory()
         workspace_id = _workspace_id(idea)
@@ -1899,6 +1931,7 @@ def memory_candidates(ws: str = _IDEA):
             "workspace_id": workspace_id,
         }
     finally:
+        _close_memory(memory)
         s.close()
 
 
@@ -2157,6 +2190,7 @@ def _run_chat_sync(
     request_id = request_id or uuid.uuid4().hex
     s = _store()
     executor = None
+    memory = None
     try:
         if cancel_event is not None and cancel_event.is_set():
             return "", None, _summary(s, idea)
@@ -2239,7 +2273,7 @@ def _run_chat_sync(
 
             prepared_request = None
             try:
-                with _memory_lock():
+                with _memory_transaction():
                     prepared_request = MemoryExtractionPipeline().prepare(
                         store=s,
                         idea_id=idea,
@@ -2262,6 +2296,7 @@ def _run_chat_sync(
                 )
         return reply, res.ask, _summary(s, idea)
     finally:
+        _close_memory(memory)
         if executor is not None:
             close = getattr(executor, "close", None)
             if callable(close):

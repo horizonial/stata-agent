@@ -50,7 +50,7 @@ class LoopResult:
             self.reply = "（这轮没有产出，请再具体一点。）"
 
 
-class Guard:
+class CompatibilityToolFacade:
     """Backward-compatible facade for callers that imported the old Guard.
 
     New code should use :class:`ToolEnforcer` directly.  Keeping this facade
@@ -62,6 +62,11 @@ class Guard:
 
     def validate(self, name: str, arguments: Any, ctx: ToolContext | None = None) -> str | None:
         return self.enforcer.validate(name, arguments, ctx)
+
+
+# Public compatibility alias.  The implementation is an application-service
+# facade over ToolEnforcer, not a transport/API guard.
+Guard = CompatibilityToolFacade
 
 
 def _history_messages(store: SQLiteStore, idea: str, limit: int = 16) -> list[dict]:

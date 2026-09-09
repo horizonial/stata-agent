@@ -133,7 +133,9 @@ class WorkspaceService:
         self._default_id = self.validate_id(default_id, default=default_id)
         self._default_name = self.validate_name(default_name)
         self._root_base = self._canonical_path(root_base or Path.cwd())
-        self._clock = clock or (lambda: int(time.time()))
+        # Registry timestamps are part of the existing UI contract and use
+        # Unix milliseconds (event timestamps use the same display scale).
+        self._clock = clock or (lambda: int(time.time() * 1000))
 
     @property
     def default_id(self) -> str:
@@ -228,7 +230,7 @@ class WorkspaceService:
         return base or f"workspace-{uuid.uuid4().hex[:8]}"
 
     def _now(self) -> int:
-        return _safe_int(self._clock(), int(time.time()))
+        return _safe_int(self._clock(), int(time.time() * 1000))
 
     @staticmethod
     def _metadata(row: RecordMapping) -> dict[str, Any]:

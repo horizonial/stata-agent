@@ -38,6 +38,9 @@ from .events.schema import (
     EVENT_BUDGET,
     EVENT_HEALTH,
     EVENT_IDEA,
+    EVENT_MEMORY_REVIEW_COMPLETED,
+    EVENT_MEMORY_REVIEW_FAILED,
+    EVENT_MEMORY_REVIEW_REQUESTED,
     EVENT_PHASE,
     EVENT_RUN_FAILED,
     EVENT_RUN_SUCCEEDED,
@@ -270,6 +273,20 @@ def _store() -> _LockedStore:
     except Exception:
         _UI_STORE_LOCK.release()
         raise
+
+
+def _memory_path() -> Path:
+    """Return the single process-local durable memory file."""
+
+    return DEFAULT_DB.parent / "memory.json"
+
+
+def _memory_lock() -> Any:
+    """Return MemoryStore's shared path lock for UI/job coordination."""
+
+    from .memory.memstore import memory_path_lock
+
+    return memory_path_lock(_memory_path())
 
 
 class _HistoryStoreView:
@@ -615,11 +632,10 @@ def _config_info() -> dict:
 
 def _memory():
     """项目记忆（约束，非证据）；没有就 None，工具会优雅降级。"""
-    path = DEFAULT_DB.parent / "memory.json"
     try:
         from .memory.memstore import MemoryStore
 
-        return MemoryStore(path)
+        return MemoryStore(_memory_path())
     except Exception:  # noqa: BLE001
         return None
 
@@ -630,6 +646,7 @@ def _run_memory_extraction_job(
     workspace_id: str,
     provider: Any,
     privacy_mode: str,
+    prepared_request: Any | None = None,
 ) -> None:
     """Open fresh per-job resources; a failed intake never changes chat output."""
 
@@ -638,19 +655,24 @@ def _run_memory_extraction_job(
         # _store serializes takeover of SQLiteStore's single-writer lease with
         # UI requests.  The worker never captures the request's store/memory.
         store = _store()
-        memory = _memory()
-        if memory is None:
-            return
-        from .memory.pipeline import MemoryExtractionPipeline
+        # MemoryStore instances reload under this same path lock.  Keeping
+        # the lock around the complete job also serializes provider-derived
+        # candidate writes with UI review/approval mutations.
+        with _memory_lock():
+            memory = _memory()
+            if memory is None:
+                return
+            from .memory.pipeline import MemoryExtractionPipeline
 
-        MemoryExtractionPipeline().run_once(
-            store=store,
-            memory=memory,
-            idea_id=idea,
-            workspace_id=workspace_id,
-            provider=provider,
-            privacy_mode=privacy_mode,
-        )
+            MemoryExtractionPipeline().run_once(
+                store=store,
+                memory=memory,
+                idea_id=idea,
+                workspace_id=workspace_id,
+                provider=provider,
+                privacy_mode=privacy_mode,
+                prepared_request=prepared_request,
+            )
     except Exception:
         # The pipeline records stable failure/denial events where possible;
         # scheduler failures remain isolated from the already delivered turn.
@@ -1555,16 +1577,30 @@ def _decision(
         }
     if decision not in {"approve", "reject"}:
         raise HTTPException(status_code=422, detail="decision 必须是 approve|reject|modify。")
-    memory = _memory() if decision == "approve" and note else None
-    event_kind = runner_approve(
-        store,
-        request_id,
-        decision=decision,
-        note=note,
-        idea=idea,
-        memory=memory,
-        workspace_id=_workspace_id(idea),
-    )
+    if decision == "approve" and note:
+        # runner.approve appends the grant and then writes the optional
+        # decision memory.  Keep that mutation under the same path lock as
+        # extraction/review so a concurrent worker cannot replace memory.json.
+        with _memory_lock():
+            event_kind = runner_approve(
+                store,
+                request_id,
+                decision=decision,
+                note=note,
+                idea=idea,
+                memory=_memory(),
+                workspace_id=_workspace_id(idea),
+            )
+    else:
+        event_kind = runner_approve(
+            store,
+            request_id,
+            decision=decision,
+            note=note,
+            idea=idea,
+            memory=None,
+            workspace_id=_workspace_id(idea),
+        )
     return {
         "decision": "approved" if decision == "approve" else "rejected",
         "event": event_kind,
@@ -1599,56 +1635,259 @@ def _memory_review(
     decision: str,
     note: str = "",
 ) -> dict[str, Any]:
-    """Apply one same-workspace candidate decision and append its audit event."""
+    """Review one candidate through a durable two-phase audit protocol.
+
+    The requested event is the recovery boundary.  Memory is mutated only
+    after it is present; a completed event is emitted only after the mutation
+    succeeds.  Any later ledger failure is surfaced as an error and, when
+    possible, represented by a failed event instead of returning a false
+    success.
+    """
 
     from .memory.memstore import MemoryStore
+    from .storage.store import DuplicateFingerprint
 
     normalized_note = str(note or "").strip()
     if len(normalized_note) > 4000:
         raise HTTPException(status_code=413, detail="记忆审核说明不能超过 4000 个字符。")
+    decision = str(decision or "").strip().lower()
+    if decision not in {"accept", "reject"}:
+        raise HTTPException(status_code=422, detail="记忆审核决定必须是 accept|reject。")
+
     workspace_id = _workspace_id(idea)
+
+    def review_fingerprint(candidate: dict[str, Any]) -> str:
+        material = {
+            "workspace_id": workspace_id,
+            "candidate_id": str(candidate_id),
+            "candidate_fingerprint": str(candidate.get("fingerprint") or ""),
+            "decision": decision,
+        }
+        encoded = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def matching_event(events: list[Event], event_type: str, fingerprint: str) -> Event | None:
+        for event in reversed(events):
+            event_fp = str(event.fingerprint or (event.payload or {}).get("fingerprint") or "")
+            if event.event_type == event_type and event_fp == fingerprint:
+                return event
+        return None
+
+    def append_failed(
+        store: Any,
+        *,
+        fingerprint: str,
+        source_ids: list[str],
+        error_code: str,
+        audit_note: str,
+        mutation_applied: bool = False,
+    ) -> int | None:
+        try:
+            return store.append(
+                Event(
+                    idea_id=idea,
+                    event_type=EVENT_MEMORY_REVIEW_FAILED,
+                    actor=ACTOR_USER,
+                    source=ACTOR_USER,
+                    payload={
+                        "status": "failed",
+                        "candidate_id": candidate_id,
+                        "workspace_id": workspace_id,
+                        "decision": decision,
+                        "source_ids": source_ids,
+                        "note": audit_note,
+                        "error_code": error_code,
+                        "mutation_applied": mutation_applied,
+                        "fingerprint": fingerprint,
+                    },
+                    fingerprint=fingerprint,
+                )
+            )
+        except DuplicateFingerprint:
+            # A previous recovery attempt already accounted for the failure.
+            return None
+        except Exception:
+            return None
+
     s = _store()
     try:
-        memory = _memory()
-        if not isinstance(memory, MemoryStore):
-            raise HTTPException(status_code=503, detail="项目记忆当前不可用。")
-        candidate = memory.candidate(candidate_id, workspace_id=workspace_id)
-        if candidate is None:
-            # Do not reveal whether the id belongs to another workspace.
-            raise HTTPException(status_code=404, detail="记忆候选不存在或不属于当前工作区。")
-        source_ids = [str(item) for item in candidate.get("source_ids") or []]
-        if decision == "accept":
-            result = memory.accept_candidate(
-                candidate_id,
-                workspace_id=workspace_id,
-                source_ids=source_ids,
-            )
-            if result is None:
-                raise HTTPException(status_code=404, detail="记忆候选不存在或不属于当前工作区。")
-            status = "accepted"
-        else:
-            if not memory.reject_candidate(candidate_id, workspace_id=workspace_id):
-                raise HTTPException(status_code=404, detail="记忆候选不存在或不属于当前工作区。")
-            result = None
-            status = "rejected"
+        # All UI/job memory mutations acquire this path lock in the same order
+        # (ledger lease first, memory lock second), preventing lost updates.
+        with _memory_lock():
+            memory = _memory()
+            if not isinstance(memory, MemoryStore):
+                raise HTTPException(status_code=503, detail="项目记忆当前不可用。")
 
-        # Candidate review is UI metadata, so use a forward-compatible event
-        # string instead of changing the canonical event schema/reducer.
-        event_type = f"memory.candidate.{status}"
-        event_seq = s.append(
-            Event(
-                idea_id=idea,
-                event_type=event_type,
-                actor=ACTOR_USER,
-                source=ACTOR_USER,
-                payload={
-                    "candidate_id": candidate_id,
-                    "workspace_id": workspace_id,
-                    "source_ids": source_ids,
-                    "note": normalized_note,
-                },
-            )
-        )
+            events = list(_event_list(s, idea))
+            candidate = memory.candidate(candidate_id, workspace_id=workspace_id)
+            if candidate is None:
+                # A completed event makes a retried HTTP request idempotently
+                # successful.  A pending request without a candidate means a
+                # prior mutation/ledger write needs recovery; never claim it
+                # completed.
+                candidate_events = [
+                    event
+                    for event in events
+                    if event.event_type
+                    in {
+                        EVENT_MEMORY_REVIEW_REQUESTED,
+                        EVENT_MEMORY_REVIEW_COMPLETED,
+                        EVENT_MEMORY_REVIEW_FAILED,
+                    }
+                    and str((event.payload or {}).get("candidate_id") or "") == str(candidate_id)
+                    and str((event.payload or {}).get("workspace_id") or "") == workspace_id
+                ]
+                completed = next(
+                    (event for event in reversed(candidate_events)
+                     if event.event_type == EVENT_MEMORY_REVIEW_COMPLETED),
+                    None,
+                )
+                if completed is not None:
+                    payload = completed.payload or {}
+                    return {
+                        "ok": True,
+                        "candidate_id": candidate_id,
+                        "status": str(payload.get("status") or "accepted"),
+                        "workspace": idea,
+                        "workspace_id": workspace_id,
+                        "event": EVENT_MEMORY_REVIEW_COMPLETED,
+                        "event_seq": completed.seq,
+                        "memory": ({"id": str(payload["memory_id"])}
+                                    if payload.get("memory_id") else None),
+                    }
+                requested = next(
+                    (event for event in reversed(candidate_events)
+                     if event.event_type == EVENT_MEMORY_REVIEW_REQUESTED),
+                    None,
+                )
+                if requested is not None:
+                    payload = requested.payload or {}
+                    fingerprint = str(requested.fingerprint or payload.get("fingerprint") or "")
+                    append_failed(
+                        s,
+                        fingerprint=fingerprint,
+                        source_ids=[str(item) for item in payload.get("source_ids") or []],
+                        error_code="candidate_unavailable",
+                        audit_note=str(payload.get("note") or ""),
+                    )
+                    raise HTTPException(status_code=503, detail="记忆审核待恢复，请稍后重试。")
+                # Do not reveal whether the id belongs to another workspace.
+                raise HTTPException(status_code=404, detail="记忆候选不存在或不属于当前工作区。")
+
+            source_ids = [str(item) for item in candidate.get("source_ids") or []]
+            fingerprint = review_fingerprint(candidate)
+            requested = matching_event(events, EVENT_MEMORY_REVIEW_REQUESTED, fingerprint)
+            audit_note = normalized_note
+            if requested is None:
+                try:
+                    s.append(
+                        Event(
+                            idea_id=idea,
+                            event_type=EVENT_MEMORY_REVIEW_REQUESTED,
+                            actor=ACTOR_USER,
+                            source=ACTOR_USER,
+                            payload={
+                                "status": "requested",
+                                "candidate_id": candidate_id,
+                                "workspace_id": workspace_id,
+                                "decision": decision,
+                                "source_ids": source_ids,
+                                "note": normalized_note,
+                                "fingerprint": fingerprint,
+                            },
+                            fingerprint=fingerprint,
+                        )
+                    )
+                except DuplicateFingerprint:
+                    # Re-read the immutable row to preserve the original note
+                    # and make concurrent/retried calls deterministic.
+                    requested = matching_event(
+                        list(_event_list(s, idea)),
+                        EVENT_MEMORY_REVIEW_REQUESTED,
+                        fingerprint,
+                    )
+                except Exception as error:
+                    raise HTTPException(status_code=503, detail="记忆审核记录暂不可写，请稍后重试。") from error
+            if requested is not None:
+                audit_note = str((requested.payload or {}).get("note") or normalized_note)
+
+            status: str
+            result: dict[str, Any] | None
+            try:
+                if decision == "accept":
+                    result = memory.accept_candidate(
+                        candidate_id,
+                        workspace_id=workspace_id,
+                        source_ids=source_ids,
+                    )
+                    if result is None:
+                        raise LookupError("candidate_unavailable")
+                    status = "accepted"
+                else:
+                    if not memory.reject_candidate(candidate_id, workspace_id=workspace_id):
+                        raise LookupError("candidate_unavailable")
+                    result = None
+                    status = "rejected"
+            except Exception as error:  # noqa: BLE001 - stable audit code only
+                append_failed(
+                    s,
+                    fingerprint=fingerprint,
+                    source_ids=source_ids,
+                    error_code="memory_write_error",
+                    audit_note=audit_note,
+                )
+                raise HTTPException(status_code=503, detail="记忆审核未完成，请稍后重试。") from error
+
+            payload = {
+                "status": status,
+                "candidate_id": candidate_id,
+                "workspace_id": workspace_id,
+                "decision": decision,
+                "source_ids": source_ids,
+                "note": audit_note,
+                "fingerprint": fingerprint,
+            }
+            if result is not None and result.get("id"):
+                payload["memory_id"] = str(result["id"])
+            try:
+                event_seq = s.append(
+                    Event(
+                        idea_id=idea,
+                        event_type=EVENT_MEMORY_REVIEW_COMPLETED,
+                        actor=ACTOR_USER,
+                        source=ACTOR_USER,
+                        payload=payload,
+                        fingerprint=fingerprint,
+                    )
+                )
+            except DuplicateFingerprint:
+                completed = matching_event(
+                    list(_event_list(s, idea)),
+                    EVENT_MEMORY_REVIEW_COMPLETED,
+                    fingerprint,
+                )
+                if completed is not None:
+                    event_seq = completed.seq or 0
+                else:
+                    append_failed(
+                        s,
+                        fingerprint=fingerprint,
+                        source_ids=source_ids,
+                        error_code="ledger_error",
+                        audit_note=audit_note,
+                        mutation_applied=True,
+                    )
+                    raise HTTPException(status_code=503, detail="记忆审核记录暂不可写，请稍后重试。")
+            except Exception as error:
+                append_failed(
+                    s,
+                    fingerprint=fingerprint,
+                    source_ids=source_ids,
+                    error_code="ledger_error",
+                    audit_note=audit_note,
+                    mutation_applied=True,
+                )
+                raise HTTPException(status_code=503, detail="记忆审核记录暂不可写，请稍后重试。") from error
     finally:
         s.close()
     return {
@@ -1657,7 +1896,7 @@ def _memory_review(
         "status": status,
         "workspace": idea,
         "workspace_id": workspace_id,
-        "event": event_type,
+        "event": EVENT_MEMORY_REVIEW_COMPLETED,
         "event_seq": event_seq,
         "memory": result,
     }
@@ -2013,17 +2252,34 @@ def _run_chat_sync(
                 "budget_invalid",
             }
         ):
-            # The callback opens a fresh SQLiteStore/MemoryStore in the worker;
-            # queue admission and extraction never delay this response.
-            _MEMORY_EXTRACTION_SCHEDULER.submit(
-                lambda: _run_memory_extraction_job(
-                    idea=idea,
-                    workspace_id=workspace_id,
-                    provider=extraction_provider,
-                    privacy_mode=pm,
-                ),
-                key=f"{idea}:{workspace_id}:{request_id}",
-            )
+            # Prepare and append the request while this turn still owns the
+            # ledger lease.  Queue admission happens only after that durable
+            # boundary, so a crash or full queue leaves resumable work.
+            from .memory.pipeline import MemoryExtractionPipeline
+
+            prepared_request = None
+            try:
+                with _memory_lock():
+                    prepared_request = MemoryExtractionPipeline().prepare(
+                        store=s,
+                        idea_id=idea,
+                        workspace_id=workspace_id,
+                    )
+            except Exception:
+                # The completed chat turn remains successful; an operator can
+                # retry preparation through the explicit resume hook.
+                prepared_request = None
+            if prepared_request is not None:
+                _MEMORY_EXTRACTION_SCHEDULER.submit(
+                    lambda: _run_memory_extraction_job(
+                        idea=idea,
+                        workspace_id=workspace_id,
+                        provider=extraction_provider,
+                        privacy_mode=pm,
+                        prepared_request=prepared_request,
+                    ),
+                    key=f"{idea}:{workspace_id}:{prepared_request.fingerprint}",
+                )
         return reply, res.ask, _summary(s, idea)
     finally:
         if executor is not None:

@@ -12,7 +12,16 @@ from dataclasses import dataclass
 import pytest
 
 import stata_agent.ui as ui
-from stata_agent.events.schema import ACTOR_AGENT, EVENT_IDEA, Event
+from stata_agent.events.schema import (
+    ACTOR_AGENT,
+    EVENT_IDEA,
+    EVENT_MEMORY_REVIEW_COMPLETED,
+    EVENT_MEMORY_REVIEW_FAILED,
+    EVENT_MEMORY_REVIEW_REQUESTED,
+    EVENT_MEMORY_EXTRACTION_NOOP,
+    EVENT_MEMORY_EXTRACTION_REQUESTED,
+    Event,
+)
 from stata_agent.harness.agent_loop import run_loop
 from stata_agent.harness.memory_scheduler import MemoryExtractionScheduler
 from stata_agent.runner import approve
@@ -31,6 +40,18 @@ class _Provider:
         if isinstance(response, BaseException):
             raise response
         return response
+
+
+class _ExtractionProvider:
+    provider = "local"
+
+    def __init__(self, output=()):
+        self.output = output
+        self.calls = []
+
+    def extract(self, request):
+        self.calls.append(request)
+        return self.output(request) if callable(self.output) else self.output
 
 
 def _store(tmp_path):
@@ -354,11 +375,13 @@ def test_memory_candidate_review_is_workspace_isolated_and_ledgered(tmp_path, mo
         events = list(store.scan("ui"))
     finally:
         store.close()
-    assert [event.event_type for event in events[-2:]] == [
-        "memory.candidate.accepted",
-        "memory.candidate.rejected",
+    assert [event.event_type for event in events[-4:]] == [
+        EVENT_MEMORY_REVIEW_REQUESTED,
+        EVENT_MEMORY_REVIEW_COMPLETED,
+        EVENT_MEMORY_REVIEW_REQUESTED,
+        EVENT_MEMORY_REVIEW_COMPLETED,
     ]
-    assert all("provider" not in event.payload for event in events[-2:])
+    assert all("provider" not in event.payload for event in events[-4:])
 
 
 def test_memory_scheduler_shutdown_and_resume_are_bounded():
@@ -371,6 +394,227 @@ def test_memory_scheduler_shutdown_and_resume_are_bounded():
     assert scheduler.submit(lambda: done.set(), key="resumed")
     assert done.wait(1.0)
     scheduler.shutdown(wait=True)
+
+
+def test_prepared_extraction_survives_worker_crash_and_resumes_exactly_once(tmp_path):
+    from stata_agent.memory.memstore import MemoryStore
+    from stata_agent.memory.pipeline import MemoryExtractionPipeline
+
+    ledger = SQLiteStore(str(tmp_path / "ledger.sqlite3"), writer_id="prepare")
+    ledger.append(Event(
+        idea_id="ui",
+        event_type="user.message",
+        actor="user",
+        source="user",
+        payload={"text": "以后默认使用中文回答"},
+    ))
+    pipeline = MemoryExtractionPipeline()
+    request = pipeline.prepare(
+        store=ledger,
+        idea_id="ui",
+        workspace_id="ws-a",
+    )
+    assert request is not None
+    assert len([event for event in ledger.scan("ui")
+                if event.event_type == EVENT_MEMORY_EXTRACTION_REQUESTED]) == 1
+
+    # Simulate a process dying after durable preparation but before the worker
+    # callback starts.  A fresh pipeline reconstructs the exact range.
+    provider = _ExtractionProvider([])
+    memory = MemoryStore(tmp_path / "memory.json", workspace_id="ws-a")
+    result = pipeline.run_once(
+        store=ledger,
+        memory=memory,
+        idea_id="ui",
+        workspace_id="ws-a",
+        provider=provider,
+    )
+    assert result.status == "noop"
+    assert len(provider.calls) == 1
+    events = list(ledger.scan("ui"))
+    assert len([event for event in events if event.event_type == EVENT_MEMORY_EXTRACTION_REQUESTED]) == 1
+    assert len([event for event in events if event.event_type == EVENT_MEMORY_EXTRACTION_NOOP]) == 1
+    ledger.close()
+
+
+def test_ui_prepares_before_queue_and_resume_consumes_request(tmp_path, monkeypatch):
+    monkeypatch.setenv("STATA_AGENT_MEMORY_EXTRACTION", "provider")
+    monkeypatch.setattr(ui, "DEFAULT_DB", tmp_path / "ledger.sqlite3")
+    monkeypatch.setenv("STATA_AGENT_WORKSPACES", str(tmp_path / "workspaces.json"))
+    monkeypatch.setattr(ui, "_executor", lambda _store: None)
+    monkeypatch.setattr(ui, "_rag", lambda: None)
+    monkeypatch.setattr(ui, "_privacy_mode", lambda: "local_strict")
+
+    class HeldScheduler:
+        def __init__(self):
+            self.callbacks = []
+
+        def submit(self, callback, *, key):
+            self.callbacks.append((key, callback))
+            return True
+
+    scheduler = HeldScheduler()
+    monkeypatch.setattr(ui, "_MEMORY_EXTRACTION_SCHEDULER", scheduler)
+
+    class Provider:
+        provider = "local"
+
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, _messages, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs.get("json_mode"):
+                return {"content": json.dumps({"candidates": []})}
+            return {"content": "ok", "tool_calls": None}
+
+    provider = Provider()
+    monkeypatch.setattr(ui, "_provider", lambda: provider)
+    assert ui._run_chat_sync("ui", "以后默认使用中文回答", "interactive")[0] == "ok"
+
+    audit = SQLiteStore(str(ui.DEFAULT_DB), writer_id="audit", takeover=True)
+    try:
+        events = list(audit.scan("ui"))
+    finally:
+        audit.close()
+    assert [event.event_type for event in events].count(EVENT_MEMORY_EXTRACTION_REQUESTED) == 1
+    assert len(scheduler.callbacks) == 1
+
+    # The original callback is held to model a crash before worker start.  A
+    # resume scan queues the durable request, and either callback is harmless
+    # because the terminal fingerprint gates provider I/O.
+    assert ui.resume_memory_extractions("ui") == 1
+    scheduler.callbacks[-1][1]()
+    scheduler.callbacks[0][1]()
+    assert sum(1 for call in provider.calls if call.get("json_mode")) == 1
+    audit = SQLiteStore(str(ui.DEFAULT_DB), writer_id="audit2", takeover=True)
+    try:
+        events = list(audit.scan("ui"))
+    finally:
+        audit.close()
+    assert [event.event_type for event in events].count(EVENT_MEMORY_EXTRACTION_REQUESTED) == 1
+    assert [event.event_type for event in events].count(EVENT_MEMORY_EXTRACTION_NOOP) == 1
+
+
+def test_prepared_request_provider_io_is_exactly_once(tmp_path):
+    from stata_agent.memory.memstore import MemoryStore
+    from stata_agent.memory.pipeline import MemoryExtractionPipeline
+
+    ledger = SQLiteStore(str(tmp_path / "ledger.sqlite3"), writer_id="prepare")
+    ledger.append(Event(
+        idea_id="ui",
+        event_type="user.message",
+        actor="user",
+        source="user",
+        payload={"text": "始终保留中文表头"},
+    ))
+    pipeline = MemoryExtractionPipeline()
+    request = pipeline.prepare(store=ledger, idea_id="ui", workspace_id="ws-a")
+    assert request is not None
+    provider = _ExtractionProvider([])
+    memory = MemoryStore(tmp_path / "memory.json", workspace_id="ws-a")
+    first = pipeline.run_once(
+        store=ledger,
+        memory=memory,
+        idea_id="ui",
+        workspace_id="ws-a",
+        provider=provider,
+        prepared_request=request,
+    )
+    second = pipeline.run_once(
+        store=ledger,
+        memory=memory,
+        idea_id="ui",
+        workspace_id="ws-a",
+        provider=provider,
+    )
+    assert first.status == second.status == "noop"
+    assert first.fingerprint == request.fingerprint == second.fingerprint
+    assert len(provider.calls) == 1
+    assert len([event for event in ledger.scan("ui")
+                if event.event_type == EVENT_MEMORY_EXTRACTION_REQUESTED]) == 1
+    ledger.close()
+
+
+def test_memory_review_ledger_failure_never_returns_success(tmp_path, monkeypatch):
+    from fastapi import HTTPException
+    from stata_agent.memory.memstore import MemoryStore
+
+    monkeypatch.setattr(ui, "DEFAULT_DB", tmp_path / "ledger.sqlite3")
+    monkeypatch.setenv("STATA_AGENT_WORKSPACES", str(tmp_path / "workspaces.json"))
+    memory_path = tmp_path / "memory.json"
+    memory = MemoryStore(memory_path, workspace_id=ui._workspace_id("ui"))
+    candidate = memory.add_candidate("以后默认使用中文", source_ids=["seq:1"])
+    real_store = SQLiteStore(str(ui.DEFAULT_DB), writer_id="review", takeover=True)
+
+    class FailingStore:
+        def append(self, event):
+            if event.event_type == EVENT_MEMORY_REVIEW_COMPLETED:
+                raise OSError("simulated ledger outage")
+            return real_store.append(event)
+
+        def scan(self, *args, **kwargs):
+            return real_store.scan(*args, **kwargs)
+
+        def close(self):
+            real_store.close()
+
+    monkeypatch.setattr(ui, "_store", lambda: FailingStore())
+    monkeypatch.setattr(ui, "_memory", lambda: MemoryStore(memory_path, workspace_id=ui._workspace_id("ui")))
+
+    with pytest.raises(HTTPException) as error:
+        ui._memory_review(candidate["id"], idea="ui", decision="accept", note="确认")
+    assert error.value.status_code == 503
+    audit = SQLiteStore(str(ui.DEFAULT_DB), writer_id="audit", takeover=True)
+    try:
+        events = list(audit.scan("ui"))
+    finally:
+        audit.close()
+    # The injected failure cannot produce a completed event or a successful
+    # API response; the durable failed row makes the state explicit.
+    assert EVENT_MEMORY_REVIEW_COMPLETED not in [event.event_type for event in events]
+    assert [event.event_type for event in events] == [
+        EVENT_MEMORY_REVIEW_REQUESTED,
+        EVENT_MEMORY_REVIEW_FAILED,
+    ]
+    assert events[-1].payload["mutation_applied"] is True
+    audit = SQLiteStore(str(ui.DEFAULT_DB), writer_id="audit2", takeover=True)
+    try:
+        assert all(event.event_type != EVENT_MEMORY_REVIEW_COMPLETED for event in audit.scan("ui"))
+    finally:
+        audit.close()
+
+
+def test_memory_concurrent_add_and_review_preserves_records(tmp_path):
+    from stata_agent.memory.memstore import MemoryStore
+
+    path = tmp_path / "memory.json"
+    initial = MemoryStore(path, workspace_id="ws-a")
+    candidate = initial.add_candidate("始终保留完整日志", workspace_id="ws-a", source_ids=["seq:1"])
+    first = MemoryStore(path, workspace_id="ws-a")
+    second = MemoryStore(path, workspace_id="ws-a")
+    barrier = threading.Barrier(2)
+
+    def add_candidate():
+        barrier.wait()
+        first.add_candidate("以后默认使用中文", workspace_id="ws-a", source_ids=["seq:2"])
+
+    def review_candidate():
+        barrier.wait()
+        assert second.accept_candidate(candidate["id"], workspace_id="ws-a") is not None
+
+    left = threading.Thread(target=add_candidate)
+    right = threading.Thread(target=review_candidate)
+    left.start()
+    right.start()
+    left.join(timeout=2)
+    right.join(timeout=2)
+    assert not left.is_alive() and not right.is_alive()
+    final = MemoryStore(path, workspace_id="ws-a")
+    records = final.all(workspace_id="ws-a", include_candidates=True)
+    assert {record["text"] for record in records} == {"始终保留完整日志", "以后默认使用中文"}
+    assert any(record["status"] == "active" for record in records if record["text"] == "始终保留完整日志")
+    assert any(record["status"] == "candidate" for record in records if record["text"] == "以后默认使用中文")
 
 
 def test_later_overflow_retry_keeps_complete_tool_pair(tmp_path):

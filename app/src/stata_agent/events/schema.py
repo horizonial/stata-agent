@@ -56,6 +56,12 @@ EVENT_MEMORY_EXTRACTION_COMPLETED = "memory.extraction.completed"
 EVENT_MEMORY_EXTRACTION_NOOP = "memory.extraction.noop"
 EVENT_MEMORY_EXTRACTION_FAILED = "memory.extraction.failed"
 EVENT_MEMORY_EXTRACTION_DENIED = "memory.extraction.denied"
+# Candidate review uses a small two-phase audit protocol.  These events are
+# UI metadata and remain reducer-agnostic, but named constants keep clients
+# from depending on ad-hoc strings.
+EVENT_MEMORY_REVIEW_REQUESTED = "memory.candidate.review.requested"
+EVENT_MEMORY_REVIEW_COMPLETED = "memory.candidate.review.completed"
+EVENT_MEMORY_REVIEW_FAILED = "memory.candidate.review.failed"
 # Short aliases mirror the existing ``*_REQ``/``*_DONE`` naming used by
 # callers while the full names remain the canonical public constants.
 EVENT_MEMORY_EXTRACTION_REQ = EVENT_MEMORY_EXTRACTION_REQUESTED
@@ -98,6 +104,9 @@ FINGERPRINT_KINDS = frozenset(
         EVENT_MEMORY_EXTRACTION_NOOP,
         EVENT_MEMORY_EXTRACTION_FAILED,
         EVENT_MEMORY_EXTRACTION_DENIED,
+        EVENT_MEMORY_REVIEW_REQUESTED,
+        EVENT_MEMORY_REVIEW_COMPLETED,
+        EVENT_MEMORY_REVIEW_FAILED,
     }
 )
 

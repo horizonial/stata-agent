@@ -24,7 +24,10 @@ import time
 import unicodedata
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
+from threading import Lock, RLock
 from typing import Any
 
 from ..rag.retriever import tokenize
@@ -67,6 +70,38 @@ SCOPE_PROJECT = "project"
 SCOPE_GLOBAL = "global"
 GLOBAL_WORKSPACE_ID = "global"
 SCHEMA_VERSION = 2
+
+# ``MemoryStore`` instances are intentionally cheap and callers commonly
+# create one per request/worker.  A process-local lock keyed by canonical path
+# keeps those instances from replacing one another's JSON file with a stale
+# snapshot.  Each mutating method reloads while holding this lock, then writes
+# its merged view atomically.  This is deliberately process-local: a shared
+# SQLite/ledger deployment should provide a cross-process writer boundary.
+_MEMORY_PATH_LOCKS: dict[str, Any] = {}
+_MEMORY_PATH_LOCKS_GUARD = Lock()
+
+
+def memory_path_lock(path: str | Path) -> Any:
+    """Return the shared re-entrant lock for one memory JSON path."""
+
+    key = str(Path(path).expanduser().resolve(strict=False)).casefold()
+    with _MEMORY_PATH_LOCKS_GUARD:
+        lock = _MEMORY_PATH_LOCKS.get(key)
+        if lock is None:
+            lock = RLock()
+            _MEMORY_PATH_LOCKS[key] = lock
+        return lock
+
+
+def _locked_mutation(method: Any) -> Any:
+    """Decorate a public mutation with reload-under-shared-lock semantics."""
+
+    @wraps(method)
+    def wrapper(self: "MemoryStore", *args: Any, **kwargs: Any) -> Any:
+        with self._mutation():
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 _SECRET_PATTERNS = (
     re.compile(
@@ -324,6 +359,8 @@ class MemoryStore:
         self._entries: list[dict[str, Any]] = []
         self._candidates: list[dict[str, Any]] = []
         self._needs_migration_save = False
+        self._lock = memory_path_lock(self._path)
+        self._mutation_depth = 0
         self._load()
 
     @property
@@ -464,6 +501,27 @@ class MemoryStore:
 
         return MemoryStore._validate_text(text)
 
+    def _reload(self) -> None:
+        """Refresh this instance while its shared path lock is held."""
+
+        self._entries = []
+        self._candidates = []
+        self._needs_migration_save = False
+        self._load()
+
+    @contextmanager
+    def _mutation(self):
+        """Serialize and merge one logical mutation across store instances."""
+
+        with self._lock:
+            if self._mutation_depth == 0:
+                self._reload()
+            self._mutation_depth += 1
+            try:
+                yield
+            finally:
+                self._mutation_depth -= 1
+
     def _make_record(
         self,
         text: str,
@@ -543,6 +601,7 @@ class MemoryStore:
             target["updated"] = now
 
     # ---------------------------------------------------------------- write
+    @_locked_mutation
     def add(
         self,
         text: str,
@@ -643,6 +702,7 @@ class MemoryStore:
         self._save()
         return _copy_record(entry)
 
+    @_locked_mutation
     def add_candidate(
         self,
         text: str,
@@ -696,6 +756,7 @@ class MemoryStore:
         self._save()
         return _copy_record(entry)
 
+    @_locked_mutation
     def accept_candidate(
         self,
         candidate_id: str,
@@ -731,6 +792,7 @@ class MemoryStore:
         )
         return result
 
+    @_locked_mutation
     def reject_candidate(
         self,
         candidate_id: str,
@@ -753,6 +815,7 @@ class MemoryStore:
         self._save()
         return True
 
+    @_locked_mutation
     def retract(
         self,
         entry_id: str,
@@ -777,6 +840,7 @@ class MemoryStore:
         self._save()
         return _copy_record(entry)
 
+    @_locked_mutation
     def supersede(
         self,
         entry_id: str,
@@ -805,11 +869,13 @@ class MemoryStore:
             now=now,
         )
 
+    @_locked_mutation
     def touch(self, entry_id: str) -> None:
         """Record usage while keeping the legacy ``used`` counter in sync."""
 
         self._touch_ids([entry_id])
 
+    @_locked_mutation
     def _touch_ids(self, entry_ids: Iterable[str], *, now: int | None = None) -> None:
         ids = set(entry_ids)
         if not ids:
@@ -1161,6 +1227,7 @@ class MemoryStore:
         return list(selection.formatted)
 
     # ------------------------------------------------------------- maintenance
+    @_locked_mutation
     def consolidate(
         self,
         *,
@@ -1211,6 +1278,7 @@ class MemoryStore:
             self._save()
         return changed
 
+    @_locked_mutation
     def prune(
         self,
         *,
@@ -1271,6 +1339,7 @@ class MemoryStore:
             self._save()
         return removed
 
+    @_locked_mutation
     def prune_unused(self, min_used: int = 1) -> int:
         """V1 compatibility helper with its original usage-count semantics."""
 

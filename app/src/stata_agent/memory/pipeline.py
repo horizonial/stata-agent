@@ -709,7 +709,196 @@ class MemoryExtractionPipeline:
                 return _result_from_terminal(event, fingerprint)
         return None
 
-    def _append_requested(self, store: Any, request: MemoryExtractionRequest) -> None:
+    @staticmethod
+    def _non_pipeline_events(events: Sequence[Any]) -> list[Any]:
+        """Return source events, excluding this pipeline's audit rows."""
+
+        return [
+            event
+            for event in events
+            if str(getattr(event, "event_type", ""))
+            not in {
+                EVENT_MEMORY_EXTRACTION_REQUESTED,
+                *TERMINAL_EXTRACTION_EVENTS,
+            }
+        ]
+
+    def _request_from_bounds(
+        self,
+        events: Sequence[Any],
+        *,
+        idea_id: str,
+        workspace_id: str,
+        from_seq: int,
+        to_seq: int,
+        prompt_version: str | None = None,
+        expected_fingerprint: str | None = None,
+        expected_source_ids: Sequence[str] | None = None,
+    ) -> MemoryExtractionRequest | None:
+        """Reconstruct a request from its durable sequence range.
+
+        Requested events intentionally carry only source ids/digests, never
+        source text.  On a process restart we can nevertheless reconstruct
+        the exact bounded request from the immutable ledger range.  Returning
+        ``None`` on a mismatch is safer than silently changing the idempotency
+        key or sending a different request to a provider.
+        """
+
+        try:
+            from_value = max(0, int(from_seq))
+            to_value = max(0, int(to_seq))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if to_value < from_value:
+            return None
+        effective_prompt_version = str(prompt_version or self.prompt_version)
+        source_events = self._non_pipeline_events(events)
+        sources, covered_to = self._build_sources(
+            source_events,
+            workspace_id=workspace_id,
+            from_seq=from_value,
+            to_seq=to_value,
+        )
+        request_to = covered_to if sources else to_value
+        if request_to < from_value and from_value > 0:
+            request_to = from_value
+        request = MemoryExtractionRequest(
+            idea_id=idea_id,
+            workspace_id=str(workspace_id),
+            from_seq=from_value,
+            to_seq=request_to,
+            sources=sources,
+            fingerprint=extraction_fingerprint(
+                workspace_id=workspace_id,
+                from_seq=from_value,
+                to_seq=request_to,
+                sources=sources,
+                prompt_version=effective_prompt_version,
+            ),
+            prompt_version=effective_prompt_version,
+        )
+        if expected_fingerprint and request.fingerprint != expected_fingerprint:
+            return None
+        if expected_source_ids is not None:
+            normalized_ids = tuple(str(item) for item in expected_source_ids)
+            if tuple(source.source_id for source in request.sources) != normalized_ids:
+                return None
+        return request
+
+    def _request_from_event(
+        self,
+        event: Any,
+        events: Sequence[Any],
+        *,
+        idea_id: str,
+        workspace_id: str,
+    ) -> MemoryExtractionRequest | None:
+        payload = _event_payload(event)
+        if not _workspace_matches(payload, workspace_id):
+            return None
+        fingerprint = str(getattr(event, "fingerprint", None) or payload.get("fingerprint") or "")
+        if not fingerprint:
+            return None
+        raw_source_ids = payload.get("source_ids", ())
+        source_ids = raw_source_ids if isinstance(raw_source_ids, (list, tuple)) else ()
+        return self._request_from_bounds(
+            events,
+            idea_id=idea_id,
+            workspace_id=workspace_id,
+            from_seq=payload.get("from_seq", 0),
+            to_seq=payload.get("to_seq", 0),
+            prompt_version=str(payload.get("prompt_version") or self.prompt_version),
+            expected_fingerprint=fingerprint,
+            expected_source_ids=source_ids,
+        )
+
+    def _pending_request(
+        self,
+        events: Sequence[Any],
+        *,
+        idea_id: str,
+        workspace_id: str,
+    ) -> MemoryExtractionRequest | None:
+        """Find the newest requested range whose terminal is still absent."""
+
+        terminal_fingerprints = {
+            str(getattr(event, "fingerprint", None) or _event_payload(event).get("fingerprint") or "")
+            for event in events
+            if str(getattr(event, "event_type", "")) in TERMINAL_EXTRACTION_EVENTS
+        }
+        requested = [
+            event
+            for event in events
+            if str(getattr(event, "event_type", "")) == EVENT_MEMORY_EXTRACTION_REQUESTED
+            and _workspace_matches(_event_payload(event), workspace_id)
+        ]
+        for event in reversed(requested):
+            fingerprint = str(getattr(event, "fingerprint", None) or _event_payload(event).get("fingerprint") or "")
+            if not fingerprint or fingerprint in terminal_fingerprints:
+                continue
+            request = self._request_from_event(
+                event,
+                events,
+                idea_id=idea_id,
+                workspace_id=workspace_id,
+            )
+            if request is not None:
+                return request
+        return None
+
+    def _build_request(
+        self,
+        events: Sequence[Any],
+        *,
+        idea_id: str,
+        workspace_id: str,
+        upto_seq: int | None = None,
+    ) -> MemoryExtractionRequest | None:
+        """Build the next request without writing any ledger event."""
+
+        previous = self._latest_terminal(events, workspace_id)
+        non_pipeline = self._non_pipeline_events(events)
+        latest_seq = max((_event_seq(event) for event in non_pipeline), default=0)
+        if upto_seq is not None:
+            try:
+                latest_seq = min(latest_seq, max(0, int(upto_seq)))
+            except (TypeError, ValueError, OverflowError):
+                latest_seq = 0
+        previous_to = self._covered_to_seq(previous) if previous is not None else 0
+        if previous is not None and latest_seq <= previous_to:
+            return None
+
+        from_seq = previous_to + 1 if previous is not None else 1
+        if latest_seq < from_seq:
+            if previous is not None:
+                return None
+            from_seq = latest_seq = 0
+        sources, covered_to = self._build_sources(
+            non_pipeline,
+            workspace_id=workspace_id,
+            from_seq=from_seq,
+            to_seq=latest_seq,
+        )
+        to_seq = covered_to if sources else latest_seq
+        if to_seq < from_seq and from_seq > 0:
+            to_seq = from_seq
+        return MemoryExtractionRequest(
+            idea_id=idea_id,
+            workspace_id=str(workspace_id),
+            from_seq=from_seq,
+            to_seq=to_seq,
+            sources=sources,
+            fingerprint=extraction_fingerprint(
+                workspace_id=workspace_id,
+                from_seq=from_seq,
+                to_seq=to_seq,
+                sources=sources,
+                prompt_version=self.prompt_version,
+            ),
+            prompt_version=self.prompt_version,
+        )
+
+    def _append_requested(self, store: Any, request: MemoryExtractionRequest) -> bool:
         payload = {
             "status": "requested",
             "workspace_id": request.workspace_id,
@@ -721,7 +910,7 @@ class MemoryExtractionPipeline:
             "prompt_version": request.prompt_version,
             "fingerprint": request.fingerprint,
         }
-        _append_event(
+        return _append_event(
             store,
             Event(
                 idea_id=request.idea_id,
@@ -732,6 +921,44 @@ class MemoryExtractionPipeline:
                 fingerprint=request.fingerprint,
             ),
         )
+
+    def prepare(
+        self,
+        *,
+        store: Any,
+        idea_id: str,
+        workspace_id: str,
+        upto_seq: int | None = None,
+    ) -> MemoryExtractionRequest | None:
+        """Durably prepare the next request before a worker is scheduled.
+
+        The returned immutable request may be passed to :meth:`run_once` by a
+        worker.  A requested event is appended before this method returns;
+        queue admission or process crashes therefore cannot lose the work.
+        Repeated preparation is fingerprint-idempotent and reuses any
+        already-requested range.
+        """
+
+        events = self._events(store, idea_id)
+        pending = self._pending_request(
+            events,
+            idea_id=idea_id,
+            workspace_id=workspace_id,
+        )
+        if pending is not None:
+            return pending
+        request = self._build_request(
+            events,
+            idea_id=idea_id,
+            workspace_id=workspace_id,
+            upto_seq=upto_seq,
+        )
+        if request is None:
+            return None
+        if self._find_terminal_by_fingerprint(events, request.fingerprint) is not None:
+            return None
+        self._append_requested(store, request)
+        return request
 
     def _append_terminal(
         self,
@@ -789,8 +1016,16 @@ class MemoryExtractionPipeline:
         provider: MemoryExtractionProvider | None = None,
         privacy_mode: str = LOCAL_STRICT,
         upto_seq: int | None = None,
+        prepared_request: MemoryExtractionRequest | None = None,
     ) -> MemoryExtractionResult:
-        """Run one bounded, idempotent intake attempt."""
+        """Run one bounded, idempotent intake attempt.
+
+        ``prepared_request`` is normally returned by :meth:`prepare` and is
+        intentionally optional for backwards compatibility.  Without it,
+        the newest durable requested event is reconstructed first, allowing a
+        process restart to resume the exact range that was prepared before a
+        worker was admitted.
+        """
 
         try:
             events = self._events(store, idea_id)
@@ -798,55 +1033,37 @@ class MemoryExtractionPipeline:
             return MemoryExtractionResult("failed", (), "", exc.code)
 
         previous = self._latest_terminal(events, workspace_id)
-        non_pipeline = [
-            event
-            for event in events
-            if str(getattr(event, "event_type", ""))
-            not in {
-                EVENT_MEMORY_EXTRACTION_REQUESTED,
-                *TERMINAL_EXTRACTION_EVENTS,
-            }
-        ]
-        latest_seq = max((_event_seq(event) for event in non_pipeline), default=0)
-        if upto_seq is not None:
-            try:
-                latest_seq = min(latest_seq, max(0, int(upto_seq)))
-            except (TypeError, ValueError, OverflowError):
-                latest_seq = 0
-        previous_to = self._covered_to_seq(previous) if previous is not None else 0
-        if previous is not None and latest_seq <= previous_to:
-            return _result_from_terminal(previous, str(getattr(previous, "fingerprint", "") or ""))
+        request: MemoryExtractionRequest | None
+        if prepared_request is not None:
+            if (
+                str(prepared_request.idea_id) != str(idea_id)
+                or str(prepared_request.workspace_id) != str(workspace_id)
+            ):
+                return MemoryExtractionResult("failed", (), prepared_request.fingerprint, "request_mismatch")
+            request = prepared_request
+        else:
+            request = self._pending_request(
+                events,
+                idea_id=idea_id,
+                workspace_id=workspace_id,
+            )
+            if request is None:
+                request = self._build_request(
+                    events,
+                    idea_id=idea_id,
+                    workspace_id=workspace_id,
+                    upto_seq=upto_seq,
+                )
+            if request is None:
+                if previous is not None:
+                    return _result_from_terminal(previous, str(getattr(previous, "fingerprint", "") or ""))
+                # ``_build_request`` returns a zero-range request for an empty
+                # ledger, but retain a defensive error if a future policy
+                # changes that invariant.
+                return MemoryExtractionResult("failed", (), "", "request_unavailable")
 
-        from_seq = previous_to + 1 if previous is not None else 1
-        if latest_seq < from_seq:
-            if previous is not None:
-                return _result_from_terminal(previous, str(getattr(previous, "fingerprint", "") or ""))
-            from_seq = latest_seq = 0
-        sources, covered_to = self._build_sources(
-            non_pipeline,
-            workspace_id=workspace_id,
-            from_seq=from_seq,
-            to_seq=latest_seq,
-        )
-        to_seq = covered_to if sources else latest_seq
-        if to_seq < from_seq and from_seq > 0:
-            to_seq = from_seq
-        fingerprint = extraction_fingerprint(
-            workspace_id=workspace_id,
-            from_seq=from_seq,
-            to_seq=to_seq,
-            sources=sources,
-            prompt_version=self.prompt_version,
-        )
-        request = MemoryExtractionRequest(
-            idea_id=idea_id,
-            workspace_id=str(workspace_id),
-            from_seq=from_seq,
-            to_seq=to_seq,
-            sources=sources,
-            fingerprint=fingerprint,
-            prompt_version=self.prompt_version,
-        )
+        fingerprint = request.fingerprint
+        sources = request.sources
         prior = self._find_terminal_by_fingerprint(events, fingerprint)
         if prior is not None:
             return prior

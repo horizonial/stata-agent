@@ -31,6 +31,12 @@ from pydantic import BaseModel
 
 from .application.chat_service import ChatService, ChatTurnRequest
 from .application.local_task_queue import LocalTaskQueue
+from .application.memory_outbox import (
+    MemoryOutboxClaim,
+    MemoryOutboxDispatcher,
+    MemoryOutboxIntent,
+    SQLiteMemoryOutboxRepository,
+)
 from .application.request_control import RequestControlNotFound, RequestControlRegistry
 from .application.task_queue import TaskQueue, TaskSubmitResult
 from .application.workspace_service import (
@@ -75,6 +81,7 @@ from .privacy.modes import (
 from .providers.mock import MockFixedProvider, MockReplayProvider
 from .runner import approve as runner_approve
 from .storage.sqlite_store import SQLiteStore
+from .storage.store import DuplicateFingerprint
 from .tools.executor import StataExecutor  # noqa: E402  （真 Stata 可选）
 from .tools.fake_executor import FakeExecutor
 from .writer.docx_out import claims_to_docx
@@ -637,6 +644,13 @@ def _memory():
         return None
 
 
+def _memory_outbox_repository() -> SQLiteMemoryOutboxRepository:
+    return SQLiteMemoryOutboxRepository(
+        _store,
+        idea_ids_factory=lambda: [str(row["id"]) for row in _read_workspace_registry()],
+    )
+
+
 def _run_memory_extraction_job(
     *,
     idea: str,
@@ -678,6 +692,69 @@ def _run_memory_extraction_job(
                 store.close()
             except Exception:
                 pass
+
+
+def _run_memory_outbox_claim(claim: MemoryOutboxClaim) -> None:
+    """Run one claimed request using its frozen provider/privacy identity."""
+
+    provider = _provider()
+    if _provider_name(provider) != claim.intent.provider_name:
+        # No terminal event is written.  The dispatcher will release the
+        # lease, allowing a later process with the matching provider to retry.
+        return
+    _, extraction_provider = _feature_adapters(provider, claim.intent.privacy_mode)
+    if extraction_provider is None:
+        return
+    from .memory.pipeline import MemoryExtractionPipeline
+
+    store = _store()
+    try:
+        prepared_request = MemoryExtractionPipeline().request_for_fingerprint(
+            store=store,
+            idea_id=claim.intent.idea_id,
+            workspace_id=claim.intent.workspace_id,
+            fingerprint=claim.intent.fingerprint,
+        )
+    finally:
+        store.close()
+    if prepared_request is None:
+        return
+    _run_memory_extraction_job(
+        idea=claim.intent.idea_id,
+        workspace_id=claim.intent.workspace_id,
+        provider=extraction_provider,
+        privacy_mode=claim.intent.privacy_mode,
+        prepared_request=prepared_request,
+    )
+
+
+def _memory_outbox_terminal(claim: MemoryOutboxClaim) -> bool:
+    """Check the ledger terminal event that authoritatively completes a job."""
+
+    from .memory.pipeline import TERMINAL_EXTRACTION_EVENTS
+
+    store = _store()
+    try:
+        return any(
+            event.event_type in TERMINAL_EXTRACTION_EVENTS
+            and str(event.fingerprint or (event.payload or {}).get("fingerprint") or "")
+            == claim.intent.fingerprint
+            for event in store.scan(claim.intent.idea_id)
+        )
+    except Exception:
+        return False
+    finally:
+        store.close()
+
+
+def _memory_outbox_dispatcher() -> MemoryOutboxDispatcher:
+    return MemoryOutboxDispatcher(
+        _memory_outbox_repository(),
+        _MEMORY_EXTRACTION_SCHEDULER,
+        worker=_run_memory_outbox_claim,
+        terminal_checker=_memory_outbox_terminal,
+        owner=f"ui:{os.getpid()}",
+    )
 
 
 def _submit_memory_extraction_task(
@@ -727,14 +804,23 @@ def _schedule_memory_extraction(
 
 
 def resume_memory_extractions(ws: str | None = None) -> int:
-    """Queue requested jobs that lack a matching terminal event.
-
-    This explicit hook is used by process-resume code and does not run at
-    import time.  It only queues work when the operator has enabled provider
-    extraction; the pipeline itself performs the final fingerprint check.
-    """
+    """Queue requested jobs that lack a matching terminal event."""
 
     from .config import memory_extraction_mode
+
+    if memory_extraction_mode() != "provider":
+        return 0
+    idea = _resolve_workspace(ws) if ws is not None else None
+    try:
+        dispatcher = _memory_outbox_dispatcher()
+        dispatcher.start(idea_id=idea, pump=False)
+        return dispatcher.pump().submitted
+    except AttributeError:
+        # Keep the legacy scan as a compatibility path for an older store
+        # without the outbox capability.  Current SQLiteStore takes the path
+        # above, so new requests never use prepare→enqueue.
+        pass
+
     from .events.schema import (
         EVENT_MEMORY_EXTRACTION_COMPLETED,
         EVENT_MEMORY_EXTRACTION_DENIED,
@@ -743,9 +829,6 @@ def resume_memory_extractions(ws: str | None = None) -> int:
         EVENT_MEMORY_EXTRACTION_REQUESTED,
     )
 
-    if memory_extraction_mode() != "provider":
-        return 0
-    idea = _resolve_workspace(ws) if ws is not None else None
     store = _store()
     try:
         ideas = [idea] if idea is not None else [row["id"] for row in _read_workspace_registry()]
@@ -2195,7 +2278,7 @@ def _chat_context_factory(*, request, store, executor, cancellation, provider):
 
 
 def _chat_post_turn(*, request, store, provider, context, result) -> None:
-    """Persist resumable memory-extraction intent before resources close."""
+    """Atomically append a requested event and its durable outbox intent."""
 
     del context
     privacy = request.privacy_mode or "local_strict"
@@ -2215,25 +2298,46 @@ def _chat_post_turn(*, request, store, provider, context, result) -> None:
     from .memory.pipeline import MemoryExtractionPipeline
 
     try:
-        with _memory_transaction():
-            prepared_request = MemoryExtractionPipeline().prepare(
-                store=store,
-                idea_id=request.idea,
-                workspace_id=request.workspace_id,
-            )
+        pipeline = MemoryExtractionPipeline()
+        prepared_request = pipeline.build_request(
+            store=store,
+            idea_id=request.idea,
+            workspace_id=request.workspace_id,
+        )
+        if prepared_request is None:
+            return
+        intent = MemoryOutboxIntent.from_request(
+            prepared_request,
+            privacy_mode=privacy,
+            provider_name=_provider_name(provider),
+        )
+        requested_event = pipeline.requested_event(
+            prepared_request,
+            privacy_mode=intent.privacy_mode,
+            provider_name=intent.provider_name,
+        )
+        append_with_outbox = getattr(store, "append_with_outbox", None)
+        if not callable(append_with_outbox):
+            # Do not reintroduce the crash window with prepare→enqueue.  A
+            # storage adapter without the atomic primitive can recover this
+            # request only after its capability is upgraded.
+            return
+        append_with_outbox(
+            requested_event,
+            SQLiteMemoryOutboxRepository.to_storage_intent(intent),
+        )
+    except DuplicateFingerprint:
+        # A previous atomic attempt already wrote the requested event and
+        # outbox row.  Pumping below is still safe and fingerprint-idempotent.
+        pass
     except Exception:
         return
-    if prepared_request is not None:
-        _submit_memory_extraction_task(
-            key=f"{request.idea}:{request.workspace_id}:{prepared_request.fingerprint}",
-            callback=lambda: _run_memory_extraction_job(
-                idea=request.idea,
-                workspace_id=request.workspace_id,
-                provider=extraction_provider,
-                privacy_mode=privacy,
-                prepared_request=prepared_request,
-            ),
-        )
+    try:
+        _memory_outbox_dispatcher().pump(limit=1)
+    except Exception:
+        # The outbox row is already durable; a full/closed/unavailable queue
+        # is intentionally left for lifespan/startup recovery.
+        return
 
 
 def _run_chat_sync(

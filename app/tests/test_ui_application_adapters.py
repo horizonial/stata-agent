@@ -9,10 +9,15 @@ from fastapi.testclient import TestClient
 
 import stata_agent.ui as ui
 from stata_agent.application import LocalTaskQueue, RequestControlRegistry
+from stata_agent.application.memory_outbox import MEMORY_EXTRACTION_KIND
 from stata_agent.events.schema import (
+    ACTOR_USER,
     EVENT_MEMORY_EXTRACTION_NOOP,
     EVENT_MEMORY_EXTRACTION_REQUESTED,
+    EVENT_USER,
+    Event,
 )
+from stata_agent.memory.pipeline import MemoryExtractionPipeline
 from stata_agent.memory.memstore import MemoryStore
 from stata_agent.memory.sqlite_repository import SQLiteMemoryRepository
 from stata_agent.storage.sqlite_store import SQLiteStore
@@ -240,3 +245,93 @@ def test_durable_memory_request_survives_queue_full_and_resume(tmp_path, monkeyp
         ledger.close()
     assert [event.event_type for event in events].count(EVENT_MEMORY_EXTRACTION_REQUESTED) == 1
     assert [event.event_type for event in events].count(EVENT_MEMORY_EXTRACTION_NOOP) == 1
+
+
+def test_ui_post_turn_atomically_persists_requested_event_and_outbox(tmp_path, monkeypatch):
+    monkeypatch.setenv("STATA_AGENT_MEMORY_EXTRACTION", "provider")
+    monkeypatch.setattr(ui, "DEFAULT_DB", tmp_path / "ledger.sqlite3")
+    monkeypatch.setenv("STATA_AGENT_WORKSPACES", str(tmp_path / "workspaces.json"))
+    monkeypatch.setattr(ui, "_executor", lambda _store: None)
+    monkeypatch.setattr(ui, "_rag", lambda: None)
+    monkeypatch.setattr(ui, "_privacy_mode", lambda: "local_strict")
+
+    class HeldScheduler:
+        def __init__(self):
+            self.callbacks = []
+
+        def submit(self, key, callback):
+            self.callbacks.append((key, callback))
+            return True
+
+    scheduler = HeldScheduler()
+    monkeypatch.setattr(ui, "_MEMORY_EXTRACTION_SCHEDULER", scheduler)
+
+    class Provider:
+        provider = "local"
+
+        def chat(self, _messages, **kwargs):
+            if kwargs.get("json_mode"):
+                return {"content": json.dumps({"candidates": []})}
+            return {"content": "ok", "tool_calls": None}
+
+    monkeypatch.setattr(ui, "_provider", Provider)
+    assert ui._run_chat_sync("ui", "以后默认使用中文回答", "interactive")[0] == "ok"
+
+    ledger = SQLiteStore(str(ui.DEFAULT_DB), writer_id="audit", takeover=True)
+    events = list(ledger.scan("ui"))
+    requested = next(event for event in events if event.event_type == EVENT_MEMORY_EXTRACTION_REQUESTED)
+    outbox = ledger.get_outbox(idempotency_key=str(requested.fingerprint))
+    assert outbox is not None
+    assert outbox.event_seq == requested.seq
+    assert outbox.task_type == MEMORY_EXTRACTION_KIND
+    assert "text" not in outbox.payload
+    ledger.close()
+
+    assert len(scheduler.callbacks) == 1
+    scheduler.callbacks[0][1]()
+    ledger = SQLiteStore(str(ui.DEFAULT_DB), writer_id="audit-2", takeover=True)
+    try:
+        terminal = [event for event in ledger.scan("ui") if event.event_type == EVENT_MEMORY_EXTRACTION_NOOP]
+        assert len(terminal) == 1
+        assert ledger.get_outbox(idempotency_key=str(requested.fingerprint)).status == "completed"
+    finally:
+        ledger.close()
+
+
+def test_legacy_requested_backfill_freezes_missing_metadata_to_local_strict(tmp_path):
+    database = tmp_path / "ledger.sqlite3"
+    ledger = SQLiteStore(str(database), writer_id="legacy")
+    ledger.append(Event(
+        idea_id="ui",
+        event_type=EVENT_USER,
+        actor=ACTOR_USER,
+        source=ACTOR_USER,
+        payload={"text": "以后默认使用中文回答"},
+    ))
+    request = MemoryExtractionPipeline().prepare(
+        store=ledger,
+        idea_id="ui",
+        workspace_id="workspace-legacy",
+    )
+    assert request is not None
+    ledger.close()
+
+    from stata_agent.application.memory_outbox import SQLiteMemoryOutboxRepository
+
+    adapter = SQLiteMemoryOutboxRepository(
+        lambda: SQLiteStore(str(database), writer_id="backfill", takeover=True),
+    )
+    assert adapter.backfill_outbox_intents(
+        kind=MEMORY_EXTRACTION_KIND,
+        idea_id="ui",
+    ) == 1
+
+    audit = SQLiteStore(str(database), writer_id="audit", takeover=True)
+    try:
+        record = audit.get_outbox(idempotency_key=request.fingerprint)
+        assert record is not None
+        assert record.payload["privacy_mode"] == "local_strict"
+        assert record.payload["provider_name"] == "local"
+        assert "以后默认使用中文回答" not in str(record.payload)
+    finally:
+        audit.close()

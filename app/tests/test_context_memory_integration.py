@@ -481,11 +481,9 @@ def test_ui_prepares_before_queue_and_resume_consumes_request(tmp_path, monkeypa
     assert [event.event_type for event in events].count(EVENT_MEMORY_EXTRACTION_REQUESTED) == 1
     assert len(scheduler.callbacks) == 1
 
-    # The original callback is held to model a crash before worker start.  A
-    # resume scan queues the durable request, and either callback is harmless
-    # because the terminal fingerprint gates provider I/O.
-    assert ui.resume_memory_extractions("ui") == 1
-    scheduler.callbacks[-1][1]()
+    # The original callback owns an unexpired outbox lease.  A resume scan
+    # reconciles the row but does not duplicate an actively leased callback.
+    assert ui.resume_memory_extractions("ui") == 0
     scheduler.callbacks[0][1]()
     assert sum(1 for call in provider.calls if call.get("json_mode")) == 1
     audit = SQLiteStore(str(ui.DEFAULT_DB), writer_id="audit2", takeover=True)

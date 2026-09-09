@@ -799,8 +799,11 @@ class MemoryExtractionPipeline:
         fingerprint = str(getattr(event, "fingerprint", None) or payload.get("fingerprint") or "")
         if not fingerprint:
             return None
-        raw_source_ids = payload.get("source_ids", ())
-        source_ids = raw_source_ids if isinstance(raw_source_ids, (list, tuple)) else ()
+        raw_source_ids = payload.get("source_ids")
+        # Older requested rows did not persist source_ids.  Let the immutable
+        # sequence range rebuild those sources; the fingerprint check below
+        # still rejects any reconstruction that is not byte-for-byte equivalent.
+        source_ids = raw_source_ids if isinstance(raw_source_ids, (list, tuple)) else None
         return self._request_from_bounds(
             events,
             idea_id=idea_id,
@@ -811,6 +814,43 @@ class MemoryExtractionPipeline:
             expected_fingerprint=fingerprint,
             expected_source_ids=source_ids,
         )
+
+    def request_for_fingerprint(
+        self,
+        *,
+        store: Any,
+        idea_id: str,
+        workspace_id: str,
+        fingerprint: str,
+    ) -> MemoryExtractionRequest | None:
+        """Rebuild exactly one requested request identified by its fingerprint.
+
+        A worker claim must never fall back to the newest pending request: a
+        later chat turn may have created a different range while this claim
+        was leased.  Matching the requested row and recomputed fingerprint
+        keeps provider I/O bound to the durable outbox key.
+        """
+
+        expected = str(fingerprint or "").strip()
+        if not expected:
+            return None
+        events = self._events(store, idea_id)
+        for event in reversed(events):
+            if str(getattr(event, "event_type", "")) != EVENT_MEMORY_EXTRACTION_REQUESTED:
+                continue
+            payload = _event_payload(event)
+            event_fingerprint = str(
+                getattr(event, "fingerprint", None) or payload.get("fingerprint") or ""
+            )
+            if event_fingerprint != expected:
+                continue
+            return self._request_from_event(
+                event,
+                events,
+                idea_id=idea_id,
+                workspace_id=workspace_id,
+            )
+        return None
 
     def _pending_request(
         self,
@@ -899,7 +939,23 @@ class MemoryExtractionPipeline:
         )
 
     def _append_requested(self, store: Any, request: MemoryExtractionRequest) -> bool:
-        payload = {
+        return _append_event(store, self.requested_event(request))
+
+    def requested_event(
+        self,
+        request: MemoryExtractionRequest,
+        *,
+        privacy_mode: str | None = None,
+        provider_name: str | None = None,
+    ) -> Event:
+        """Build the audit event used by atomic ledger/outbox preparation.
+
+        The event carries metadata only.  Source text remains reconstructible
+        from the ledger range and is never copied into either requested-event
+        or outbox payloads.
+        """
+
+        payload: dict[str, Any] = {
             "status": "requested",
             "workspace_id": request.workspace_id,
             "from_seq": request.from_seq,
@@ -910,16 +966,17 @@ class MemoryExtractionPipeline:
             "prompt_version": request.prompt_version,
             "fingerprint": request.fingerprint,
         }
-        return _append_event(
-            store,
-            Event(
-                idea_id=request.idea_id,
-                event_type=EVENT_MEMORY_EXTRACTION_REQUESTED,
-                actor=ACTOR_ORCH,
-                source=ACTOR_ORCH,
-                payload=payload,
-                fingerprint=request.fingerprint,
-            ),
+        if privacy_mode is not None:
+            payload["privacy_mode"] = normalize_mode(privacy_mode)
+        if provider_name is not None and str(provider_name).strip():
+            payload["provider_name"] = str(provider_name).strip()[:80]
+        return Event(
+            idea_id=request.idea_id,
+            event_type=EVENT_MEMORY_EXTRACTION_REQUESTED,
+            actor=ACTOR_ORCH,
+            source=ACTOR_ORCH,
+            payload=payload,
+            fingerprint=request.fingerprint,
         )
 
     def prepare(
@@ -937,6 +994,33 @@ class MemoryExtractionPipeline:
         queue admission or process crashes therefore cannot lose the work.
         Repeated preparation is fingerprint-idempotent and reuses any
         already-requested range.
+        """
+
+        request = self.build_request(
+            store=store,
+            idea_id=idea_id,
+            workspace_id=workspace_id,
+            upto_seq=upto_seq,
+        )
+        if request is None:
+            return None
+        self._append_requested(store, request)
+        return request
+
+    def build_request(
+        self,
+        *,
+        store: Any,
+        idea_id: str,
+        workspace_id: str,
+        upto_seq: int | None = None,
+    ) -> MemoryExtractionRequest | None:
+        """Build the next request without writing a ledger row.
+
+        Composition roots use this method when storage can atomically append
+        :meth:`requested_event` together with an outbox intent.  The legacy
+        :meth:`prepare` method remains a convenience for callers that only
+        have an event store.
         """
 
         events = self._events(store, idea_id)
@@ -957,7 +1041,6 @@ class MemoryExtractionPipeline:
             return None
         if self._find_terminal_by_fingerprint(events, request.fingerprint) is not None:
             return None
-        self._append_requested(store, request)
         return request
 
     def _append_terminal(

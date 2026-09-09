@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from ..memory.pipeline import MemoryExtractionRequest
-from ..privacy.modes import PrivacyViolation, normalize_mode
+from ..privacy.modes import LOCAL_STRICT, PrivacyViolation, normalize_mode
 from .task_queue import TaskQueue, TaskSubmitResult, TaskSubmitStatus
 
 
@@ -534,6 +534,245 @@ class FakeMemoryOutboxRepository:
         return True
 
 
+class SQLiteMemoryOutboxRepository:
+    """Adapt the generic application port to the SQLite task-outbox API.
+
+    This adapter is intentionally kept beside the port so the UI composition
+    root only wires factories.  Each operation opens a fresh store session;
+    leased callbacks can therefore complete after the post-turn writer closes.
+    """
+
+    def __init__(
+        self,
+        store_factory: Callable[[], Any],
+        *,
+        idea_ids_factory: Callable[[], list[str]] | None = None,
+    ) -> None:
+        self._store_factory = store_factory
+        self._idea_ids_factory = idea_ids_factory or (lambda: [])
+
+    @staticmethod
+    def to_storage_intent(intent: MemoryOutboxIntent) -> Any:
+        from ..storage.store import OutboxIntent
+
+        return OutboxIntent(
+            idempotency_key=intent.key,
+            task_type=intent.kind,
+            payload=intent.as_payload(),
+        )
+
+    @staticmethod
+    def _close(store: Any) -> None:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    @staticmethod
+    def _frozen_metadata(payload: Mapping[str, Any]) -> tuple[str, str]:
+        mode = payload.get("privacy_mode")
+        provider = payload.get("provider_name") or payload.get("provider")
+        # A legacy request that lacks either half of the freeze must not be
+        # upgraded to a more permissive mode during recovery.
+        if not isinstance(mode, str) or not mode.strip() or not isinstance(provider, str) or not provider.strip():
+            return LOCAL_STRICT, "local"
+        try:
+            return normalize_mode(mode), provider.strip().lower()[:80]
+        except PrivacyViolation:
+            return LOCAL_STRICT, "local"
+
+    @classmethod
+    def _intent_from_payload(
+        cls,
+        *,
+        key: str,
+        task_type: str,
+        payload: Mapping[str, Any],
+    ) -> MemoryOutboxIntent:
+        mode, provider = cls._frozen_metadata(payload)
+        source_ids = payload.get("source_ids")
+        if not isinstance(source_ids, (list, tuple)):
+            source_ids = ()
+        return MemoryOutboxIntent(
+            idea_id=str(payload.get("idea_id") or ""),
+            workspace_id=str(payload.get("workspace_id") or ""),
+            fingerprint=str(payload.get("fingerprint") or key),
+            from_seq=payload.get("from_seq", 0),
+            to_seq=payload.get("to_seq", 0),
+            source_ids=tuple(str(item) for item in source_ids),
+            prompt_version=str(payload.get("prompt_version") or "memory-extraction-v1"),
+            privacy_mode=mode,
+            provider_name=provider,
+            kind=task_type,
+        )
+
+    def ensure_outbox_intent(self, intent: MemoryOutboxIntent) -> bool:
+        store = self._store_factory()
+        try:
+            result = store.enqueue_outbox(self.to_storage_intent(intent))
+            return bool(getattr(result, "accepted", result))
+        finally:
+            self._close(store)
+
+    def backfill_outbox_intents(
+        self,
+        *,
+        kind: str,
+        idea_id: str | None = None,
+    ) -> int:
+        from ..events.schema import (
+            EVENT_MEMORY_EXTRACTION_COMPLETED,
+            EVENT_MEMORY_EXTRACTION_DENIED,
+            EVENT_MEMORY_EXTRACTION_FAILED,
+            EVENT_MEMORY_EXTRACTION_NOOP,
+            EVENT_MEMORY_EXTRACTION_REQUESTED,
+        )
+        from ..memory.pipeline import MemoryExtractionPipeline
+
+        if kind != MEMORY_EXTRACTION_KIND:
+            return 0
+        ideas = [idea_id] if idea_id is not None else list(dict.fromkeys(self._idea_ids_factory()))
+        terminal_types = {
+            EVENT_MEMORY_EXTRACTION_COMPLETED,
+            EVENT_MEMORY_EXTRACTION_DENIED,
+            EVENT_MEMORY_EXTRACTION_FAILED,
+            EVENT_MEMORY_EXTRACTION_NOOP,
+        }
+        pipeline = MemoryExtractionPipeline()
+        store = self._store_factory()
+        try:
+            intents: list[Any] = []
+            for current in dict.fromkeys(str(item) for item in ideas if str(item).strip()):
+                events = list(store.scan(current))
+                terminal = {
+                    str(event.fingerprint or (event.payload or {}).get("fingerprint") or "")
+                    for event in events
+                    if event.event_type in terminal_types
+                }
+                for event in events:
+                    if event.event_type != EVENT_MEMORY_EXTRACTION_REQUESTED:
+                        continue
+                    payload = event.payload or {}
+                    key = str(event.fingerprint or payload.get("fingerprint") or "")
+                    if not key or key in terminal:
+                        continue
+                    workspace_id = str(payload.get("workspace_id") or "")
+                    if not workspace_id:
+                        continue
+                    request = pipeline.request_for_fingerprint(
+                        store=store,
+                        idea_id=current,
+                        workspace_id=workspace_id,
+                        fingerprint=key,
+                    )
+                    if request is None:
+                        continue
+                    mode, provider = self._frozen_metadata(payload)
+                    intents.append(
+                        self.to_storage_intent(
+                            MemoryOutboxIntent.from_request(
+                                request,
+                                privacy_mode=mode,
+                                provider_name=provider,
+                            )
+                        )
+                    )
+            if not intents:
+                return 0
+            results = store.backfill_outbox(intents)
+            return sum(1 for result in results if bool(getattr(result, "accepted", result)))
+        finally:
+            self._close(store)
+
+    def claim(
+        self,
+        kind: str,
+        owner: str,
+        lease_seconds: float,
+        *,
+        limit: int = DEFAULT_OUTBOX_CLAIM_LIMIT,
+    ) -> list[MemoryOutboxClaim]:
+        store = self._store_factory()
+        try:
+            records = store.claim_outbox(
+                str(owner),
+                limit=int(limit),
+                lease_seconds=max(1, int(lease_seconds)),
+            )
+            claims: list[MemoryOutboxClaim] = []
+            for record in records:
+                if record.task_type != kind or not record.lease_token:
+                    if record.lease_token:
+                        try:
+                            store.retry_outbox(record, record.lease_token, error="unsupported_task_type")
+                        except Exception:  # noqa: BLE001 - best-effort release
+                            pass
+                    continue
+                payload = record.payload if isinstance(record.payload, Mapping) else {}
+                try:
+                    intent = self._intent_from_payload(
+                        key=record.idempotency_key,
+                        task_type=record.task_type,
+                        payload=payload,
+                    )
+                    if not intent.idea_id or not intent.workspace_id:
+                        raise ValueError("outbox metadata lacks workspace identity")
+                    claims.append(
+                        MemoryOutboxClaim(
+                            intent=intent,
+                            lease_token=record.lease_token,
+                            owner=str(record.lease_owner or owner),
+                            outbox_id=record.outbox_id,
+                        )
+                    )
+                except (TypeError, ValueError):
+                    try:
+                        store.retry_outbox(record, record.lease_token, error="invalid_outbox_metadata")
+                    except Exception:  # noqa: BLE001 - best-effort release
+                        pass
+            return claims
+        finally:
+            self._close(store)
+
+    def complete(self, kind: str, key: str, lease_token: str) -> bool:
+        store = self._store_factory()
+        try:
+            record = store.get_outbox(idempotency_key=key)
+            if record is None or record.task_type != kind:
+                return False
+            store.complete_outbox(record, lease_token)
+            return True
+        except Exception:  # noqa: BLE001 - stale leases are not acknowledgements
+            return False
+        finally:
+            self._close(store)
+
+    def retry(
+        self,
+        kind: str,
+        key: str,
+        lease_token: str,
+        *,
+        error_code: str,
+        delay_seconds: float = 0.0,
+    ) -> bool:
+        store = self._store_factory()
+        try:
+            record = store.get_outbox(idempotency_key=key)
+            if record is None or record.task_type != kind:
+                return False
+            store.retry_outbox(
+                record,
+                lease_token,
+                error=error_code,
+                delay_seconds=max(0, int(delay_seconds)),
+            )
+            return True
+        except Exception:  # noqa: BLE001 - stale leases are not acknowledgements
+            return False
+        finally:
+            self._close(store)
+
+
 __all__ = [
     "DEFAULT_OUTBOX_CLAIM_LIMIT",
     "DEFAULT_OUTBOX_LEASE_SECONDS",
@@ -546,4 +785,5 @@ __all__ = [
     "MemoryOutboxLeaseError",
     "MemoryOutboxRepository",
     "OutboxDispatchReport",
+    "SQLiteMemoryOutboxRepository",
 ]

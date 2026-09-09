@@ -14,6 +14,7 @@ from .memory_outbox import (
     MemoryOutboxLeaseError,
     MemoryOutboxRepository,
     OutboxDispatchReport,
+    SQLiteMemoryOutboxRepository,
 )
 from .request_control import RequestControlNotFound, RequestControlRegistry
 from .task_queue import (
@@ -57,6 +58,7 @@ __all__ = [
     "MemoryOutboxLeaseError",
     "MemoryOutboxRepository",
     "OutboxDispatchReport",
+    "SQLiteMemoryOutboxRepository",
     "QueueStats",
     "RequestControlNotFound",
     "RequestControlRegistry",

@@ -43,6 +43,7 @@ from .pipeline import (
     validate_extraction_output,
     validate_memory_candidates,
 )
+from .sqlite_store import SQLiteMemoryStore
 
 __all__ = [
     "CONFIDENCE_EXPLICIT",
@@ -81,4 +82,5 @@ __all__ = [
     "extraction_fingerprint",
     "validate_extraction_output",
     "validate_memory_candidates",
+    "SQLiteMemoryStore",
 ]

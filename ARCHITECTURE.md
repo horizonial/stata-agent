@@ -2,6 +2,7 @@
 
 > 用途：给 codex 接手继续开发用的完整交接文档。覆盖：定位、分层架构、关键设计决策、代码地图、事件契约、已完成/遗留、接手清单。
 > 更细的设计在 `design/`（SPEC v0.5 + DD-01…07 + agent-tool-routing.md + rethink-autonomy.md）。
+> 当前实现成熟度、文档权威关系与模块研究顺序见 `design/PROJECT_ARCHITECTURE_AUDIT.md`。
 > 运行环境：Python 3.12 · deepseek(OpenAI 兼容) · 本机 Stata 18 + stata-mcp · SQLite · FastAPI + 原生前端。
 
 ---
@@ -131,8 +132,8 @@ SSE 流式输出 · 多工作区 UI · 有界内容哈希 RAG · 可匹配 Skill
 默认能力或 CI 事实。
 
 **尚未实现或需继续强化**：
-1. **真实环境验收（P0）**：真 Stata 长会话、远端模型隐私边界、断网/重启恢复与独立 wheel Windows UI 仍需发布前人工验证。
-2. **模型代码准确性（P0）**：远端模型仍可能把 reg/检验命令跑偏，需细化 econometrics skill，并让 `verify_result` 对关键数字和模型设定主动复核。
+1. **模型代码准确性（P0）**：真 Stata transport/持久会话发布探针已通过；远端模型仍可能把 reg/检验命令跑偏，需细化 econometrics skill，并让 `verify_result` 对关键数字和模型设定主动复核。
+2. **其余真实环境验收（P0/P1）**：远端模型隐私边界、断网/重启恢复与独立 wheel Windows UI 仍需发布前人工验证。
 3. **Outbox 运维闭环（P1）**：SQLite outbox 已实现原子 intent、claim lease、持续重投、dead-letter 与健康指标；下一步是超长 provider 调用的 lease heartbeat、人工 redrive 和历史任务清理策略。
 4. **附件/图片输入（P1）**：尚未建立上传沙箱、格式嗅探、大小限制、恶意文件测试和 workspace 生命周期清理。
 5. **可观测性/支持（P1）**：需统一 request/operation/outbox correlation，增加结构化日志、错误导出包和真实运行 SLO。
@@ -140,14 +141,14 @@ SSE 流式输出 · 多工作区 UI · 有界内容哈希 RAG · 可匹配 Skill
 7. **自进化 skill（P2）**：`evolve.py` 仍在 staging（promote 需人工），且 `skill_candidate_md` 的旧 variants 格式需对齐新 Skill 语义。
 8. **部署扩展（P3）**：只有出现多进程/多机 worker、任务量或运维隔离需求时，再实现 RQ/Redis adapter；当前 SQLite + 本地队列是桌面单机产品的默认方案。
 
-**2026-09-10 当前离线门禁**：346 collected，342 passed / 4 skipped；Ruff、Mypy、L1–L4 产品评测、77% branch coverage 与 wheel build 均通过。
+**2026-09-10 当前门禁**：368 collected，364 passed / 4 skipped；Ruff、Mypy、L1–L4 产品评测、77% branch coverage 与 wheel build 均通过。真 Stata doctor 20 次持久会话验收通过。
 
 ## 6. 给 codex 的接手清单
 
 1. **先跑通**：`cd app && python -m pytest`（342 过 / 4 skip）；`python -m stata_agent.ui`（8001）看 UI。
 2. **读设计**：`design/agent-tool-routing.md`（意图/工具/Skill 分层，最新方向）+ `design/rethink-autonomy.md`（为什么从"研究驾驶舱"改到"自主 agent"）。
 3. **别破坏的契约**：写权分离（模型不能签 card/claim）· 事件账本 append-only · 隐私门 · 工具 permission/enabled · app.js 不得出现 `innerHTML`（防 XSS）。
-4. **建议下一步**（按发布价值）：① Windows 真 Stata + 真 provider 长会话验收；② econometrics skill/`verify_result`；③ outbox heartbeat/redrive；④ 附件沙箱；⑤ 可观测性与 UX 收口。
+4. **建议下一步**（按发布价值）：① econometrics skill/`verify_result`；② outbox heartbeat/redrive；③ 可观测性与诊断包；④ 附件沙箱；⑤ UX 与发布运维收口。
 5. **外部依赖路径**：stata-mcp 在 `C:\Users\user\stata-mcp`；文献库 `D:\work file\06_学位论文\一区\文献(1)`；key 在 `app/.env`（gitignored）。
 
 ## 7. 关键环境变量（app/.env）

@@ -54,6 +54,131 @@ def test_require_ados_empty_ok(tmp_path):
     assert True
 
 
+class _ProbeResult:
+    def __init__(self, text: str = "", *, is_error: bool = False) -> None:
+        self.text = text
+        self.is_error = is_error
+
+
+class _ProbeSession:
+    results: list[_ProbeResult] | None = None
+    error: BaseException | None = None
+    instances: list["_ProbeSession"] = []
+
+    def __init__(self) -> None:
+        type(self).instances.append(self)
+        self.closed = False
+
+    def run_batch(self, codes: list[str]):
+        del codes
+        if type(self).error is not None:
+            raise type(self).error
+        return list(type(self).results or [])
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_ado_probe_requires_complete_markers_and_closes(monkeypatch):
+    from stata_agent.tools import ado
+
+    _ProbeSession.instances = []
+    _ProbeSession.results = [
+        _ProbeResult("C:/ado/reghdfe.ado"),
+        _ProbeResult("ADOOK_rc=0"),
+        _ProbeResult("command nonsense_xyz_123 not found as either built-in or ado-file", is_error=True),
+        _ProbeResult("ADOOK_rc=0"),
+    ]
+    _ProbeSession.error = None
+    monkeypatch.setattr(ado, "StataSession", _ProbeSession)
+
+    assert ado.which_ados(["reghdfe", "nonsense_xyz_123"]) == {
+        "reghdfe": True,
+        "nonsense_xyz_123": False,
+    }
+    assert _ProbeSession.instances[0].closed is True
+
+
+def test_ado_probe_partial_or_error_response_fails_closed(monkeypatch):
+    from stata_agent.tools import ado
+
+    _ProbeSession.error = None
+    _ProbeSession.results = [_ProbeResult("ADOOK_rc=0")]
+    monkeypatch.setattr(ado, "StataSession", _ProbeSession)
+    with pytest.raises(ado.AdoProbeProtocolError, match="result count"):
+        ado.which_ados(["reghdfe", "ftools"])
+    _ProbeSession.results = [_ProbeResult("C:/ado/reghdfe.ado"), _ProbeResult("ADOOK_rc=0")]
+    assert ado.which_ados(["reghdfe"]) == {"reghdfe": True}
+
+    class ErrorSession(_ProbeSession):
+        def run_batch(self, codes):
+            del codes
+            return [
+                _ProbeResult("MCP returned an error", is_error=True),
+                _ProbeResult("ADOOK_rc=0"),
+            ]
+
+    monkeypatch.setattr(ado, "StataSession", ErrorSession)
+    with pytest.raises(ado.AdoProbeUnavailable):
+        ado.which_ados(["reghdfe"])
+
+
+def test_ado_probe_runtime_failure_never_means_no_missing(monkeypatch):
+    from stata_agent.tools import ado
+
+    class BrokenSession(_ProbeSession):
+        def run_batch(self, codes):
+            del codes
+            raise RuntimeError("session failed to start: license unavailable")
+
+    monkeypatch.setattr(ado, "StataSession", BrokenSession)
+    with pytest.raises(ado.AdoProbeUnavailable):
+        ado.missing_ados(["reghdfe"])
+
+
+def test_ado_probe_rejects_bad_markers_and_duplicate_names(monkeypatch):
+    from stata_agent.tools import ado
+
+    _ProbeSession.error = None
+    _ProbeSession.results = [_ProbeResult("C:/ado/reghdfe.ado"), _ProbeResult("ADOOK_rc=abc")]
+    monkeypatch.setattr(ado, "StataSession", _ProbeSession)
+    with pytest.raises(ado.AdoProbeProtocolError):
+        ado.which_ados(["reghdfe"])
+    with pytest.raises(ado.AdoProbeProtocolError, match="unique"):
+        ado.which_ados(["reghdfe", "reghdfe"])
+
+
+def test_ado_probe_rejects_empty_success_response_and_close_error(monkeypatch):
+    from stata_agent.tools import ado
+
+    class CloseErrorSession(_ProbeSession):
+        def close(self) -> None:
+            self.closed = True
+            raise RuntimeError("cleanup failed")
+
+    _ProbeSession.error = None
+    _ProbeSession.results = [_ProbeResult(""), _ProbeResult("ADOOK_rc=0")]
+    monkeypatch.setattr(ado, "StataSession", CloseErrorSession)
+    with pytest.raises(ado.AdoProbeProtocolError, match="empty which"):
+        ado.which_ados(["reghdfe"])
+    assert _ProbeSession.instances[-1].closed is True
+
+
+def test_ado_probe_rejects_out_of_order_which_responses(monkeypatch):
+    from stata_agent.tools import ado
+
+    _ProbeSession.error = None
+    _ProbeSession.results = [
+        _ProbeResult("C:/ado/ftools.ado"),
+        _ProbeResult("ADOOK_rc=0"),
+        _ProbeResult("C:/ado/reghdfe.ado"),
+        _ProbeResult("ADOOK_rc=0"),
+    ]
+    monkeypatch.setattr(ado, "StataSession", _ProbeSession)
+    with pytest.raises(ado.AdoProbeProtocolError, match="does not identify"):
+        ado.which_ados(["reghdfe", "ftools"])
+
+
 @pytest.mark.skipif(os.environ.get("STATA_LIVE") != "1", reason="需 STATA_LIVE=1")
 def test_missing_ados_live(tmp_path):
     from stata_agent.tools.ado import missing_ados

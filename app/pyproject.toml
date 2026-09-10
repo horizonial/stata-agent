@@ -11,6 +11,7 @@ dependencies = ["pydantic>=2.0"]
 
 [project.scripts]
 stata-agent-eval = "stata_agent.eval.runner:main"
+stata-agent-stata-check = "stata_agent.stata_doctor:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "coverage>=7.6", "ruff>=0.6", "mypy>=1.10", "build>=1.2"]

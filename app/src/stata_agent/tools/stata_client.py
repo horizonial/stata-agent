@@ -13,6 +13,7 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import monotonic
+from typing import TextIO
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -72,12 +73,14 @@ async def _call(
     timeout: float = 180.0,
     cancellation=None,
     cancel_token=None,
+    errlog: TextIO | None = None,
 ) -> CallResult:
     token = cancellation or cancel_token
     if is_cancel_requested(token):
         raise StataCancelledError(cancellation_reason(token), uncertain=False)
     params = server_params()
-    async with stdio_client(params) as (read, write):
+    transport = stdio_client(params) if errlog is None else stdio_client(params, errlog=errlog)
+    async with transport as (read, write):
         async with ClientSession(read, write) as sess:
             await sess.initialize()
             task = asyncio.create_task(sess.call_tool(tool, {"code": code}))
@@ -123,14 +126,37 @@ async def _call(
 class StataClient:
     """同步门面（harness 是同步的；内部 asyncio.run 一次调用）。"""
 
-    def run_code(self, code: str, timeout: float = 180.0, cancellation=None, cancel_token=None) -> CallResult:
+    def __init__(self, *, errlog: TextIO | None = None) -> None:
+        self._errlog = errlog
+
+    def run_code(
+        self,
+        code: str,
+        timeout: float = 180.0,
+        cancellation=None,
+        cancel_token=None,
+        *,
+        errlog: TextIO | None = None,
+    ) -> CallResult:
         return asyncio.run(
-            _call(code, timeout=timeout, cancellation=cancellation, cancel_token=cancel_token)
+            _call(
+                code,
+                timeout=timeout,
+                cancellation=cancellation,
+                cancel_token=cancel_token,
+                errlog=errlog or self._errlog,
+            )
         )
 
-    async def list_tools(self) -> list[str]:
+    async def list_tools(self, *, errlog: TextIO | None = None) -> list[str]:
         params = server_params()
-        async with stdio_client(params) as (read, write):
+        target_errlog = errlog or self._errlog
+        transport = (
+            stdio_client(params)
+            if target_errlog is None
+            else stdio_client(params, errlog=target_errlog)
+        )
+        async with transport as (read, write):
             async with ClientSession(read, write) as sess:
                 await sess.initialize()
                 tools = await sess.list_tools()
@@ -153,8 +179,9 @@ class StataSession:
     逐条单行命令执行。本类在专用线程里跑事件循环 + 常驻 stdio，暴露同步 call()。
     """
 
-    def __init__(self, timeout: float = 180.0):
+    def __init__(self, timeout: float = 180.0, *, errlog: TextIO | None = None):
         self._timeout = timeout
+        self._errlog = errlog
         self._ready = threading.Event()
         self._err: Exception | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -178,7 +205,13 @@ class StataSession:
             self._closed_fut = loop.create_future()
             if self._closing:
                 return
-            async with stdio_client(server_params()) as (read, write):
+            target_errlog = self._errlog
+            transport = (
+                stdio_client(server_params())
+                if target_errlog is None
+                else stdio_client(server_params(), errlog=target_errlog)
+            )
+            async with transport as (read, write):
                 async with ClientSession(read, write) as sess:
                     await sess.initialize()
                     self._session = sess

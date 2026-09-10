@@ -8,8 +8,12 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import runpy
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -147,6 +151,31 @@ def test_eval_module_entrypoint(monkeypatch, capsys) -> None:
     assert output["summary"] == {"total": 1, "passed": 1, "failed": 0}
 
 
+def test_stata_doctor_module_help_entrypoint() -> None:
+    """The module help path is import-safe and never starts stata-mcp."""
+
+    app_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(app_root / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    completed = subprocess.run(
+        [sys.executable, "-m", "stata_agent.stata_doctor", "--help"],
+        cwd=app_root,
+        env=env,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0
+    assert "stata-agent-stata-check" in completed.stdout.decode("utf-8", errors="replace")
+
+
+def test_stata_doctor_console_script_is_declared() -> None:
+    """The wheel-facing console target stays aligned with the module main."""
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    text = pyproject.read_text(encoding="utf-8")
+    assert 'stata-agent-stata-check = "stata_agent.stata_doctor:main"' in text
+
+
 def test_legacy_cli_empty_stdin_closes_store(tmp_path, monkeypatch, capsys) -> None:
     """EOF before the first line still creates and cleanly closes the ledger."""
 
@@ -196,13 +225,14 @@ def test_legacy_cli_mock_script_exhaustion(tmp_path, monkeypatch, capsys) -> Non
 
 
 class _AdoResult:
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, *, is_error: bool = False) -> None:
         self.text = text
+        self.is_error = is_error
 
 
 class _AdoSession:
     instances: list["_AdoSession"] = []
-    response_text = ""
+    responses: list[_AdoResult] = []
     error: BaseException | None = None
 
     def __init__(self) -> None:
@@ -214,7 +244,7 @@ class _AdoSession:
         self.codes = list(codes)
         if type(self).error is not None:
             raise type(self).error
-        return [_AdoResult(type(self).response_text)]
+        return list(type(self).responses)
 
     def close(self) -> None:
         self.closed = True
@@ -224,7 +254,12 @@ def test_ado_success_failure_and_empty_paths(monkeypatch) -> None:
     """Ado probes parse installed/missing statuses and always close sessions."""
 
     _AdoSession.instances = []
-    _AdoSession.response_text = "ADOOK_rc=0\nADOOK_rc=1\n"
+    _AdoSession.responses = [
+        _AdoResult("C:/ado/reghdfe.ado"),
+        _AdoResult("ADOOK_rc=0"),
+        _AdoResult("command ftools not found as either built-in or ado-file", is_error=True),
+        _AdoResult("ADOOK_rc=0"),
+    ]
     _AdoSession.error = None
     monkeypatch.setattr(ado, "StataSession", _AdoSession)
     assert ado.which_ados(["reghdfe", "ftools"]) == {
@@ -235,9 +270,9 @@ def test_ado_success_failure_and_empty_paths(monkeypatch) -> None:
     session = _AdoSession.instances[0]
     assert session.closed is True
     assert session.codes == [
-        "cap which reghdfe",
+        "which reghdfe",
         'di "ADOOK_rc=" _rc',
-        "cap which ftools",
+        "which ftools",
         'di "ADOOK_rc=" _rc',
     ]
 
@@ -250,7 +285,7 @@ def test_ado_transport_failure_still_closes(monkeypatch) -> None:
     """Transport errors are surfaced; cleanup is not swallowed."""
 
     _AdoSession.instances = []
-    _AdoSession.response_text = ""
+    _AdoSession.responses = []
     _AdoSession.error = RuntimeError("transport unavailable")
     monkeypatch.setattr(ado, "StataSession", _AdoSession)
     with pytest.raises(RuntimeError, match="transport unavailable"):

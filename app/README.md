@@ -47,6 +47,23 @@ python -m coverage report
 python -m build --wheel
 ```
 
+真 Stata 发布验收（仅在明确要验证本机运行时时运行；默认测试和产品评测不会启动 Stata）：
+
+```powershell
+# 源码 checkout（在 app/ 下）
+python -m stata_agent.stata_doctor --json --iterations 20
+# 安装 wheel 后的等价入口
+stata-agent-stata-check --json --iterations 20
+```
+
+门禁会依次验证 `stata-mcp` 工具发现、Stata 引擎、同一持久会话、内置
+`auto` 回归和 SQLite 事件链/provenance。`--json` 输出带 `schema_version` 的稳定
+报告；返回码 `0` 表示全部通过，`1` 表示运行时或检查失败，`2` 表示参数/配置错误。
+报告只保留有限的失败码和脱敏诊断，不输出 API key、许可证序列号、完整 stderr、
+用户目录或临时绝对路径。运行前必须安装可用的 Stata 18 与 `stata-mcp`（本机当前
+为 perpetual 授权）；许可证或 MCP 不可用时应修复环境后重跑门禁，不能改用
+`FakeExecutor` 冒充 live 通过。
+
 当前全量 branch coverage 实测为 75%，CI 门槛同样为 75%。
 
 golden 只比较结构化稳定字段，不锁 UUID、时间或绝对路径；源文件位于 `eval_golden/scenarios.json`，wheel 内含一份用于安装后评测的副本。真实 Stata、远端模型和 Windows UI 验收步骤见仓库根目录 `PRODUCTIZATION_PLAN.md` 的“发布门禁与验收清单”。
@@ -56,7 +73,7 @@ golden 只比较结构化稳定字段，不锁 UUID、时间或绝对路径；�
 - 隐私（默认 local_strict，**不自动发远端**）：要真用远端 LLM 须显式授权 `STATA_AGENT_PRIVACY=approved_remote`（或 mixed_sanitized）。UI/命令示例：
   `PYTHONUTF8=1 PYTHONPATH=src STATA_AGENT_PRIVACY=approved_remote DEEPSEEK_API_KEY=sk-… python -m stata_agent.ui`
 - 建议把 key 放 Windows 用户环境变量（`setx DEEPSEEK_API_KEY sk-…`），别明文写进代码/聊天。
-- Stata：`C:\Program Files\Stata18` + stata-mcp 仓库 `C:\Users\user\stata-mcp`（`tools/stata_client.py` 默认指向其 .venv）。
+- Stata：可用的 Stata 18 + `stata-mcp` 仓库；通过 `STATA_MCP_DIR` 指向仓库（其 `.venv` 中需有 MCP Python）。
 - 文献库（RAG）：设置 `STATA_AGENT_LIBRARY`；默认按 `style_only` 摄取，只有显式
   `source_role=citable_evidence` 的索引块可作为证据引用。
 

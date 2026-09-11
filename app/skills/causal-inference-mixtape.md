@@ -218,3 +218,16 @@ or `--quick` to skip the slow one.
 
 `prompts/01-implement-method.md` · `02-robustness-checks.md` ·
 `03-finance-application.md` · `04-statspai-workflow.md`
+
+---
+
+## Structured result verification in the agent
+
+Method selection is not software verification. Before reporting a coefficient,
+declare a schema-version-1 `result_contract` containing the target term,
+estimator (`regress` or `reghdfe`), dependent variable, VCE, cluster variables,
+fixed effects, and required statistics. The executor—not model-authored code—
+extracts coefficients and model metadata; generic `MACHINE_*` markers are not
+evidence. Call `verify_result` and use numeric results only when
+`evidence_ready` is true. Execution success, contract compliance, and causal
+identification validity are separate claims.

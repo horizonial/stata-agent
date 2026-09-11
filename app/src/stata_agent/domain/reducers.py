@@ -252,6 +252,7 @@ def apply(proj: Projection, ev: Event) -> Projection:
             semantic_input_hash=ev.fingerprint or semantic_hash,
             side_effect=side_effect,
             status="running",
+            result_contract=p.get("result_contract"),
         )
         return out
 

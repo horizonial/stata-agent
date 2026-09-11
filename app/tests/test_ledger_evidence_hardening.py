@@ -29,7 +29,7 @@ from stata_agent.harness.recovery import reconcile_uncertain
 from stata_agent.storage.sqlite_store import SQLiteStore
 from stata_agent.storage.store import StaleWrite
 from stata_agent.tools.evidence_signer import sign_run_numeric_cards
-from stata_agent.tools.fake_executor import FakeExecutor
+from stata_agent.tools.fake_executor import FakeExecutor, default_test_contract
 from stata_agent.tools.executor import StataExecutor, TransportUncertainError
 from stata_agent.writer.draft_multi import draft_from_ledger
 
@@ -146,7 +146,7 @@ def test_forged_succeeded_run_cannot_be_signed(tmp_path):
     forged = {"kind": "real", "executor": "other", "attested": True,
               "do_file": "x.do", "command_hash": "h", "env_sig": {"version": "18"}}
     store.append_many(_run_chain(provenance=forged))
-    with pytest.raises(ValueError, match="provenance"):
+    with pytest.raises(ValueError, match="contract|provenance"):
         sign_run_numeric_cards(store, "r1")
     assert store.project("i1").cards == {}
     store.close()
@@ -183,7 +183,7 @@ def test_terminal_run_id_or_attempt_mismatch_is_rejected_without_pollution(tmp_p
 def test_retracted_and_missing_evidence_never_produce_draft(tmp_path):
     store = SQLiteStore(str(tmp_path / "l.db"), writer_id="a")
     fake = FakeExecutor(store)
-    fake.execute("display 1", idea="i1", run_id="r1")
+    fake.execute("display 1", idea="i1", run_id="r1", result_contract=default_test_contract())
     sign_run_numeric_cards(store, "r1", claim_statement="不可再见的结论")
     store.append(Event(
         idea_id="i1", event_type=EVENT_CLAIM_RETRACT, actor=ACTOR_EVIDENCE, source=ACTOR_EVIDENCE,

@@ -45,6 +45,8 @@ class RunRecord(BaseModel):
     status: str = "pending"  # pending|running|succeeded|failed|uncertain|cancelled
     provenance: dict[str, Any] = Field(default_factory=dict)
     machine: dict[str, Any] = Field(default_factory=dict)
+    # Optional so historical run.requested events remain replayable.
+    result_contract: Optional[dict[str, Any]] = None
 
 
 class ResearchState(BaseModel):

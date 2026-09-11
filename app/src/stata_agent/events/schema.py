@@ -46,9 +46,28 @@ EVENT_HEALTH = "health.probe"
 EVENT_BUDGET = "budget.limit"
 EVENT_PRIVACY = "privacy.mode.changed"
 EVENT_FALLBACK = "provider.fallback"
+# Provider lifecycle telemetry is additive operational metadata.  It never
+# participates in the research reducer and never carries prompt/response
+# content; the application projector may use it to explain model turns.
+EVENT_PROVIDER_TURN_STARTED = "provider.turn.started"
+EVENT_PROVIDER_TURN_COMPLETED = "provider.turn.completed"
+EVENT_PROVIDER_TURN_FAILED = "provider.turn.failed"
 EVENT_RESTORED = "system.restored"
 EVENT_ARTIFACT = "artifact.stored"
 EVENT_FILES_DEL = "files.delete_request"
+# Attachment lifecycle events are operational metadata only.  Reducers may
+# safely ignore them; the attachment table in the same SQLite database is the
+# authoritative lifecycle index, while these events preserve an audit trail.
+EVENT_ATTACHMENT_INTAKE_REQUESTED = "attachment.intake.requested"
+EVENT_ATTACHMENT_READY = EVENT_ARTIFACT
+EVENT_ATTACHMENT_QUARANTINED = "attachment.quarantined"
+EVENT_ATTACHMENT_REJECTED = "attachment.rejected"
+EVENT_ATTACHMENT_FAILED = "attachment.failed"
+# Compatibility spellings for adapters that prefer shorter lifecycle names.
+EVENT_ATTACHMENT_REQUESTED = EVENT_ATTACHMENT_INTAKE_REQUESTED
+EVENT_ATTACHMENT_QUARANTINE = EVENT_ATTACHMENT_QUARANTINED
+EVENT_ATTACHMENT_REJECT = EVENT_ATTACHMENT_REJECTED
+EVENT_ATTACHMENT_FAILURE = EVENT_ATTACHMENT_FAILED
 # Optional model-assisted memory intake.  These events are audit metadata only:
 # they never participate in the research reducer and never carry model output.
 EVENT_MEMORY_EXTRACTION_REQUESTED = "memory.extraction.requested"
@@ -107,6 +126,11 @@ FINGERPRINT_KINDS = frozenset(
         EVENT_MEMORY_REVIEW_REQUESTED,
         EVENT_MEMORY_REVIEW_COMPLETED,
         EVENT_MEMORY_REVIEW_FAILED,
+        EVENT_ATTACHMENT_INTAKE_REQUESTED,
+        EVENT_ARTIFACT,
+        EVENT_ATTACHMENT_QUARANTINED,
+        EVENT_ATTACHMENT_REJECTED,
+        EVENT_ATTACHMENT_FAILED,
     }
 )
 

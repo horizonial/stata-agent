@@ -1,4 +1,5 @@
 <!doctype html>
+<!-- Packaged under webui/ so it cannot shadow the stata_agent.ui module. -->
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8">
@@ -44,7 +45,9 @@
       </header>
 
       <div id="refresh-notice" class="refresh-notice" role="status" hidden>
-        状态暂时未更新，页面保留上次成功内容。
+        <span>状态暂时未更新，页面保留上次成功内容。</span>
+        <button class="link-button" type="button" data-action="refresh-state">重试</button>
+        <button class="link-button" type="button" data-action="download-diagnostics">下载诊断包</button>
       </div>
 
       <main class="app-body">
@@ -97,7 +100,7 @@
 
     <div id="decision-overlay" class="overlay" hidden>
       <button class="overlay-backdrop" type="button" data-close-overlay="decision-overlay" aria-label="关闭审批说明"></button>
-      <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="decision-title">
+      <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="decision-title" aria-describedby="decision-description" tabindex="-1">
         <div class="sheet-header">
           <div>
             <div class="eyebrow">研究闸门</div>
@@ -108,8 +111,10 @@
           </button>
         </div>
         <p id="decision-description" class="dialog-description"></p>
-        <label class="dialog-label" for="decision-note">给 Agent 的说明（可选）</label>
-        <textarea id="decision-note" rows="4" maxlength="4000" placeholder="例如：保留城市和年份固定效应，改用滞后一期的解释变量。"></textarea>
+        <label id="decision-note-label" class="dialog-label" for="decision-note">给 Agent 的说明（可选）</label>
+        <textarea id="decision-note" rows="4" maxlength="4000" placeholder="例如：保留城市和年份固定效应，改用滞后一期的解释变量。" aria-describedby="decision-note-error" aria-required="false" aria-invalid="false"></textarea>
+        <p id="decision-note-error" class="dialog-error" role="alert" aria-live="assertive"></p>
+        <p id="decision-status" class="dialog-status" role="status" aria-live="polite"></p>
         <div class="dialog-actions">
           <button id="cancel-decision-button" class="secondary-button" type="button">取消</button>
           <button id="submit-decision-button" class="primary-button" type="button">提交拒绝</button>

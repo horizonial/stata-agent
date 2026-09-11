@@ -36,6 +36,10 @@ from .memstore import (
     SCOPE_PROJECT,
     STATUS_ACTIVE,
     STATUS_CANDIDATE,
+    _format_memory_context,
+    _lifecycle_issues,
+    _memory_relevance,
+    _rank_memory_entry,
 )
 from .sqlite_repository import SQLiteMemoryRepository
 
@@ -203,24 +207,7 @@ class SQLiteMemoryStore(MemoryStore):
         *,
         exact_workspace: bool,
     ) -> tuple[float, int, int, int, int, str]:
-        entry_tokens = tokenize(str(entry.get("text", "")))
-        token_set = set(entry_tokens)
-        overlap = len(query_tokens & token_set)
-        query_text = " ".join(sorted(query_tokens))
-        text_lower = str(entry.get("text", "")).lower()
-        phrase_bonus = 0.25 if query_text and query_text in text_lower else 0.0
-        lexical = overlap / max(len(query_tokens), 1) + phrase_bonus
-        confidence = _confidence_score(str(entry.get("confidence", CONFIDENCE_INFERRED)))
-        used = max(0, _safe_int(entry.get("use_count", entry.get("used", 0))))
-        recency = max(0, _safe_int(entry.get("updated_at", entry.get("updated", 0))))
-        return (
-            lexical,
-            1 if exact_workspace else 0,
-            confidence,
-            used,
-            recency,
-            str(entry.get("id", "")),
-        )
+        return _rank_memory_entry(entry, query_tokens, exact_workspace=exact_workspace)
 
     # ---------------------------------------------------------------- write
     def add(
@@ -494,6 +481,34 @@ class SQLiteMemoryStore(MemoryStore):
                 record = global_candidate
         return _copy_record(record) if record is not None else None
 
+    def lifecycle_issues(
+        self,
+        *,
+        workspace_id: str | Path | None = None,
+        workspace: str | Path | None = None,
+    ) -> tuple[str, ...]:
+        """Return structural issues in explicit supersede links."""
+
+        explicit_workspace = self._workspace_explicit(workspace_id, workspace)
+        records = self._repository.all(
+            workspace_id=workspace_id,
+            workspace=workspace,
+            include_candidates=False,
+            include_global=not explicit_workspace,
+            include_inactive=True,
+        )
+        return _lifecycle_issues(records)
+
+    def validate_lifecycle(
+        self,
+        *,
+        workspace_id: str | Path | None = None,
+        workspace: str | Path | None = None,
+    ) -> None:
+        issues = self.lifecycle_issues(workspace_id=workspace_id, workspace=workspace)
+        if issues:
+            raise MemoryCandidateRejected("memory_lifecycle_invalid:" + ",".join(issues))
+
     def search(
         self,
         query: str | None,
@@ -505,6 +520,7 @@ class SQLiteMemoryStore(MemoryStore):
         include_global: bool | None = None,
         include_inactive: bool = False,
         now: int | None = None,
+        min_relevance: float = 0.0,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
@@ -514,6 +530,7 @@ class SQLiteMemoryStore(MemoryStore):
         allow_global = bool(include_global) if include_global is not None else False
         kind_set = self._kind_set(kinds)
         now_value = _now() if now is None else _safe_int(now, _now())
+        relevance_floor = max(0.0, min(1.0, float(min_relevance)))
         records = self._repository.list_records(
             workspace_id=current_workspace,
             include_global=allow_global,
@@ -536,8 +553,8 @@ class SQLiteMemoryStore(MemoryStore):
             if not visible:
                 continue
             if query_tokens:
-                entry_tokens = set(tokenize(str(record.get("text", ""))))
-                if not query_tokens & entry_tokens:
+                relevance = _memory_relevance(record, query_tokens)
+                if relevance <= 0.0 or relevance < relevance_floor:
                     continue
             exact = record.get("scope") != SCOPE_GLOBAL and record.get("workspace_id") == current_workspace
             ranked.append((self._rank(record, query_tokens, exact_workspace=exact), record))
@@ -561,6 +578,8 @@ class SQLiteMemoryStore(MemoryStore):
         include_global: bool | None = None,
         touch: bool = True,
         now: int | None = None,
+        min_relevance: float = 0.0,
+        whole_items: bool = False,
     ) -> MemoryContextSelection:
         if max_items is not None:
             limit = int(max_items)
@@ -577,14 +596,19 @@ class SQLiteMemoryStore(MemoryStore):
         if max_chars_value <= 0:
             return MemoryContextSelection([], [], estimated_tokens=0)
 
+        # Whole-item mode may skip an over-cap high-ranked record. Fetch a
+        # small bounded candidate window so a fitting lower-ranked memory can
+        # still be selected without exposing an unbounded scan to callers.
+        search_limit = max(limit, 32) if whole_items else max(limit, 1)
         records = self.search(
             query,
-            limit=max(limit, 1),
+            limit=search_limit,
             workspace_id=workspace_id,
             workspace=workspace,
             kinds=kinds,
             include_global=include_global,
             now=now,
+            min_relevance=min_relevance,
         )
         formatted: list[str] = []
         selected: list[dict[str, Any]] = []
@@ -593,16 +617,14 @@ class SQLiteMemoryStore(MemoryStore):
         was_truncated = False
         for record in records:
             source_ids = record.get("source_ids") or []
-            source_text = ", ".join(str(source) for source in source_ids) if source_ids else "unspecified"
-            line = (
-                f"[memory/{record.get('kind', KIND_PREFERENCE)}; working knowledge, not evidence] "
-                f"{record.get('text', '')} (provenance: {source_text})"
-            )
+            line = _format_memory_context(record)
             separator_chars = 1 if formatted else 0
             remaining = max_chars_value - consumed_chars - separator_chars
             if remaining <= 0:
                 break
             if len(line) > remaining:
+                if whole_items:
+                    continue
                 line = line[:remaining]
                 was_truncated = True
                 if line:

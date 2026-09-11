@@ -8,10 +8,11 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
+from collections.abc import Mapping
 
 from docx import Document
 
-from ..domain.models import Claim
+from ..domain.models import Claim, EvidenceCard
 
 
 def claims_to_docx(
@@ -41,10 +42,21 @@ def save_docx(buf: BytesIO, path: str | Path) -> Path:
     return p
 
 
-def tables_to_docx(title: str, tables: list) -> BytesIO:
-    """把一组 TableModel 渲染成 .docx（含表头与行）。"""
+def tables_to_docx(
+    title: str,
+    tables: list,
+    *,
+    cards: Mapping[str, EvidenceCard] | None = None,
+) -> BytesIO:
+    """把一组 TableModel 渲染成 .docx（含表头与行）。
+
+    ``cards`` is optional for compatibility with the legacy helper.  Product
+    callers pass the projection card map, which enables exact card/value
+    validation before any DOCX bytes are emitted.
+    """
     from .table import add_table_to_doc
     from .table import numeric_cells
+    from .table import validate_cells
 
     doc = Document()
     doc.add_heading(title, level=0)
@@ -52,6 +64,14 @@ def tables_to_docx(title: str, tables: list) -> BytesIO:
         missing = [cell.text for _ri, _ci, cell in numeric_cells(model) if not cell.card_id]
         if missing:
             raise ValueError(f"数字表格缺 EvidenceCard provenance: {missing[:5]}")
+        if cards is not None:
+            invalid = validate_cells(
+                model,
+                list(cards.values()),
+                require_card_ids=True,
+            )
+            if invalid:
+                raise ValueError(f"数字表格 EvidenceCard 不匹配: {invalid[:5]}")
         add_table_to_doc(doc, model, title_heading=True)
     buf = BytesIO()
     doc.save(buf)

@@ -60,6 +60,7 @@ def test_qwen_profile_and_registry(monkeypatch):
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
     monkeypatch.delenv("STATA_AGENT_PRIVACY", raising=False)
+    monkeypatch.delenv("STATA_AGENT_LIVE", raising=False)
     with pytest.raises(MissingApiKey):
         default_provider()                      # 无 key
     monkeypatch.setenv("DASHSCOPE_API_KEY", "x")
@@ -68,4 +69,5 @@ def test_qwen_profile_and_registry(monkeypatch):
         default_provider()
     # 显式授权 approved_remote 后才用远端
     monkeypatch.setenv("STATA_AGENT_PRIVACY", "approved_remote")
+    monkeypatch.setenv("STATA_AGENT_LIVE", "1")
     assert default_provider().provider == "qwen"

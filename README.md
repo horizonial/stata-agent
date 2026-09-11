@@ -20,7 +20,7 @@
 | 形态 | **单 agent 循环起步**，预留多 agent | 先证明单 agent 出东西；多 agent 为解"上下文打架" |
 | 编排 | **确定性阶段状态机 + 阶段内受约束单 agent**（v0.4） | 状态迁移只归编排器；多 agent 需评测证明才启用 |
 | 终点 | idea→数据→实证→稳健性/机制/异质性→**实证部分初稿** | 引言可浅，方法+结果+解读完整 |
-| 大脑 | **LLM 聚合层**，provider 可扩展，先 **deepseek** | 按能力画像+契约测试编程，不按模型名；换模型只改配置 |
+| 大脑 | **LLM 聚合层**，provider 可扩展，目录提供多家 OpenAI-compatible 模型 | 按能力画像+契约测试编程，不按模型名；换模型只改配置 |
 | 交互/UI | 强交互 + 聊天 UI（**后置**）；可打断可自动 | 人工确认 = 持久化 approval 事件，不只聊天文本 |
 | trace | **结构化全链路**（decision_summary/action/tool_result/结论），UI 可回放；**不存思维链**（v0.4） | 信任+调试+续跑；可解释性靠"为何选它"不靠回放 CoT |
 | 状态 | **SQLite events 表（append-only）= 唯一事实源** + 物化视图（v0.4） | jsonl 仅导出；唯一真相源、可回放续跑 |
@@ -73,7 +73,7 @@ RAG 内部: Retriever(混合: 向量+grep/BM25+可选 rerank) → VectorDB(Chrom
    ↓
 事件账本 SQLite(events append-only+物化视图+快照)   遥测 OTel→现成后端
    ↓
-LLM 聚合: ModelCapabilityProfile + provider 接口(deepseek 起步+mock); 隐私三档门(local_strict/approved_remote/mixed)
+LLM 聚合: ModelCapabilityProfile + 闭合 provider/model 目录 + provider 接口(OpenAI-compatible 起步、历史 provider 兼容、mock); 隐私三档门(local_strict/approved_remote/mixed)
 ```
 
 ## 5. 一个 idea 的工作流（见 SPEC §2，跑在阶段状态机上）
@@ -84,7 +84,7 @@ LLM 聚合: ModelCapabilityProfile + provider 接口(deepseek 起步+mock); 隐�
 
 ## 6. 路线（给 codex/新 session 的切法，v0.4 合并 P1/P2，见 SPEC §5）
 
-- **M0 骨架**：阶段状态机(最小) + PydanticAI 协议层 + LLM 聚合(deepseek+mock) + **SQLite events 表(schema/版本/幂等骨架)** + 物化视图 + 工作区脚手架 + CLI 对话（一句一问、都进表、不存思维链）
+- **M0 骨架**：阶段状态机(最小) + PydanticAI 协议层 + LLM 聚合(目录 provider+mock) + **SQLite events 表(schema/版本/幂等骨架)** + 物化视图 + 工作区脚手架 + CLI 对话（一句一问、都进表、不存思维链）
 - **M1 可行性**：file_reader + 双 RAG 落库(摄取版本链/稳定 chunk_id/source_role) + 混合检索 + 50–100 条 gold set 消融 + 对话式可行性 + **隐私三档默认 local_strict** + OTel 埋点；验收=真实 idea 跑通
 - **M2 实证**：连 stata-mcp + 策略映射/错误分类 + skills(先 panel_did) + approval 门控事件 + **恢复协议(幂等+未决副作用核对)**；验收=复现 1–2 篇基准主表
 - **M3 初稿**：EvidenceBundle + writer + validator + Word/rtf + 顶刊文风(style_only 隔离)；验收=对抗注入 validator 全抓 + 复现集扩 ≥3 篇异质，跑 L0–L3
@@ -109,12 +109,35 @@ v0.4 已关闭：ledger.jsonl vs SQLite 冲突、thought 持久化、本地隐�
 - `design/dd-07-rag-skills.md` —— 详细设计 07：文献管线 + skill 规范（双库摄取版本链/抽取 QA/OCR 接线、混合检索+rerank、citable 纪律、skill 文件 schema 与激活 preflight）
 - `design/audit-stata-practice.md` —— Stata 实证需求审计（2026-09-07）：prep/pipeline、env_sig、表语义 locator、图证据、门控探索环、联网/图片能力决策（S1 已修入 DD-01，S2 修入 DD-02/SPEC）
 - `design/golden-replication-registry.md` —— Golden 复现论文注册表（eval L3 用，草稿）：CK1994/AL1999/NSW 起步三篇 + ADH held-out，含数据源/遮蔽数字/容差登记模板
-- `design/impl-plan.md` —— **落实规划**（切片 0–5、代码布局、当场默认值表、切片 0 详单与验收）；审后据此写码
+- `IMPLEMENTATION_PLAN.md` —— **唯一当前实施计划**（含优先级、当前 Objective、任务与验收）；历史设计文档不再单独决定“下一步”
 - `design/ui-requirements-codex.md` —— **UI 需求**（给 codex 做界面/交互设计，我据此写码；契约：只读物化视图+发消息）
 - `research/PROMPT_codex_research.md` —— 交给 codex 的深度调研任务书
 - `research/codex_report.md` —— codex 调研交付报告（2026-09-03，SPEC v0.4 的修订依据，从 docx 转存）
 - `research/borrow_from_coding_agents.md` —— 借鉴引入笔记（2026-09-07，从 pi/codex/claude-code/claw-code 学习册提取可借鉴项 → SPEC 映射 + codex 记忆系统复查；v0.5 候选清单见其 §6）
 - MCP 执行层：`C:\Users\user\stata-mcp`（DESIGN.md 记录 7 轮审计；README 中英优劣势）
+
+## 9. 应用设置中心（V1）
+
+Windows 单机用户可从 UI 的“应用设置”配置模型、隐私、Stata、文献库、附件默认角色、
+压缩/记忆和上下文预算；“当前研究”页面仍是由 SQLite 账本驱动的只读投影。非秘密设置按
+`default < .env < 用户设置 < 显式进程环境` 合并，显式环境变量只读且不会产生 shadow value；
+`.env` 仅作兼容输入，设置中心不会改写它。API key 通过 Windows Credential Manager 管理，
+页面只显示是否已配置，不能回显或写入 settings JSON、SQLite、日志或浏览器存储。
+
+模型选择来自服务端的闭合 provider/model 目录，而不是把页面写死为 DeepSeek/Qwen，也不接受
+任意自由文本模型名。当前目录包含多个经过能力画像登记的 OpenAI-compatible provider；每个模型
+必须先有 `ModelCapabilityProfile` 和契约测试，才会出现在下拉框。凭据区域只有一个通用 provider
+选择器，用户可针对目录中的任一 provider 在页面填写、替换或删除凭据；显式环境变量仍按安全契约
+锁定为只读。
+
+设置保存使用 revision/锁和原子替换；主题等 UI 偏好即时生效，运行参数从下一请求生效，
+端口、MCP 和目录类设置显示“需重启”。设置页可运行有界 provider/Stata/library 检查，
+并创建或验证备份；恢复仍是离线运维动作，不提供热迁移/热恢复。关于页显示安全版本和
+“永久授权”的本机状态，不显示许可证序列号或 machine ID。
+
+Agent 预算按单次提交计算，并非整段对话只能聊固定次数：普通消息默认最多 16 个内部模型回合，
+目标任务默认 64 个，下一条消息会重新计数；顶层工具调用默认最多 128 次。若本次已经调用工具，
+最后一个模型回合只负责汇总工具结果。这三个上限可在“Agent、记忆与上下文”中调整并从下一请求生效。
 
 模型辅助摘要与记忆提取默认关闭。可显式设置 `STATA_AGENT_COMPACTION_SUMMARY=provider`
 在溢出压缩时复用当前 provider，或设置 `STATA_AGENT_MEMORY_EXTRACTION=provider`

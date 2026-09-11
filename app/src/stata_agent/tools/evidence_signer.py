@@ -7,10 +7,7 @@ DD-01 §2.6/§2.7 + SPEC N11：模型只能提议；EvidenceCard 只能由 valid
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
-from pathlib import Path
 
 from ..domain.models import Claim, EvidenceCard
 from ..events.schema import (
@@ -21,10 +18,20 @@ from ..events.schema import (
     Event,
 )
 from ..storage.sqlite_store import SQLiteStore
+from .result_verifier import (
+    canonical_machine_hash,
+    trusted_provenance_kind,
+    verify_run_record,
+)
 
 
-def _sha(obj) -> str:
-    return hashlib.sha256(json.dumps(obj, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+class VerificationError(ValueError):
+    """A deterministic verification gate rejected evidence signing."""
+
+    def __init__(self, message: str, *, code: str = "verification_failed", report=None):
+        self.code = code
+        self.report = report
+        super().__init__(message)
 
 
 def _trusted_provenance(provenance: dict) -> str:
@@ -36,32 +43,10 @@ def _trusted_provenance(provenance: dict) -> str:
     FakeExecutor is accepted only as an explicitly test-only backend so the
     offline test suite can exercise the full chain; it is never labelled real.
     """
-    if not isinstance(provenance, dict):
-        raise ValueError("run provenance 缺失或格式错误，拒绝签证据")
-    kind = provenance.get("kind")
-    executor = provenance.get("executor")
-    env_sig = provenance.get("env_sig")
-    if not isinstance(provenance.get("command_hash"), str) or not provenance["command_hash"]:
-        raise ValueError("run provenance 缺 command_hash，拒绝签证据")
-    if not isinstance(provenance.get("do_file"), str) or not provenance["do_file"]:
-        raise ValueError("run provenance 缺 do_file，拒绝签证据")
-    if "data_signature" not in provenance:
-        raise ValueError("run provenance 缺 data_signature，拒绝签证据")
-    if not isinstance(env_sig, dict) or not env_sig:
-        raise ValueError("run provenance 缺 env_sig，拒绝签证据")
-    if kind == "real":
-        if executor != "stata-mcp" or provenance.get("attested") is not True:
-            raise ValueError("run provenance 未通过 Stata executor attestation，拒绝签证据")
-        if not {"stata_version", "stata_flavor"}.issubset(env_sig):
-            raise ValueError("run provenance env_sig 不完整，拒绝签证据")
-        if not Path(provenance["do_file"]).is_file():
-            raise ValueError("run provenance do_file 不存在，拒绝签证据")
-        return "real"
-    if kind == "test":
-        if executor != "fake" or provenance.get("test_only") is not True:
-            raise ValueError("test provenance 必须明确 executor=fake/test_only=true")
-        return "test"
-    raise ValueError("run provenance kind 未知或不可信，拒绝签证据")
+    try:
+        return trusted_provenance_kind(provenance)
+    except ValueError as error:
+        raise VerificationError(str(error), code=str(error)) from error
 
 
 def validate_run_provenance(provenance: dict) -> str:
@@ -75,6 +60,7 @@ def sign_run_numeric_cards(
     *,
     idea: str = "i1",
     claim_statement: str | None = None,
+    correlation_id: str | None = None,
 ) -> list[str]:
     """对一次 succeeded run 的机器层逐值签 numeric EvidenceCard；可选再合成一条 Claim。
 
@@ -86,10 +72,17 @@ def sign_run_numeric_cards(
         raise ValueError(f"run 不存在: {run_id}")
     if rec.status != "succeeded":
         raise ValueError(f"run 未成功(status={rec.status})：不许对失败结果签证据")
+    report = verify_run_record(rec)
+    if not report.evidence_ready:
+        failed = next((item for item in report.checks if not item.passed), None)
+        code = failed.code if failed is not None else "verification_failed"
+        raise VerificationError(
+            f"run 未通过结果合同验证：{code}",
+            code=code,
+            report=report,
+        )
     provenance = rec.provenance or {}
     provenance_kind = _trusted_provenance(provenance)
-    if rec.semantic_input_hash and provenance.get("command_hash") != rec.semantic_input_hash:
-        raise ValueError("run provenance command_hash 与 requested input 不一致，拒绝签证据")
     machine = rec.machine or {}
     numeric = {
         k: v for k, v in machine.items()
@@ -100,7 +93,10 @@ def sign_run_numeric_cards(
 
     cards: list[str] = []
     all_cards: list[str] = []
-    machine_hash = _sha(machine)
+    machine_hash = canonical_machine_hash(machine)
+    contract_hash = report.contract_hash
+    contract = rec.result_contract or {}
+    target_term = contract.get("target_term") if isinstance(contract, dict) else None
     existing = set(proj.cards)
     for stat_type, value in numeric.items():
         card_id = f"card-{run_id}-{stat_type}"
@@ -111,7 +107,10 @@ def sign_run_numeric_cards(
             card_id=card_id,
             kind="numeric",
             locator={"run_id": run_id, "stat_type": stat_type,
-                     "provenance_kind": provenance_kind},
+                     "provenance_kind": provenance_kind,
+                     "target_term": target_term,
+                     "contract_hash": contract_hash,
+                     "verification_schema_version": report.schema_version},
             value={"value": value},
             machine_hash=machine_hash,
             signed_by=ACTOR_VALIDATOR,
@@ -119,6 +118,7 @@ def sign_run_numeric_cards(
         store.append(Event(
             idea_id=idea, event_type=EVENT_CARD_SIGNED, actor=ACTOR_VALIDATOR,
             source=ACTOR_VALIDATOR,
+            correlation_id=correlation_id,
             payload={"card": card.model_dump()},
         ))
         cards.append(card.card_id)
@@ -131,6 +131,7 @@ def sign_run_numeric_cards(
         store.append(Event(
             idea_id=idea, event_type=EVENT_CLAIM_SIGNED, actor=ACTOR_EVIDENCE,
             source=ACTOR_EVIDENCE,
+            correlation_id=correlation_id,
             payload={"claim": claim.model_dump()},
         ))
     return cards

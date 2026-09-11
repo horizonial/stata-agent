@@ -22,6 +22,16 @@ class MockReplayProvider:
         self._i += 1
         return prop
 
+    def chat(self, messages: list[dict], **kwargs) -> dict:
+        """Expose the modern chat surface without changing replay semantics.
+
+        Legacy proposal actions are deliberately rendered as deterministic
+        text instead of being reinterpreted as tool calls.  Tool execution is
+        owned by the modern agent loop and requires its native tool schema.
+        """
+        del messages, kwargs
+        return _proposal_as_chat_response(self.propose(""))
+
     @property
     def consumed(self) -> int:
         return self._i
@@ -35,6 +45,17 @@ class MockFixedProvider:
 
     def propose(self, context: str) -> ActionProposal:
         return self._proposal
+
+    def chat(self, messages: list[dict], **kwargs) -> dict:
+        """Return the fixed proposal through the modern chat protocol."""
+        del messages, kwargs
+        return _proposal_as_chat_response(self._proposal)
+
+
+def _proposal_as_chat_response(proposal: ActionProposal) -> dict:
+    """Render a legacy proposal safely for chat-only offline operation."""
+    content = proposal.ask_user or proposal.decision_summary
+    return {"content": content, "tool_calls": []}
 
 
 def ask_question(question: str, reason: str = "") -> ActionProposal:

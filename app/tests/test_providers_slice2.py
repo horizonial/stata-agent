@@ -14,7 +14,7 @@ from stata_agent.providers.contract import check_all, run_checks
 from stata_agent.providers.deepseek import DeepSeekProvider, MissingApiKey, StreamProtocolError
 from stata_agent.providers.fake import FakeChat
 from stata_agent.providers.llm import chat_proposal
-from stata_agent.providers.mock import MockFixedProvider
+from stata_agent.providers.mock import MockFixedProvider, MockReplayProvider
 
 
 def test_deepseek_profile_fields_and_meets():
@@ -63,8 +63,9 @@ def test_chat_structured_raises_after_retries():
 
 def test_deepseek_missing_key_raises(monkeypatch):
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
-    with pytest.raises(MissingApiKey):
+    with pytest.raises(MissingApiKey) as raised:
         DeepSeekProvider(api_key=None)
+    assert raised.value.code == "credentials_missing"
 
 
 def test_unknown_privacy_mode_is_fail_closed(monkeypatch):
@@ -115,6 +116,21 @@ def test_contract_checks_on_mock():
     res = run_checks(prov)
     assert all(res.values()), res
     check_all(prov)  # 不抛
+
+
+def test_legacy_mock_providers_support_modern_chat_without_fabricating_tools():
+    fixed = MockFixedProvider(ActionProposal(decision_summary="记录", ask_user="请配置模型"))
+    assert fixed.chat([{"role": "user", "content": "你好"}], tools=[]) == {
+        "content": "请配置模型",
+        "tool_calls": [],
+    }
+
+    replay = MockReplayProvider([ActionProposal(decision_summary="演示已就绪")])
+    assert replay.chat([], tools=[{"type": "function"}]) == {
+        "content": "演示已就绪",
+        "tool_calls": [],
+    }
+    assert replay.consumed == 1
 
 
 @pytest.mark.skipif(

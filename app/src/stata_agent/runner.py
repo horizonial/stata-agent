@@ -147,7 +147,19 @@ def _execute_run(store, idea, act, executor):
     """允许的 request_run → 执行（真/fake）→ 自动签卡 → 回填。返回 (run_id, machine, cards)。"""
     script = (act.target or {}).get("script") or auto_regress_script()
     spec_id = (act.target or {}).get("spec_id")
-    out = executor.execute(script, idea=idea, spec_id=spec_id)
+    contract = (act.target or {}).get("result_contract")
+    # The offline runner is a test/demo harness.  Make its fixture contract
+    # explicit while leaving real executors contract-free unless the proposal
+    # actually declares one.
+    if contract is None:
+        from .tools.fake_executor import FakeExecutor, default_test_contract
+
+    if contract is None and isinstance(executor, FakeExecutor):
+        contract = default_test_contract().model_dump()
+    execute_kwargs = {"idea": idea, "spec_id": spec_id}
+    if contract is not None:
+        execute_kwargs["result_contract"] = contract
+    out = executor.execute(script, **execute_kwargs)
     cards = sign_run_numeric_cards(
         store, out["run_id"], idea=idea,
         claim_statement=act.reason or f"run {out['run_id']} 的机器层结果",
@@ -166,14 +178,17 @@ def _freeze_spec(store, idea, act) -> str:
 
 
 def literature_context(question: str, index, *, top_k: int = 3, char_budget: int = 1200) -> list[str]:
-    """把检索命中压缩成给模型的证据块（doc/page/snippet）。无 index 返回空。"""
+    """把检索命中压缩成给模型的证据块（含 opaque chunk identity）。"""
     if index is None or not question:
         return []
+    from .rag.ingest import chunk_text_digest
+
     out: list[str] = []
     used = 0
     for c in index.search(question, top_k=top_k, roles={"citable_evidence"}):
         snip = c.text.replace("\n", " ")[:250]
-        line = f"[文献] {c.doc_id[:40]} p{c.page}: {snip}"
+        digest = chunk_text_digest(c.text)
+        line = f"[文献] chunk={c.chunk_id} role={c.source_role} {c.doc_id[:40]} p{c.page} digest={digest[:16]}: {snip}"
         if used + len(line) > char_budget:
             break
         out.append(line)

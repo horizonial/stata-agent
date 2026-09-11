@@ -1,287 +1,298 @@
+# Document Authority
+
+本文件是唯一有效的当前实施计划。`ARCHITECTURE.md` 是最高架构约束；
+`design/TRACE_ACTIVITY_TIMELINE_V1.md` 是本轮详细设计；其他设计与历史报告只作参考。
+
 # Objective
 
-为系数型 Stata 结果建立版本化、确定性、失败关闭的证据验收门：只有声明了
-`ResultContract`、由可信执行层提取实际模型元数据、并通过 `verify_result` 全部检查的
-run，才能自动签发 numeric EvidenceCard。
+交付 **Trace Activity Timeline V1**：把当前面向内部事件账本的扁平 Trace，改造成按一次用户请求分组、
+能直接回答“模型想了几轮、调用了什么、Stata 做了什么、结果是否形成结构化证据、为何停止”的产品级活动时间线；
+随机 UUID、call ID、run ID 默认隐藏，仅在可展开的技术详情中保留。
 
 # Context
 
-真 Stata transport、持久会话、provenance 和发布探针已经通过验收。当前最高优先级风险
-转为计量结果语义：系统能运行 Stata，但尚不能证明被报告的系数对应声明的 estimator、
-因变量、目标 term、VCE、聚类和固定效应。
+最新真实运行“重新来”已经证明 agent loop、Stata 调用和工具后总结能够完成，但 Trace 页面仍主要展示
+22 条内部事件和随机标识。用户无法从中判断模型回合数、工具层级、上下文变化与证据状态。
 
-本轮落实 `design/ECONOMETRICS_RESULT_VERIFICATION.md`，实现 DD-01 已定义但尚未落地的
-`output_contract` 思想。它强化既有 Tool/Executor/EvidenceSigner 链路，不建立新编排器、
-工作流或事实源。
+代码审计确认问题位于现有观测投影边界：SQLite 账本已经持久化 correlation ID 和底层事件，
+但 `/api/trace` 的公开投影丢弃 correlation ID；agent loop 没有 provider lifecycle 事件；前端把每条原始事件
+平铺为同等级行。此次只补充安全事件和 application-owned 只读投影，不改变既有编排、账本或恢复架构。
 
 # Current Behavior
 
-- `run_stata` 接受自由文本 `code`，提示模型自行打印通用 `MACHINE_B/MACHINE_SE`。
-- `parse_machine()` 接受首个通用 marker，未绑定到具体 run 或目标 term。
-- machine 缺少 estimator、depvar、vce、cluster、absvars 等模型元数据。
-- `_run_stata()` 对任何非空有限 machine 值立即签卡；签卡异常被静默吞掉。
-- `verify_result` 仅回显 ledger 中的 machine/provenance。
-- signer 只检查 do-file 存在，不复算文件 hash。
-- `RunRecord` 没有结果合同；旧 run 与可报告 run 无法结构化区分。
-- packaged causal-inference Skill 未强制结构化结果合同。
-
-Targeted baseline：toolkit/executor/evidence/agent/skill 相关测试 48 passed。
+- `GET /api/trace` 返回 newest-first 的扁平公开事件，主要字段为 sequence、type、object、summary 和 payload。
+- object 列优先展示 request/run/call UUID，普通用户看到大量字母数字而非业务含义。
+- SQLite 事件保存 correlation ID，但公开 Trace 响应没有返回，无法可靠按一次用户请求分组。
+- agent loop 没有 provider turn 的 started/completed/failed 事件，Trace 无法说明模型实际调用轮数、耗时或 token usage。
+- 多种终态 payload 使用 `reply`、`status`、`code` 等字段，当前 summary fallback 不覆盖，许多行为空。
+- `run_stata` 顶层工具、executor 内部命令、context snapshot 和 artifact 读取均平铺，内部细节压过主流程。
+- 连续相同的 context snapshot 重复出现，没有聚合为“上下文保持不变”。
+- “Stata 执行成功”“有结构化 machine result”“已生成 evidence card/claim”没有分级，界面可能把执行成功误述为证据已签入。
+- 多类型筛选主要在前端当前已加载行上执行，total/pagination 容易造成完整筛选的错觉。
 
 # Target Behavior
 
-- `run_stata`/`run_do_file` 可携带 `result_contract`；无合同探索命令仍可执行，但不得自动
-  产生 numeric evidence。
-- V1 合同明确 target term、estimator、dependent variable、VCE、clusters、fixed effects 和
-  required stats，仅支持 `regress`/`reghdfe` 系数结果进入证据链。
-- extraction suffix 由 executor 生成并使用 run-scoped marker namespace；模型输出的旧通用
-  marker 不能伪造机器层。
-- semantic input hash 覆盖用户代码与 canonical contract；command hash 覆盖实际 do-file。
-- `verify_result` 返回稳定、版本化、逐项可判定的 `VerificationReport`。
-- signer 自己调用 verifier；只有 `evidence_ready=true` 才签卡，locator 绑定 term、contract
-  hash 和 verification schema version。
-- run 成功但验证失败时仍为 succeeded；工具明确返回验证失败和零签卡。
-- 旧 ledger 无需迁移即可回放；无合同旧 run 明确为不可签证据。
+- 默认 Trace 为按 correlation ID 分组的请求卡片，标题使用“请求 4”和用户消息摘要，不展示随机 ID。
+- 每个请求按因果顺序展示少量语义步骤，例如“模型回合 1 → Stata 运行 1 → 读取运行结果 → 模型回合 2 → 已完成”。
+- provider 每次逻辑调用都有 started/completed/failed 账本事件，只记录安全元数据、耗时、usage 和结果类别。
+- `run_stata` 及其内部 executor 事件折叠成一个 Stata 运行步骤；内部命令可展开查看，并使用受控命令族标签。
+- 连续等价的 context snapshots 合并显示，同时保留首次/末次 sequence 和重复次数。
+- 结果状态严格区分：仅执行成功、已获得结构化结果、已生成 EvidenceCard、已形成 Claim；不能越级宣称。
+- 新增有界的 `GET /api/trace/activity` 服务端投影；现有 `GET /api/trace` 保持兼容并作为“技术审计”视图。
+- 完整 UUID/call ID/run ID/correlation ID 仅在展开的“技术详情”中显示并可复制。
+- 旧事件缺少 correlation ID 时单独进入“历史未分组事件”，不得依据时间或 UUID 猜测归属。
 
 # Invariants / Hard Constraints
 
-- SQLite append-only event ledger 仍是唯一研究事实源，不改写历史事件。
-- 模型不能签 EvidenceCard/Claim；写权分离与 actor 校验不得弱化。
-- `ChatService -> agent_loop -> ToolEnforcer -> toolkit` 仍是主编排链。
-- Tool permission/enabled/Skill.allowed_tools 约束保持生效。
-- FakeExecutor 只能显式用于 test/demo，不能充当 real 或 live fallback。
-- 取消、timeout、uncertain、幂等复用、lease/fence 和隐私契约不得改变。
-- verification 失败不等于 Stata 执行失败。
-- 合同字段不得作为任意 Stata 代码插值；target term 必须保守校验。
-- 不保存思维链，不把 Skill/Memory 内容提升为研究证据。
-- 本轮不修改前端；现有 `innerHTML` 禁令保持。
+- SQLite append-only ledger 仍是运行事实唯一真相源；Activity Timeline 只是可重建的只读投影。
+- `ChatService → agent_loop → provider/tool/store` 仍是唯一编排链，不新增第二状态机或 Trace 专用状态源。
+- provider lifecycle 事件只能观测既有调用，不得改变重试、路由、预算、工具、取消或 terminal-first-wins 语义。
+- 现有 `/api/trace` 的字段和恢复/诊断消费者保持向后兼容；新能力使用独立 activity endpoint。
+- 不保存或展示 system prompt、完整请求上下文、模型原始响应、隐藏推理、API key、附件正文或 Stata 原始敏感输出。
+- correlation ID 是关联键，不是授权边界；workspace、路径和下载仍执行现有隔离与访问校验。
+- EvidenceCard/Claim 的真实性以 ledger 中实际签名事件为准，UI 不得从自然语言回复或 run success 推断。
+- 前端继续使用原生安全 DOM API，禁止 `innerHTML`；不引入前端框架。
+- 投影输出必须设置数量、payload 深度、字符串长度和响应体上限，不能无界读取全账本。
+- legacy null-correlation 事件不得启发式归组。
+- 不删除、skip、xfail 或弱化现有测试。
 
 # Scope
 
 ## In Scope
 
-- ResultContract、VerificationReport 和纯验证逻辑。
-- RunRecord 对可选合同的兼容投影。
-- executor 内可信 marker、模型元数据提取、双 hash 语义和复用兼容。
-- `run_stata`、`run_do_file`、`verify_result` 合同升级。
-- numeric signer verification gate 和 locator 补充。
-- FakeExecutor/fixtures 对显式 test contract 的支持。
-- packaged causal-inference Skill 的最小方法约束。
-- `regress`、`reghdfe` offline 测试及一个 opt-in real Stata smoke。
-- README 的合同示例和失败语义。
+- provider turn 安全生命周期事件与 schema 注册。
+- application-owned `TraceProjectionService` 和稳定的 activity DTO。
+- correlation 分组、人类序号、语义 summary、层级折叠和 context 去重。
+- Stata 执行/结构化结果/证据签名的准确状态投影。
+- `/api/trace/activity` 的有界查询、event type 服务端筛选和稳定错误响应。
+- Trace 页面默认 Activity Timeline、可切换 Technical Audit、展开技术详情和复制 ID。
+- provider/model、工具、Stata、context、budget、cancel/failure/recovery 的成功与失败测试。
+- browserless UI contract、产品 eval、兼容与隐私回归。
+- 更新设计说明和最终 `IMPLEMENTATION_REPORT.md`。
 
 ## Out of Scope
 
-- 自动选择识别策略或证明因果有效性。
-- IV、RDD、event-study、非线性、survival、survey、MI、bootstrap、多方程 profile。
-- 平行趋势、弱工具变量、聚类阈值、安慰剂、多重检验等领域诊断。
-- prepared dataset、真实外部数据签名或跨机器独立复现。
-- 新事件类型、SQLite migration、新 API/UI 页面。
-- ChatService、agent loop、provider、memory、RAG、writer、outbox 重构。
-- 附件、可观测性、发布签名和后续 backlog。
+- OpenTelemetry、Jaeger、云遥测、远程日志采集或多用户 observability backend。
+- 修改 SQLite schema、重写 ledger、迁移或回填历史 correlation ID。
+- 改变 agent 最大步数、provider 路由/重试、工具选择、context/memory 算法或 Stata 执行策略。
+- 暴露 prompt、完整模型输入输出、chain-of-thought、secret、附件原文或原始数据集。
+- RAG、OCR、rerank、econometrics、Writer/evidence 签名逻辑本身的质量改造。
+- installer、Windows 签名、升级/回滚和发布型 UX。
+- 通用 tracing DSL、插件式 renderer 或新的前端框架。
 
 # Architecture Change Required
 
-None。结果合同是 DD-01 `ResearchSpec.output_contract` 与既有 validator 写权分离的实现切片；
-可选 RunRecord 字段通过现有 JSON event payload 回放，不改变事实源或数据库架构。
+None。
+
+新增 provider lifecycle 事件属于既有 append-only event vocabulary 的兼容扩展；新增 Trace projector 位于 application
+读模型边界，不拥有写权限、不参与编排，也不成为第二真相源。
+
+若实现必须修改 SQLite schema、把投影状态持久化为另一套权威数据、记录完整 prompt/response，或让 Trace 服务参与
+agent 控制流，应立即停止并单独提出架构变更。
 
 # Files
 
 ## Primary files
 
-- `app/src/stata_agent/tools/result_verifier.py`（新增）
-- `app/src/stata_agent/tools/executor.py`
-- `app/src/stata_agent/tools/fake_executor.py`
-- `app/src/stata_agent/tools/evidence_signer.py`
-- `app/src/stata_agent/toolkit.py`
-- `app/src/stata_agent/domain/models.py`
-- `app/src/stata_agent/domain/reducers.py`
-- `app/src/stata_agent/skills/SKILL.md`
-- `app/README.md`
+- `app/src/stata_agent/application/trace_projection.py`（新增）
+- `app/src/stata_agent/application/__init__.py`
+- `app/src/stata_agent/events/schema.py`
+- `app/src/stata_agent/harness/agent_loop.py`
+- `app/src/stata_agent/ui.py`
+- `app/src/stata_agent/webui/index.html`
+- `app/src/stata_agent/webui/app.js`
+- `app/src/stata_agent/webui/styles.css`
 
 ## Likely test files
 
-- `app/tests/test_result_verifier.py`（新增）
-- `app/tests/test_executor_parse.py`
-- `app/tests/test_stata_executor.py`
-- `app/tests/test_evidence_skill.py`
-- `app/tests/test_ledger_evidence_hardening.py`
-- `app/tests/test_toolkit_direct.py`
+- `app/tests/test_trace_projection.py`（新增）
 - `app/tests/test_agent_loop.py`
-- `app/tests/test_skill_decision.py`
-- `app/tests/test_runner.py`
+- `app/tests/test_ui_trace_recovery.py`
+- `app/tests/test_application_layer.py`
 - `app/tests/test_e2e_full_pipeline.py`
+- `app/tests/test_ui_interaction_contract.py`
+- `app/tests/test_product_ux.py`
+- `app/tests/test_product_ux_coverage.py`
 - `app/tests/test_product_eval.py`
 
 ## Reference-only files
 
 - `ARCHITECTURE.md`
-- `design/PROJECT_ARCHITECTURE_AUDIT.md`
-- `design/ECONOMETRICS_RESULT_VERIFICATION.md`
+- `design/TRACE_ACTIVITY_TIMELINE_V1.md`
+- `design/CORRELATION_DIAGNOSTIC_BUNDLE_V1.md`
 - `design/dd-01-domain-events.md`
-- `design/dd-04-tool-permission.md`
-- `design/dd-05-writer-validator.md`
-- `design/dd-06-eval.md`
-- `app/src/stata_agent/events/schema.py`
-- `app/src/stata_agent/harness/agent_loop.py`
-- `app/src/stata_agent/harness/tool_enforcer.py`
-- `app/src/stata_agent/tools/strategy.py`
-- `app/src/stata_agent/stata_doctor.py`
+- `design/ui-design-codex.md`
+- `design/ui-requirements-codex.md`
+- `IMPLEMENTATION_REPORT.md`
+- `app/src/stata_agent/application/diagnostics.py`
+- `app/src/stata_agent/stata_executor.py`
+- `app/src/stata_agent/evidence/`
+- `app/src/stata_agent/storage/sqlite_store.py`
 
 ## Files that should not be modified unless necessary
 
-- `app/src/stata_agent/events/schema.py`
-- `app/src/stata_agent/storage/`
-- `app/src/stata_agent/application/`
-- `app/src/stata_agent/providers/`
-- `app/src/stata_agent/memory/`
-- `app/src/stata_agent/rag/`
-- `app/src/stata_agent/writer/`
-- `app/src/stata_agent/ui.py`
-- `app/src/stata_agent/ui/`
-- `app/pyproject.toml`
+- `app/src/stata_agent/storage/migrations.py` 和 SQLite schema。
+- `app/src/stata_agent/domain/` reducer、ResearchState 与审批状态机。
+- provider transports、routing/fallback、tool permissions 和 Stata execution behavior。
+- context、compaction、memory、RAG、Writer 与 evidence signer 实现。
+- settings、release、installer、signing 和 upgrade/rollback 代码。
+- 既有 golden/eval fixtures；只有新增独立 trace scenario 时可追加，不得覆盖历史预期。
 
 # Implementation Tasks
 
-## Task 1 — 定义版本化结果合同和纯验证器
+## Task 1 — Provider turn lifecycle observability
 
-- **Goal**：建立与 UI/LLM/transport 解耦、可单测、稳定排序的验证契约。
-- **Files**：`tools/result_verifier.py`、`domain/models.py`、`domain/reducers.py`、
-  `tests/test_result_verifier.py` 和相关 reducer tests。
+- **Goal**：让账本能够无歧义记录每次 provider 逻辑回合，而不暴露模型内容或改变执行语义。
+- **Files**：`events/schema.py`、`harness/agent_loop.py`、`tests/test_agent_loop.py`。
 - **Required behavior**：
-  - 定义 schema v1 的 ResultContract、CheckResult、VerificationReport。
-  - V1 只接受 `regress`/`reghdfe`，校验 target term、列表长度、字符和重复项。
-  - RunRecord 新增可选 contract；reducer 从 `run.requested` fold，旧事件正常回放。
-  - verifier 按设计文档固定 12 项顺序检查，不依赖网络、provider 或 Stata session。
-  - report 只含稳定安全字段；contract/machine 使用 canonical JSON hash。
-- **Edge cases**：旧 run 无合同；run 不存在/未成功；NaN/Inf/bool；缺字段；unsupported
-  estimator；空/重复 cluster/FE；大小写/空白；畸形 provenance。
+  - 注册 `provider.turn.started`、`provider.turn.completed`、`provider.turn.failed`。
+  - 每次实际 provider 调用前 append started；正常返回 append completed；异常路径 append failed 后保持原异常处理。
+  - payload 只允许 turn ordinal、provider/model 安全标识、tools-enabled 布尔值、duration、标准化 usage、result category、safe error code。
+  - 所有事件继承当前 request correlation ID；不得记录 messages、prompt、response content、tool arguments、secret 或 traceback。
+  - cancellation、budget exhaustion、provider fallback 和 terminal outcome 保持既有行为。
+- **Edge cases**：provider 在 yield 前失败、stream 中途失败、usage 缺失/部分字段、fallback、最终汇总回合 tools disabled、账本 append 冲突。
 - **Dependencies**：无。
-- **Acceptance criteria**：每个失败码、稳定顺序、hash 确定性和旧 ledger 回放均有单测；
-  不新增 migration/event type。
+- **Acceptance criteria**：
+  - 两回合 tool→final 流程产生两个完整 turn lifecycle，ordinal 稳定且 correlation 相同。
+  - provider failure 产生 failed 而非 completed；safe payload 不含输入、输出或 secret sentinel。
+  - 新观测写入不改变 provider call count、预算计数、terminal event 和现有测试结果。
 
-## Task 2 — 将机器层提取移入可信 executor 边界
+## Task 2 — Application-owned trace projection
 
-- **Goal**：模型控制的 Stata 输出不能伪造待签系数或模型元数据。
-- **Files**：`tools/executor.py`、`tools/fake_executor.py`、`tests/test_executor_parse.py`、
-  `tests/test_stata_executor.py`。
+- **Goal**：从 ledger 事件确定性构造请求级、人类可读、可重建的 Activity Timeline。
+- **Files**：新增 `application/trace_projection.py`、`application/__init__.py`、新增 `tests/test_trace_projection.py`。
 - **Required behavior**：
-  - executor 接受可选 ResultContract，生成不可预知的 run-scoped marker namespace。
-  - 有合同才追加 `_b[]/_se[]` 与 e(cmd/depvar/vce/clustvar/absvars/N/r2) extraction；环境
-    extraction 保持。
-  - parser 只接受本次 namespace；legacy marker 不参与 contracted result。
-  - semantic hash = 原代码 + canonical contract；command hash = 实际 do-file 全文。
-  - request 保存 contract/semantic hash，terminal 保存 command hash；reuse 区分不同合同。
-  - FakeExecutor 仅在 explicit test provenance 下产生等形合同结果。
-- **Edge cases**：主动打印伪 marker；term 不存在；字符串含空格；无 r2；不同 VCE；多向
-  cluster/FE；无合同非估计命令；取消与 uncertain。
-- **Dependencies**：Task 1。
-- **Acceptance criteria**：伪 marker 测试通过；do-file hash 可复算；不同合同不复用；相同
-  合同保持幂等；opt-in live `regress` 验证 term/cmd/depvar/vce。
+  - 定义 framework-neutral query、request group、step、technical details 和 page contracts。
+  - 只通过现有 store/read interfaces 读取事件，不直接依赖 HTTP 或 DOM，不写 ledger。
+  - 以非空 correlation ID 精确分组；请求 ordinal 按首次 sequence 稳定计算；组内按 sequence 升序。
+  - 从首条用户消息生成有界标题摘要；缺少用户消息时使用安全事件类别标题。
+  - 把 provider turn、顶层 tool、Stata executor 子事件、artifact read、context、budget/cancel/failure/terminal 转成闭合集合的语义 step kind。
+  - 相邻等价 context snapshots 合并并记录 repeat count；Stata 内部调用作为父运行的可展开 children。
+  - 随机 ID 不进入 collapsed label，只放 technical details；legacy null correlation 单独返回。
+  - 所有字符串、children 数、payload 深度和每页 group/event 数有硬上限，并给出 truncation metadata。
+- **Edge cases**：空账本、乱序输入、重复 sequence 防御、unknown event、null correlation、缺失 tool parent、失败后恢复、多 terminal 竞争、超长文本/深层 payload。
+- **Dependencies**：Task 1 的 provider event vocabulary；对旧数据仍须可用。
+- **Acceptance criteria**：
+  - 同一固定事件集重复投影结果完全相同，不依赖 wall clock 或随机数。
+  - collapsed 输出不含 UUID-looking identifiers；展开详情保留完整原始 ID 和 sequence。
+  - unknown/legacy event 安全降级，不猜测关联、不使整个请求投影失败。
+  - 单元测试覆盖所有 step kinds、截断、分页、filter 和 payload 脱敏边界。
 
-## Task 3 — 让 verify_result 成为真正的 fail-closed 工具
+## Task 3 — Bounded activity API and trace compatibility
 
-- **Goal**：工具返回验证结论，不再只回显 ledger。
-- **Files**：`toolkit.py`、`tests/test_toolkit_direct.py`、`tests/test_agent_loop.py`。
+- **Goal**：以稳定 HTTP contract 暴露请求级时间线，同时保持原始审计 API 兼容。
+- **Files**：`ui.py`、`application/trace_projection.py`、`tests/test_ui_trace_recovery.py`、`tests/test_application_layer.py`。
 - **Required behavior**：
-  - `run_stata`/`run_do_file` schema 接受设计规定的 `result_contract`。
-  - 删除让模型自行构造 MACHINE marker 的提示；handler 把合同交给 executor。
-  - `verify_result` 返回完整 report 及兼容所需的 run_id/machine 摘要。
-  - 无合同运行成功但 `evidence_ready=false`；失败提供稳定 code/suggestion。
-  - 不吞 verification/signing 异常；结构化返回且不改写成功 run 状态。
-- **Edge cases**：缺 run_id；旧 run；store 异常；合同畸形；reused run；run succeeded 但
-  verification failed；执行前后取消。
-- **Dependencies**：Tasks 1–2。
-- **Acceptance criteria**：schema 拒绝额外/畸形字段；所有签卡尝试都有可见 report；
-  ToolEnforcer permission、timeout、取消行为不回退。
+  - 新增 `GET /api/trace/activity`，支持有界 limit/cursor、workspace scope、status 和 event type 服务端筛选。
+  - 响应返回 request groups、legacy group、total/cursor/truncation metadata；不返回超出 allow-list 的 payload。
+  - `GET /api/trace` 保留现有字段和默认行为，只允许兼容性增加 correlation ID/技术字段，不删除或改义。
+  - invalid cursor/filter/limit 使用稳定 4xx code；storage busy/corrupt 使用现有安全错误 envelope。
+  - Trace 响应设置 `Cache-Control: no-store`，遵循 localhost/workspace 安全边界。
+- **Edge cases**：limit 为零/负数/超限、未知 type、翻页中新增事件、当前 workspace 切换、空 correlation、损坏 payload、storage lock。
+- **Dependencies**：Task 2。
+- **Acceptance criteria**：
+  - activity endpoint 的 grouping、pagination、filter 和 error contract 集成测试通过。
+  - 旧 `/api/trace` consumer fixtures 保持通过；existing recovery/diagnostic routes 不退化。
+  - 服务端返回的 total/filter 语义与实际查询一致，不依赖前端当前 50 行再筛选。
 
-## Task 4 — 将 verification gate 接到 EvidenceSigner
+## Task 4 — Human-readable Activity Timeline UI
 
-- **Goal**：numeric card 不能绕过确定性验证进入主证据链。
-- **Files**：`tools/evidence_signer.py`、`tools/result_verifier.py`、
-  `tests/test_evidence_skill.py`、`tests/test_ledger_evidence_hardening.py`、
-  `tests/test_runner.py`、`tests/test_e2e_full_pipeline.py`。
+- **Goal**：默认向用户展示业务流程，原始事件和随机 ID 退居可展开的技术审计层。
+- **Files**：`webui/index.html`、`webui/app.js`、`webui/styles.css`、相关 UI/product tests。
 - **Required behavior**：
-  - signer 从 canonical RunRecord 重新验证，不信任调用者布尔值/report。
-  - 未通过时不 append card/claim，并抛带稳定 code 的验证异常。
-  - coef/se locator 加 target_term、contract_hash、verification schema；N/r2 绑定同一合同。
-  - 签名前复算 do-file hash并比对 command hash。
-  - 保持 card ID、actor、append-only、幂等和 test-only provenance 隔离。
-  - legacy runner/eval fixtures 仅补显式 test contract，不恢复无合同自动签卡。
-- **Edge cases**：do-file 修改/删除；machine/contract hash 改变；重复验证；部分旧卡；fake
-  冒充 real；card/claim append 中途失败。
-- **Dependencies**：Tasks 1–3。
-- **Acceptance criteria**：失败路径零新增 card/claim；通过路径 locator 完整；重复调用不重复
-  写；writer grounding tests 不弱化。
+  - Trace 默认页渲染请求卡片：人类请求序号、摘要、开始/结束时间、耗时、状态和步骤计数。
+  - 步骤 label 使用“模型回合 1”“Stata 运行 1”“读取运行结果”“上下文准备”“已完成/失败/暂停”等闭合中文词汇。
+  - 父步骤可展开内部 Stata 命令、context metrics 和 failure detail；完整 ID 只在“技术详情”内展示，并提供 copy action。
+  - 提供明确的“活动时间线 / 技术审计”切换；技术审计继续使用旧 raw endpoint。
+  - 筛选、分页和 total 使用服务端 activity contract；刷新后保留安全的 view/filter state，但不把 payload/ID 写入 browser storage。
+  - unknown/legacy 事件以中性文案展示；空态、loading、storage busy、API failure 均有可恢复提示。
+  - 保持键盘操作、focus、ARIA、窄屏布局和原生 DOM 安全实现。
+- **Edge cases**：只有一个事件、正在运行无 terminal、失败后续跑、同秒多请求、长中文摘要、长模型名、legacy group、copy API 不可用、窄屏。
+- **Dependencies**：Task 3。
+- **Acceptance criteria**：
+  - collapsed timeline DOM 中没有 UUID/call ID/run ID；展开后能复制完整技术标识。
+  - 用户能在一个视图判断 provider 回合数、顶层工具数、Stata 运行数、终态和失败点。
+  - Activity/Technical 切换、filter、pagination、refresh、keyboard 和 responsive contract tests 通过。
+  - `app.js` 不使用 `innerHTML`，不新增前端框架或不安全 HTML sink。
 
-## Task 5 — 强化 Skill、评测和文档
+## Task 5 — Truthful summaries and evidence readiness
 
-- **Goal**：让模型知道何时必须声明合同，并建立稳定产品回归门。
-- **Files**：`skills/SKILL.md`、`eval/runner.py`（仅必要时）、`app/README.md`、skill/agent/
-  product eval tests、`IMPLEMENTATION_REPORT.md`。
+- **Goal**：保证 Trace 文案来自机器事实，并准确表达从执行到证据签名的不同成熟度。
+- **Files**：`application/trace_projection.py`、必要时 `ui.py` 的旧 public summary helper、projection/UI/e2e tests。
 - **Required behavior**：
-  - Skill 明确“方法选择不等于软件验证”，报告型系数必须有完整合同并检查 evidence_ready。
-  - adversarial scenario：伪 marker 或错误 cluster/FE 必须拒签。
-  - success scenario：explicit test contract → verified → card/claim → writer 可消费。
-  - README 给出最小 `regress` contract、失败语义和 live 命令。
-  - 报告不得把 V1 描述为可证明因果有效性。
-- **Edge cases**：Skill 未匹配；无 executor；Fake 未显式启用；旧 golden 稳定字段。
-- **Dependencies**：Tasks 1–4。
-- **Acceptance criteria**：Skill routing/allowed tools 不变；对抗 eval 稳定通过；README 与 schema
-  一致；报告完整。
+  - 建立安全字段优先级，覆盖 `reply`、`status`、`decision_summary`、`summary`、`text`、safe error code 和闭合事件模板。
+  - Stata 命令只投影受控 command family，例如“加载示例数据”“查看变量结构”“描述统计”“回归估计”；未知命令显示“执行 Stata 命令”，默认不回显完整 code。
+  - 根据实际 ledger 事件分别投影 `execution_succeeded`、`structured_result_available`、`evidence_card_signed`、`claim_signed`。
+  - machine result 为空时不得显示结构化结果完成；仅 assistant 自然语言声称“已签入”不得提升 evidence state。
+  - failure、cancel、budget、pause、resume 采用稳定原因码和可操作的安全中文摘要。
+- **Edge cases**：`machine={}`、只有 raw artifact、card 签名失败、claim 被拒绝、回复与账本矛盾、未知 Stata code、敏感错误文本、超长 reply。
+- **Dependencies**：Task 2；可与 Task 4 后半并行，但验收以最终 UI 为准。
+- **Acceptance criteria**：
+  - 空 machine result 的成功 run 只显示“执行成功”，不显示结构化结果或证据已签入。
+  - card/claim 只有对应成功 ledger 事件才显示完成；失败/拒绝状态准确。
+  - summary fixtures 无空白主步骤、无 raw code/路径/secret 泄漏，且与 end-to-end ledger 一致。
+
+## Task 6 — Product regression, eval and documentation closure
+
+- **Goal**：证明新 Trace 可读、可审计、兼容且不影响 agent 执行。
+- **Files**：上述测试文件、`design/TRACE_ACTIVITY_TIMELINE_V1.md`、必要的产品 eval fixtures、`IMPLEMENTATION_REPORT.md`。
+- **Required behavior**：
+  - 增加端到端 scenario：纯聊天、tool→final、真实形态 Stata 多子调用、provider failure、cancel、budget limit、pause/resume、legacy data。
+  - 每个 scenario 同时断言 ledger raw truth、activity projection 和 UI contract，避免只测文案。
+  - 增加 privacy regression，使用 sentinel 证明 prompt/response/tool args/secret 不进入 trace public output。
+  - 验证旧 raw trace、diagnostic bundle、recovery、request control 和 release gates 不退化。
+  - 最终更新 `IMPLEMENTATION_REPORT.md`，只记录真实执行结果和未完成项。
+- **Edge cases**：非 Windows CI、无真实 provider/Stata、dirty worktree、wheel 安装后的静态资源、现有历史 DB。
+- **Dependencies**：Tasks 1–5。
+- **Acceptance criteria**：
+  - targeted、full、lint、type、eval、coverage、wheel/release smoke 全部通过或对既有环境性失败给出明确证据。
+  - 无新增无理由 skip/xfail，无删除测试或断言弱化。
+  - 实现与设计偏差全部写入 report；完成本轮后不继续其他模块。
 
 # Tests
 
-## Unit tests to add
+## Unit tests
 
-- ResultContract 合法/非法 schema、canonical hash、term allowlist。
-- VerificationReport 固定检查顺序和每个失败 code。
-- trusted marker namespace，确认旧/伪 marker 被忽略。
-- cmd/depvar/vce/cluster/absvars 正常化和不匹配。
-- required stats 缺失、非有限值、bool 拒绝。
-- semantic/command hash 分离及 do-file tamper。
-- RunRecord 可选 contract 的新旧事件回放。
+- provider lifecycle 的 started/completed/failed、ordinal、duration、usage normalization 和安全 payload。
+- correlation 精确分组、人类序号、组内排序、unknown/legacy 降级。
+- provider/tool/Stata/context/artifact/terminal/budget/cancel/recovery 的 step mapping。
+- context snapshot 去重、Stata parent-child 折叠、截断和有界 payload。
+- safe summary precedence、Stata command family、敏感 sentinel 脱敏。
+- execution/structured/card/claim 四级状态真值表。
 
-## Integration tests to add or update
+## Integration tests
 
-- contracted Fake/Stub → run_stata → verifier → signer → card/claim。
-- 无 contract 和 mismatch 都执行成功但零证据。
-- 相同代码+相同合同复用；相同代码+不同合同不复用。
-- `verify_result` 经 ToolEnforcer 返回机器可判定报告。
-- opt-in real Stata `regress`；本机有 reghdfe 时再覆盖 reghdfe。
-- product eval 的伪 marker/错误 VCE 或 FE 对抗场景。
+- 两个 provider 回合的 tool→final 请求显示正确回合数和因果顺序。
+- Stata 顶层调用与内部多命令被归入同一运行步骤，展开后 sequence 完整。
+- activity endpoint 的 cursor、limit、status/type filter、total 和 storage error contract。
+- provider failure、用户停止、max steps、暂停/续跑的 raw ledger 与 activity 终态一致。
+- 老数据库 null correlation 可加载但不被错误归组。
 
-## Success paths that must be covered
+## UI/browserless tests
 
-- `regress price mpg` 与 mpg term、price depvar、ols VCE 合同通过并签卡。
-- reghdfe metadata 形状 offline 通过，live 取决于 ado 可用。
-- verified card/claim 仍可供 table/writer 使用。
-- 重复 verification/signing 幂等。
-
-## Failure paths that must be covered
-
-- marker spoofing、缺 term、错误 estimator/depvar/vce/cluster/FE。
-- run missing/failed/uncertain、合同缺失/不支持/畸形。
-- do-file 缺失/修改；command、machine、contract hash 不一致。
-- machine 缺 coef/se/N，或含 NaN/Inf/bool。
-- fake 冒充 real，或 real provenance 未 attested。
-- 签卡异常不得被 `_run_stata` 静默吞掉。
+- 默认进入 Activity Timeline，可切换 Technical Audit。
+- collapsed DOM 不显示随机 ID；technical details 展开与 copy 正常。
+- request card 状态、步骤计数、filter、pagination、refresh、empty/error/recovery。
+- keyboard、focus、ARIA、窄屏和 long-content contract。
+- 禁止 `innerHTML`，禁止把 event payload/ID 写入 browser storage。
 
 ## Regression tests
 
-- 禁止删除、skip 或弱化 ledger、write-authority、cancellation、reuse、writer tests。
-- 无合同 describe/list/探索代码仍能运行。
-- 旧 ledger/snapshot/upcast 继续通过。
-- 默认 pytest 不要求 Stata、ado 或网络；live tests 继续显式 gate。
-- FakeExecutor 仍只能显式配置。
+- agent loop call count、budget、tool permissions、provider fallback、cancel 和 terminal-first-wins 不变。
+- raw `/api/trace`、diagnostic bundle、request recovery 和 settings 页面保持兼容。
+- context/memory、Stata executor/verifier、evidence/Writer 与 release gates 不退化。
+- 禁止通过删除测试、无理由 skip/xfail 或放宽已有断言解决失败。
 
 # Verification Commands
 
-在 `app/` 下依次运行：
+在 `app/` 目录按任务顺序运行：
 
 ```powershell
-python -m pytest -q tests/test_result_verifier.py tests/test_executor_parse.py tests/test_evidence_skill.py tests/test_ledger_evidence_hardening.py tests/test_toolkit_direct.py
-python -m pytest -q tests/test_agent_loop.py tests/test_runner.py tests/test_e2e_full_pipeline.py tests/test_skill_decision.py tests/test_product_eval.py
-$env:STATA_LIVE='1'; python -m pytest -q tests/test_stata_executor.py; Remove-Item Env:STATA_LIVE
+python -m pytest -q tests/test_agent_loop.py tests/test_trace_projection.py
+python -m pytest -q tests/test_ui_trace_recovery.py tests/test_application_layer.py tests/test_e2e_full_pipeline.py
+python -m pytest -q tests/test_ui_interaction_contract.py tests/test_product_ux.py tests/test_product_ux_coverage.py
+node --check src/stata_agent/webui/app.js
+python -m pytest -q tests/test_product_eval.py tests/test_release_entrypoints.py
 python -m pytest -q
 python -m ruff check src tests
 python -m mypy src
@@ -289,30 +300,36 @@ python -m stata_agent.eval --json
 python -m coverage run --branch -m pytest -q
 python -m coverage report --fail-under=75
 python -m build --wheel
+python -m stata_agent.release_doctor --offline --json --wheel .\dist\stata_agent-0.1.0-py3-none-any.whl
 ```
 
 在仓库根目录运行：
 
 ```powershell
-python C:\Users\user\.codex\skills\codespaces\scripts\build_belief_map.py --root "D:\work\stata agent" --full
-python C:\Users\user\.codex\skills\codespaces\scripts\belief_search.py boundaries all
-python C:\Users\user\.codex\skills\codespaces\scripts\belief_search.py invariants all
+git diff --check
 ```
+
+完成代码后重建 codespaces full belief map，并运行 `boundaries all` 与 `invariants all`，确认 Trace projector
+没有成为写模型或第二编排器。
+
+自动门禁通过后，在真实 Windows UI 做一次短验收：发出一个包含 Stata 工具往返的请求，确认 Activity Timeline
+显示请求、模型回合、Stata 运行、结果读取与终态；展开技术详情核对完整 ID，再切换 Technical Audit 核对原始事件。
 
 # Stop Conditions
 
-- Tasks 1–5 和上述门禁全部通过后立即停止。
-- 不继续实现其他 estimator profile、领域诊断、outbox、附件、观测或 UI。
-- 若 Stata `e()` 元数据不足，仅将对应 profile 标为 unsupported；不得用命令文本猜测后放行。
-- 若需要新事件类型、SQLite migration 或改变 EvidenceCard 写权，停止并记录
-  `Architecture Change Required`，不得混入本轮。
-- live reghdfe 因本机缺 ado 可明确记录 skip；offline contract 与 real `regress` smoke 仍必须过。
+- Tasks 1–6 和本轮验证完成后立即停止，不继续 RAG、econometrics、settings、installer 或其他模块。
+- 不修改 agent budget、provider routing/retry、Stata command selection、context/memory 算法或 evidence 写入逻辑。
+- 不引入远程遥测、OpenTelemetry、第二数据库、事件迁移或历史 correlation 猜测。
+- 不记录或暴露 prompt、原始模型响应、隐藏推理、secret、附件正文或敏感 Stata 输出。
+- 不重命名或删除 durable technical IDs；只改变它们在产品 UI 的默认可见级别。
+- 若无法在现有 application read-model 边界内实现，或必须改变 SQLite/schema/编排契约，应停止并报告
+  `Architecture Change Required`，不得把架构重构混入本轮。
 
 # Deliverables
 
-1. 代码修改。
-2. 新增/更新测试。
-3. 与实际 schema 一致的 README。
+1. Tasks 1–6 的代码修改。
+2. 新增及更新的 unit、integration、UI、privacy 和 regression tests。
+3. 更新后的 Trace 设计/产品文档。
 4. `IMPLEMENTATION_REPORT.md`，必须包含：
    - Completed
    - Files Changed
@@ -321,6 +338,3 @@ python C:\Users\user\.codex\skills\codespaces\scripts\belief_search.py invariant
    - Deviations from Plan
    - Remaining Issues
    - Recommended Next Step
-
-报告必须明确区分“Stata 执行成功”“规格符合合同”和“因果设计有效”，并记录任何不支持的
-estimator/profile，不得夸大验证范围。

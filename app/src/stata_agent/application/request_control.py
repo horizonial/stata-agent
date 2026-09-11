@@ -14,7 +14,7 @@ from time import time
 from typing import Any, Callable
 
 
-TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "uncertain", "paused"})
 """Statuses after which a request can no longer be cancelled or changed."""
 
 
@@ -32,6 +32,9 @@ class _RequestControl:
     cancel_reason: str | None
     created_at: float
     finished_at: float | None = None
+    terminal_reason: str | None = None
+    error_code: str | None = None
+    retryable: bool | None = None
 
 
 class RequestControlRegistry:
@@ -130,7 +133,15 @@ class RequestControlRegistry:
                 self._set_event(control.cancel_event)
             return self._public(control)
 
-    def finish(self, request_id: str, status: str) -> dict[str, Any] | None:
+    def finish(
+        self,
+        request_id: str,
+        status: str,
+        *,
+        terminal_reason: str | None = None,
+        error_code: str | None = None,
+        retryable: bool | None = None,
+    ) -> dict[str, Any] | None:
         """Mark a request terminally, preserving the first terminal result."""
 
         status = str(status or "").strip().lower()
@@ -144,6 +155,9 @@ class RequestControlRegistry:
                 return self._public(control)
             control.status = status
             control.finished_at = self._clock()
+            control.terminal_reason = str(terminal_reason) if terminal_reason else None
+            control.error_code = str(error_code) if error_code else None
+            control.retryable = bool(retryable) if retryable is not None else None
             return self._public(control)
 
     def snapshot(self, request_id: str) -> dict[str, Any] | None:
@@ -223,6 +237,9 @@ class RequestControlRegistry:
             "cancel_reason": control.cancel_reason,
             "created_at": control.created_at,
             "finished_at": control.finished_at,
+            "terminal_reason": control.terminal_reason,
+            "error_code": control.error_code,
+            "retryable": control.retryable,
         }
 
     @classmethod

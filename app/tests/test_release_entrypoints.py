@@ -13,6 +13,7 @@ import runpy
 import sqlite3
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -174,6 +175,32 @@ def test_stata_doctor_console_script_is_declared() -> None:
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     text = pyproject.read_text(encoding="utf-8")
     assert 'stata-agent-stata-check = "stata_agent.stata_doctor:main"' in text
+
+
+def test_product_release_console_scripts_are_declared() -> None:
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    text = pyproject.read_text(encoding="utf-8")
+    assert 'stata-agent-backup = "stata_agent.application.release_ops:main"' in text
+    assert 'stata-agent-release-check = "stata_agent.release_doctor:main"' in text
+    assert 'stata-agent-provider-check = "stata_agent.providers.provider_check:main"' in text
+
+
+def test_product_wheel_declares_direct_runtime_dependencies() -> None:
+    """A plain wheel install must be able to import every advertised product entrypoint."""
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    project = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
+    declared = {item.split("[", 1)[0].split(">", 1)[0].lower() for item in project["dependencies"]}
+    assert {"pydantic", "fastapi", "uvicorn", "pymupdf", "python-docx", "mcp"} <= declared
+
+
+def test_release_doctor_module_entrypoint(capsys) -> None:
+    from stata_agent import release_doctor
+
+    assert release_doctor.main(["--offline", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["automated_ok"] is True
+    assert report["release_ready"] is False
 
 
 def test_legacy_cli_empty_stdin_closes_store(tmp_path, monkeypatch, capsys) -> None:

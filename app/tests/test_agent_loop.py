@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import time
 
-from stata_agent.events.schema import EVENT_IDEA, ACTOR_AGENT, Event
+from stata_agent.events.schema import (
+    ACTOR_AGENT,
+    EVENT_IDEA,
+    EVENT_PROVIDER_TURN_COMPLETED,
+    EVENT_PROVIDER_TURN_STARTED,
+    Event,
+)
 from stata_agent.harness.agent_loop import run_loop
 from stata_agent.harness.tool_enforcer import ToolEnforcer
 from stata_agent.privacy.modes import sanitize_messages
+from stata_agent.providers.protocol import ProviderError
 from stata_agent.storage.sqlite_store import SQLiteStore
 from stata_agent.toolkit import Tool, ToolContext, default_tools, ok
-from stata_agent.tools.fake_executor import FakeExecutor
+from stata_agent.tools.fake_executor import FakeExecutor, default_test_contract
 
 
 class FakeChatProvider:
@@ -19,9 +26,11 @@ class FakeChatProvider:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = 0
+        self.tool_snapshots = []
 
     def chat(self, messages, tools=None):
         self.calls += 1
+        self.tool_snapshots.append(tools)
         return self.responses.pop(0)
 
 
@@ -46,18 +55,35 @@ def test_research_calls_run_stata_tool(tmp_path):
     s = _store(tmp_path)
     prov = FakeChatProvider([
         {"content": None, "tool_calls": [{"id": "c1", "name": "run_stata",
-                                          "arguments": {"code": "sysuse auto, clear"}}]},
+                                          "arguments": {"code": "sysuse auto, clear",
+                                                        "result_contract": default_test_contract().model_dump()}}]},
         {"content": "主回归已跑完，系数 -238.9。", "tool_calls": None},
     ])
-    ctx = ToolContext(idea="ui", store=s, executor=FakeExecutor(s))
+    ctx = ToolContext(idea="ui", request_id="req-loop-1", store=s, executor=FakeExecutor(s))
     res = run_loop(s, prov, default_tools(), ctx, user_text="用 DID 跑主回归")
     assert res.reply == "主回归已跑完，系数 -238.9。"
     assert res.tool_calls == 1
     # 工具执行写进了事件（tool.invoked + tool.done + 证据链）
+    correlated = [event for event in s.scan("ui") if event.event_type in {
+        "tool.invoked", "tool.done", "run.requested", "run.succeeded", "tool.call", "tool.result",
+    }]
+    assert correlated and {event.correlation_id for event in correlated} == {"req-loop-1"}
     kinds = [e.event_type for e in s.scan("ui")]
     assert "tool.invoked" in kinds and "tool.done" in kinds
+    lifecycle = [event for event in s.scan("ui") if event.event_type in {
+        EVENT_PROVIDER_TURN_STARTED, EVENT_PROVIDER_TURN_COMPLETED,
+    }]
+    assert [event.event_type for event in lifecycle] == [
+        EVENT_PROVIDER_TURN_STARTED, EVENT_PROVIDER_TURN_COMPLETED,
+        EVENT_PROVIDER_TURN_STARTED, EVENT_PROVIDER_TURN_COMPLETED,
+    ]
+    assert {event.correlation_id for event in lifecycle} == {"req-loop-1"}
+    assert [event.payload["turn_index"] for event in lifecycle] == [1, 1, 2, 2]
+    assert all("messages" not in event.payload and "response" not in event.payload for event in lifecycle)
     # 证据自动签了卡
     assert len(s.project("ui").cards) >= 1
+    evidence_events = [event for event in s.scan("ui") if event.event_type in {"evidence.card_signed", "claim.signed"}]
+    assert evidence_events and {event.correlation_id for event in evidence_events} == {"req-loop-1"}
     s.close()
 
 
@@ -197,6 +223,63 @@ def test_max_steps_writes_budget_and_terminal_agent_step(tmp_path):
     events = list(s.scan("ui"))
     assert any(event.event_type == "budget.limit" and event.payload["kind"] == "max_steps" for event in events)
     assert events[-1].event_type == "agent_step"
+    s.close()
+
+
+def test_provider_failure_is_observed_without_sensitive_payload(tmp_path):
+    s = _store(tmp_path)
+
+    class FailingProvider(FakeChatProvider):
+        def chat(self, messages, tools=None):
+            self.calls += 1
+            raise ProviderError("auth", provider="deepseek", detail="Bearer SECRET_SENTINEL")
+
+    prov = FailingProvider([])
+    ctx = ToolContext(idea="ui", request_id="req-provider-failure", store=s)
+    result = run_loop(s, prov, default_tools(), ctx, user_text="检查模型")
+
+    assert result.terminal_reason == "provider_error"
+    events = list(s.scan("ui"))
+    failed = [event for event in events if event.event_type == "provider.turn.failed"]
+    assert len(failed) == 1
+    assert failed[0].correlation_id == "req-provider-failure"
+    assert failed[0].payload["error_code"] == "auth"
+    assert failed[0].payload["retryable"] is False
+    assert "SECRET_SENTINEL" not in str(failed[0].payload)
+    assert "messages" not in failed[0].payload and "response" not in failed[0].payload
+    s.close()
+
+
+def test_last_provider_turn_is_reserved_for_tool_result_finalization(tmp_path):
+    s = _store(tmp_path)
+    ping = Tool(
+        name="ping",
+        description="ping",
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        handler=lambda args, ctx: ok({"pong": True}),
+        permission="safe",
+    )
+    prov = FakeChatProvider([
+        {"content": None, "tool_calls": [{"id": "1", "name": "ping", "arguments": {}}]},
+        {"content": "工具结果已确认。", "tool_calls": None},
+    ])
+
+    res = run_loop(
+        s,
+        prov,
+        {"ping": ping},
+        ToolContext(idea="ui", store=s),
+        user_text="run and summarize",
+        max_steps=2,
+    )
+
+    assert res.reply == "工具结果已确认。"
+    assert res.terminal_reason == "model_stop"
+    assert res.tool_calls == 1
+    assert prov.calls == 2
+    assert prov.tool_snapshots[0]
+    assert prov.tool_snapshots[1] == []
+    assert not any(event.event_type == "budget.limit" for event in s.scan("ui"))
     s.close()
 
 

@@ -3,6 +3,23 @@
 > 文档层级：`design/SPEC.md` v0.5 的下位细化。本文把 SPEC §4.9.4（五层评测、复现基准、对抗集）、DD-01（事件/claim 溯源）、DD-05（validator/表语义）落到可实现评测设计。
 > 定位：实证 agent 独有的 ground truth = **复现已发表论文**。目标不是"好看"，是能证明"数字对不上就是失败"。
 
+## 评测口径：回归门禁不等于能力分
+
+本项目明确区分两类结果：
+
+- **Regression gate**：固定输入、确定性替身和已知故障分支，用于防止代码回归；应长期接近 100%。现有 `stata-agent-eval` 的 L1–L7 属于这一层。
+- **Capability benchmark**：真实模型、真实工具和重复 trial，用于测任务能力；必须保留失败，报告分母、逐任务结果、`pass@1`/`pass^k`、Wilson 95% 区间和 P50/P95。不得因未达到 100% 而令 CLI 失败。
+
+这一分法与 Anthropic 对 capability eval / regression eval 的区分一致；轨迹评测参考 Apple ToolSandbox 的状态与中间里程碑评分，重复可靠性参考 τ-bench 的 `pass^k`，数值评测参考 OpenAI 数据 Agent 对生成查询及最终数据的联合评分，开放研究质量参考 PaperBench 的分层 rubric 与 judge 校准：
+
+- https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents
+- https://machinelearning.apple.com/research/toolsandbox-stateful-conversational-llm-benchmark
+- https://arxiv.org/abs/2406.12045
+- https://openai.com/index/inside-our-in-house-data-agent/
+- https://cdn.openai.com/papers/22265bac-3191-44e5-b057-7aaacd8e90cd/paperbench.pdf
+
+评测优先级固定为：**最终状态/数值正确 > 安全与契约 > 轨迹效率 > 文本观感**。模型直接用文本澄清和调用 `ask_user` 都可能完成同一目标；grader 应先判 outcome，再把调用次数、重复调用和路径质量单独计分。
+
 ---
 
 ## 0. 设计输入与要回答的问题
@@ -92,6 +109,29 @@
 3. L3 篇目收集与遮蔽数字登记表（专家评审记录，避免自评放水）。
 4. 指标记录：系数误差、引用溯源命中率、trace 完整度、成本(token/$)；每次评测写 metrics.jsonl。
 5. LLM judge 对齐批次流程与阈值（§6）。
+
+## 8.1 已落地的真实 capability runner
+
+入口：`stata-agent-capability-eval` / `python -m stata_agent.eval.capability`。它与离线 golden runner 隔离，必须显式打开 live provider；真实 Stata 轨迹还需要本机 Stata 与 stata-mcp。
+
+```powershell
+$env:STATA_AGENT_LIVE='1'
+$env:STATA_AGENT_PRIVACY='approved_remote'
+python -m stata_agent.eval.capability --routing --trials 3 --json
+python -m stata_agent.eval.capability --stata-e2e --trials 3 --json
+```
+
+当前 v1 覆盖：普通问答不误用工具、缺输入澄清、数据检查、Stata/do-file 执行、产物读写、本地检索、公开源抓取、计划记忆、结果复核、出稿路由和非法 shell 请求。每个 trial 使用生产 provider 与生产 tool schema；E2E 进一步走生产 loop、真 Stata、结果合同、EvidenceCard 和最终回答。
+
+2026-09-11 基线（DeepSeek + Stata 18，本机单并发）：
+
+- 路由 outcome：15 个任务 × 3 次 = 45 trials，42/45 通过，`pass@1=93.3%`，Wilson 95% CI `[82.1%, 97.7%]`；14/15 个任务达到 `pass^3`；参数 schema 合法 45/45；P50 1.21s，P95 1.88s。
+- 唯一稳定失败：已声明存在签名证据并要求生成 Word 时，3/3 未选择 `write_draft`。本地文献任务 3/3 会并行发出两次同类检索，outcome 正确但轨迹效率需单列。
+- 真 Agent E2E：OLS 任务 3/3 通过，每次只调用一次 `run_stata`，均得到 `N=74`、`coef=-238.8943456`、`SE=53.0766872`、`R²=0.2195828562`，签发 4 张 EvidenceCard；P50 7.27s，P95 7.68s。样本仅 3 次，Wilson 区间仍为 `[43.9%, 100%]`，不能写成泛化成功率 100%。
+- 上下文/压缩/记忆专项：77 个确定性回归用例通过；异常恢复/安全专项：127 个确定性回归用例通过。这些是覆盖证据，不是开放任务能力分。
+- 真 Stata `reghdfe` 验收发现：`model.fixed_effects` 返回 `None`，预期为 `foreign`；因此当前不得宣称 FE 结构提取全部通过。
+
+当前 v1 未统计 provider 输出 token/费用（provider 合同未暴露 usage），也未覆盖多模型、论文复现、跨数据集长任务或人工研究质量。下一阶段按本文 L3–L4 扩展，不把 v1 分数外推。
 
 ## 9. 面试叙事（一句话）
 > 我们把评测做成五层：合同用代码断、组件用 gold set 断、轨迹用规则断、结果用已发表论文的每个单元格断、研究质量用盲评专家断——模型只有一次抄答案的机会会被无计算 baseline 拆穿。

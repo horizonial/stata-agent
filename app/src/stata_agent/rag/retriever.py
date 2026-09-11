@@ -9,6 +9,19 @@ from collections import Counter, defaultdict
 from .ingest import Chunk
 
 _CJK = re.compile(r"[一-鿿]")
+MAX_TOP_K = 100
+
+
+def _bounded_top_k(value: int) -> int:
+    if isinstance(value, bool):
+        raise ValueError("top_k must be an integer")
+    try:
+        selected = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("top_k must be an integer") from exc
+    if selected <= 0:
+        return 0
+    return min(selected, MAX_TOP_K)
 
 
 def tokenize(text: str) -> list[str]:
@@ -44,7 +57,17 @@ class LexicalIndex:
         for c in chunks:
             self.add(c)
 
-    def search(self, query: str, *, top_k: int = 5, roles: set[str] | None = None) -> list[Chunk]:
+    def search(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        roles: set[str] | None = None,
+        attachment_ids: set[str] | None = None,
+    ) -> list[Chunk]:
+        top_k = _bounded_top_k(top_k)
+        if top_k == 0:
+            return []
         q = Counter(tokenize(query))
         df = {t: len(v) for t, v in self._postings.items()}
         n_docs = max(len(self._chunks), 1)
@@ -54,8 +77,10 @@ class LexicalIndex:
             for cid, tf in self._postings.get(term, []):
                 if roles and self._chunks[cid].source_role not in roles:
                     continue
+                if attachment_ids and self._chunks[cid].attachment_id not in attachment_ids:
+                    continue
                 scores[cid] += qf * tf * tfidf_idf
-        ranked = sorted(scores, key=scores.get, reverse=True)[:top_k]
+        ranked = sorted(scores, key=lambda cid: (-scores[cid], cid))[:top_k]
         return [self._chunks[c] for c in ranked]
 
     def __len__(self) -> int:

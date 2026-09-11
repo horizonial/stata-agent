@@ -12,7 +12,7 @@ from stata_agent.memory.sqlite_repository import (
     STATUS_ACTIVE,
     SQLiteMemoryRepository,
 )
-from stata_agent.storage.migrations import Migration, MigrationError, MigrationRunner
+from stata_agent.storage.migrations import MIGRATIONS, Migration, MigrationError, MigrationRunner
 
 
 def test_migrations_are_idempotent_and_failure_rolls_back(tmp_path):
@@ -20,17 +20,23 @@ def test_migrations_are_idempotent_and_failure_rolls_back(tmp_path):
     connection = sqlite3.connect(database)
     runner = MigrationRunner(connection)
 
-    assert runner.run() == 2
-    assert runner.run() == 2
-    assert [item["version"] for item in runner.applied()] == [1, 2]
+    assert runner.run() == 4
+    assert runner.run() == 4
+    assert [item["version"] for item in runner.applied()] == [1, 2, 3, 4]
     tables = {
         row[0]
         for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
-            "('schema_migrations', 'memory_records', 'memory_candidates', 'workspace_registry')"
+            "('schema_migrations', 'memory_records', 'memory_candidates', 'workspace_registry', 'task_outbox')"
         )
     }
-    assert tables == {"schema_migrations", "memory_records", "memory_candidates", "workspace_registry"}
+    assert tables == {
+        "schema_migrations",
+        "memory_records",
+        "memory_candidates",
+        "workspace_registry",
+        "task_outbox",
+    }
     connection.close()
 
     failed_connection = sqlite3.connect(tmp_path / "failed.sqlite3")
@@ -59,7 +65,7 @@ def test_migrations_are_idempotent_and_failure_rolls_back(tmp_path):
 def test_migrations_reject_downgrade_and_schema_history_drift(tmp_path):
     connection = sqlite3.connect(tmp_path / "drift.sqlite3")
     runner = MigrationRunner(connection)
-    assert runner.run() == 2
+    assert runner.run() == 4
 
     with pytest.raises(MigrationError, match="older than current"):
         runner.run(target_version=0)
@@ -79,9 +85,58 @@ def test_migrations_reject_downgrade_and_schema_history_drift(tmp_path):
         )
 
 
+def test_v3_outbox_migration_is_additive_idempotent_and_defaults_existing_rows(tmp_path):
+    database = tmp_path / "outbox-v2.sqlite3"
+    connection = sqlite3.connect(database)
+    runner = MigrationRunner(connection)
+    assert runner.run(target_version=2) == 2
+    connection.execute(
+        "INSERT INTO task_outbox("
+        "outbox_id,idempotency_key,task_type,payload,status,attempt_count,max_attempts,"
+        "available_at,created_at,updated_at"
+        ") VALUES ('outbox-1','memory:1','memory.extraction','{}','failed',3,3,10,10,11)"
+    )
+    connection.commit()
+
+    assert runner.run(target_version=3) == 3
+    assert connection.execute(
+        "SELECT state_version FROM task_outbox WHERE outbox_id='outbox-1'"
+    ).fetchone()[0] == 0
+    assert runner.run(target_version=3) == 3
+    assert connection.execute(
+        "PRAGMA table_info(task_outbox)"
+    ).fetchall()[-1][1] == "state_version"
+    connection.close()
+
+
+def test_v3_outbox_migration_rolls_back_column_and_history_on_failure(tmp_path):
+    connection = sqlite3.connect(tmp_path / "outbox-v3-failure.sqlite3")
+    runner = MigrationRunner(connection)
+    assert runner.run(target_version=2) == 2
+
+    def fail_after_state_version_ddl(conn):
+        conn.execute(
+            "ALTER TABLE task_outbox ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0"
+        )
+        raise RuntimeError("synthetic v3 migration failure")
+
+    failing_runner = MigrationRunner(
+        connection,
+        (*MIGRATIONS[:2], Migration(3, "task_outbox_state_version_v3", fail_after_state_version_ddl)),
+    )
+    with pytest.raises(RuntimeError, match="synthetic v3"):
+        failing_runner.run()
+    assert failing_runner.current_version == 2
+    assert "state_version" not in {
+        row[1] for row in connection.execute("PRAGMA table_info(task_outbox)")
+    }
+    assert [item["version"] for item in failing_runner.applied()] == [1, 2]
+    connection.close()
+
+
 def test_repository_configures_sqlite_and_covers_schema(tmp_path):
     repository = SQLiteMemoryRepository(tmp_path / "memory.sqlite3", workspace_id="project-a", busy_timeout_ms=3210)
-    assert repository.schema_version == 2
+    assert repository.schema_version == 4
     assert repository.applied_migrations()[0]["name"] == "memory_storage_v1"
     assert repository.connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert repository.connection.execute("PRAGMA busy_timeout").fetchone()[0] == 3210

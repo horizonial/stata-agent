@@ -24,6 +24,7 @@ MAX_CHUNK_CHARS = 1200
 DEFAULT_MAX_FILES = 256
 DEFAULT_MAX_PAGES = 64
 DEFAULT_MAX_CHUNKS = 10_000
+PARSER_VERSION = "ingest-v1"
 
 
 @dataclass
@@ -33,6 +34,15 @@ class Chunk:
     source_role: str
     page: int
     text: str
+    text_digest: str | None = None
+    parser_version: str = PARSER_VERSION
+    # Opaque workspace attachment identity.  It is optional so legacy/global
+    # library callers and positional constructors remain source compatible.
+    attachment_id: str | None = None
+
+
+def chunk_text_digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _content_digest(path: Path) -> str:
@@ -43,10 +53,19 @@ def _content_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _token_doc_id(path: Path, content_hash: str | None = None) -> str:
+def _token_doc_id(
+    path: Path,
+    content_hash: str | None = None,
+    *,
+    attachment_id: str | None = None,
+    parser_version: str = PARSER_VERSION,
+) -> str:
     """Return a stable identity that changes when same-sized content changes."""
 
-    return f"{path.name}|{content_hash or _content_digest(path)}"
+    digest = content_hash or _content_digest(path)
+    if attachment_id:
+        return f"attachment:{attachment_id}|{digest}|{parser_version}"
+    return f"{path.name}|{digest}"
 
 
 def _segment(page_text: str, limit: int = MAX_CHUNK_CHARS) -> list[str]:
@@ -79,7 +98,9 @@ def _segment(page_text: str, limit: int = MAX_CHUNK_CHARS) -> list[str]:
 
 def ingest_pdf(path: str | Path, *, source_role: str = DEFAULT_SOURCE_ROLE,
                max_pages: int | None = DEFAULT_MAX_PAGES,
-               max_chunks: int | None = DEFAULT_MAX_CHUNKS) -> tuple[list[Chunk], dict]:
+               max_chunks: int | None = DEFAULT_MAX_CHUNKS,
+               attachment_id: str | None = None,
+               parser_version: str = PARSER_VERSION) -> tuple[list[Chunk], dict]:
     """Return ``(chunks, meta)`` with bounded pages/chunks and source role."""
 
     if not isinstance(source_role, str) or not source_role.strip():
@@ -100,7 +121,19 @@ def ingest_pdf(path: str | Path, *, source_role: str = DEFAULT_SOURCE_ROLE,
         else max(0, min(int(max_chunks), DEFAULT_MAX_CHUNKS))
     )
     pages = min(doc.page_count, page_limit)
-    doc_id = _token_doc_id(p, content_hash)
+    if attachment_id is not None and (
+        not isinstance(attachment_id, str) or not attachment_id.strip() or len(attachment_id) > 256
+        or any(char in attachment_id for char in ("/", "\\"))
+    ):
+        raise ValueError("attachment_id must be an opaque bounded identifier")
+    if not isinstance(parser_version, str) or not parser_version.strip() or len(parser_version) > 64:
+        raise ValueError("parser_version must be a bounded string")
+    doc_id = _token_doc_id(
+        p,
+        content_hash,
+        attachment_id=attachment_id,
+        parser_version=parser_version,
+    )
     try:
         for pno in range(pages):
             text = doc[pno].get_text("text") or ""
@@ -108,10 +141,12 @@ def ingest_pdf(path: str | Path, *, source_role: str = DEFAULT_SOURCE_ROLE,
             for idx, seg in enumerate(_segment(text)):
                 if len(chunks) >= chunk_limit:
                     break
-                raw = f"{doc_id}|p{pno + 1}|{idx}|{hashlib.sha256(seg.encode('utf-8')).hexdigest()}"
+                text_digest = chunk_text_digest(seg)
+                raw = f"{doc_id}|p{pno + 1}|{idx}|{text_digest}"
                 chunk_id = hashlib.sha256(raw.encode()).hexdigest()[:32]
                 chunks.append(Chunk(chunk_id=chunk_id, doc_id=doc_id, source_role=source_role,
-                                    page=pno + 1, text=seg))
+                                    page=pno + 1, text=seg, text_digest=text_digest,
+                                    parser_version=parser_version, attachment_id=attachment_id))
             if len(chunks) >= chunk_limit:
                 break
     finally:
@@ -123,6 +158,8 @@ def ingest_pdf(path: str | Path, *, source_role: str = DEFAULT_SOURCE_ROLE,
         "content_hash": content_hash,
         "source_role": source_role,
         "chunk_limit": chunk_limit,
+        "parser_version": parser_version,
+        "attachment_id": attachment_id,
     }
     return chunks, meta
 

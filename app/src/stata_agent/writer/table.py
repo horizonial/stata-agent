@@ -9,6 +9,9 @@ TableModel = 表的中立语义表示（行=系数/统计，列=spec，格=stat 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
+import re
+from collections.abc import Mapping
 
 from ..domain.models import Claim, EvidenceCard
 
@@ -76,6 +79,65 @@ def numeric_cells(model: TableModel):
                 yield ri, ci, cell
 
 
+def _numeric_text(text: str) -> float | None:
+    """Read the numeric prefix of a display value, including significance stars."""
+
+    match = re.fullmatch(r"\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+))(?:\*{1,4})?\s*", text)
+    if not match:
+        return None
+    try:
+        value = float(match.group(1))
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _card_matches_cell(cell: Cell, card: EvidenceCard) -> bool:
+    if card.kind != "numeric" or not isinstance(card.value, dict):
+        return False
+    raw = card.value.get("value")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(float(raw)):
+        return False
+    locator = card.locator if isinstance(card.locator, dict) else {}
+    card_stat = str(locator.get("stat_type") or "")
+    if card_stat and cell.stat_type not in {"", "value", card_stat}:
+        return False
+    parsed = _numeric_text(cell.text)
+    if parsed is None:
+        return False
+    if cell.numeric is not None:
+        try:
+            numeric_value = float(cell.numeric)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(numeric_value):
+            return False
+        if card_stat == "N" or cell.stat_type == "N":
+            if int(round(numeric_value)) != int(round(parsed)):
+                return False
+        elif f"{numeric_value:.3f}" != f"{parsed:.3f}":
+            return False
+    expected = float(raw)
+    if card_stat == "N" or cell.stat_type == "N":
+        return int(round(parsed)) == int(round(expected)) and abs(parsed - round(parsed)) < 1e-9
+    # A table display may round a canonical value, but must equal the same
+    # deterministic display representation (stars are presentation-only).
+    expected_display = f"{expected:.3f}"
+    actual_display = f"{parsed:.3f}"
+    return actual_display == expected_display
+
+
+def validate_cell(cell: Cell, cards: Mapping[str, EvidenceCard], *, require_card_id: bool = True) -> str | None:
+    """Return a stable error token for one numeric cell, or None when valid."""
+
+    if not cell.card_id:
+        return "missing_card" if require_card_id else None
+    card = cards.get(cell.card_id)
+    if card is None or not _card_matches_cell(cell, card):
+        return "card_mismatch"
+    return None
+
+
 def render_markdown(model: TableModel) -> str:
     lines = [f"**{model.title}**" if model.title else ""]
     header = ["指标"] + list(model.columns)
@@ -103,13 +165,32 @@ def add_table_to_doc(doc, model: TableModel, *, title_heading: bool = True) -> N
             cells_row[j + 1].text = cell.text
 
 
-def validate_cells(model: TableModel, cards: list[EvidenceCard]) -> list[str]:
-    """表格里每个数字必须命中某张 numeric 卡的显示值；返回无主数字。"""
+def validate_cells(
+    model: TableModel,
+    cards: list[EvidenceCard],
+    *,
+    require_card_ids: bool = False,
+) -> list[str]:
+    """Validate numeric cells.
+
+    The default remains compatible with the original token-only helper used by
+    legacy fixtures. Product delivery passes require_card_ids=True so every
+    numeric cell is checked against its explicitly attached card.
+    """
     from .ground import numeric_tokens
 
+    by_id = {card.card_id: card for card in cards}
     allowed = numeric_tokens(cards)
     bad: list[str] = []
     for _ri, _ci, cell in numeric_cells(model):
+        if require_card_ids:
+            if not cell.card_id:
+                bad.append(f"missing_card:{cell.text}")
+                continue
+            card = by_id.get(cell.card_id)
+            if card is None or not _card_matches_cell(cell, card):
+                bad.append(f"card_mismatch:{cell.card_id}:{cell.text}")
+            continue
         if cell.text.strip() not in allowed:
             bad.append(cell.text)
     return bad
@@ -137,26 +218,54 @@ def build_run_table(proj, run_id: str, *, title: str = "主回归") -> TableMode
     machine_hash = hashlib.sha256(
         json.dumps(rec.machine, sort_keys=True, ensure_ascii=False).encode()
     ).hexdigest()
-    cards_by_stat = {}
+    from ..tools.result_verifier import verify_run_record
+    from ..tools.evidence_signer import validate_run_provenance
+
+    report = verify_run_record(rec)
+    if not report.evidence_ready:
+        failed = next((item.code for item in report.checks if not item.passed), "verification_failed")
+        raise ValueError(f"run {run_id!r} 结果合同未通过: {failed}（缺 EvidenceCard）")
+    contract = rec.result_contract if isinstance(rec.result_contract, dict) else {}
+    target_term = contract.get("target_term")
+    provenance_kind = validate_run_provenance(rec.provenance or {})
+    cards_by_stat: dict[str, list[str]] = {}
     for card in proj.cards.values():
         if card.kind == "numeric" and isinstance(card.locator, dict):
             if card.locator.get("run_id") == run_id:
-                cards_by_stat[str(card.locator.get("stat_type"))] = card.card_id
+                stat = str(card.locator.get("stat_type") or "")
+                cards_by_stat.setdefault(stat, []).append(card.card_id)
     stats = ["coef", "se", "N", "r2"]
     order = [s for s in stats if s in rec.machine]
     model = TableModel(title=title, columns=["主回归"])
     for stat in order:
         raw = rec.machine[stat]
         value = float(raw)
-        cid = cards_by_stat.get(stat)
-        if cid is None:
+        stat_cards = cards_by_stat.get(stat, [])
+        if not stat_cards:
             raise ValueError(f"run {run_id!r} 的 {stat} 缺 numeric EvidenceCard，不能出表")
+        if len(stat_cards) != 1:
+            raise ValueError(f"run {run_id!r} 的 {stat} 存在重复 numeric EvidenceCard，不能出表")
+        cid = stat_cards[0]
         card = proj.cards.get(cid)
-        if card is None or card.kind != "numeric":
+        if card is None or card.kind != "numeric" or card.signed_by != "validator":
             raise ValueError(f"run {run_id!r} 的 {stat} card 不完整，不能出表")
-        if card.locator.get("run_id") != run_id or card.machine_hash != machine_hash:
+        if card.locator.get("run_id") != run_id or card.locator.get("stat_type") != stat:
+            raise ValueError(f"run {run_id!r} 的 {stat} card stat/run provenance 不匹配，不能出表")
+        recorded_machine_hash = card.locator.get("machine_hash")
+        if (
+            card.machine_hash != machine_hash
+            or (recorded_machine_hash is not None and recorded_machine_hash != machine_hash)
+            or card.locator.get("contract_hash") != report.contract_hash
+            or card.locator.get("verification_schema_version") != report.schema_version
+            or card.locator.get("target_term") != target_term
+            or card.locator.get("provenance_kind") != provenance_kind
+        ):
             raise ValueError(f"run {run_id!r} 的 {stat} card provenance 不匹配，不能出表")
-        if not isinstance(card.value, dict) or float(card.value.get("value")) != value:
+        try:
+            card_value = float(card.value.get("value")) if isinstance(card.value, dict) else float("nan")
+        except (TypeError, ValueError, OverflowError):
+            card_value = float("nan")
+        if not math.isfinite(card_value) or card_value != value:
             raise ValueError(f"run {run_id!r} 的 {stat} card 数值与机器层不一致，不能出表")
         display = display_for(stat, value) if stat != "se" else str(value)
         model.rows.append(Row(

@@ -11,6 +11,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .harness.cancellation import (
@@ -25,6 +26,9 @@ class ToolContext:
     """工具执行所需的外部依赖（由 loop 注入；环境类信息不让模型填）。"""
 
     idea: str = "ui"
+    # Effective request root assigned by ChatService.  This is operational
+    # metadata only; it is never model-authored input or an auth boundary.
+    request_id: str | None = None
     # Stable project identity used by ContextAssembler/MemoryStore V2.  Keep
     # ``idea`` as the public ledger key for backward compatibility; this
     # field deliberately has a separate name because an idea slug is not a
@@ -47,6 +51,10 @@ class ToolContext:
     phase: str | None = None
     data_dir: Any = None
     network_available: bool = False
+    # Request-frozen live-provider gate.  ``None`` keeps legacy callers on
+    # the process configuration path; a bool is captured by ChatService at
+    # bootstrap and must not drift during a running turn.
+    live_provider_enabled: bool | None = None
     # Optional explicit roots for the central tool enforcer.  When omitted,
     # the enforcer falls back to run_root/data_dir and the local ledger folder.
     allowed_roots: tuple[Any, ...] = ()
@@ -161,6 +169,27 @@ def _summarize_run(r: dict) -> str:
     return f"run {d.get('run_id', '?')} {head}；完整日志见 {d.get('do_file', '')}"
 
 
+def _verification_payload(report: Any) -> dict[str, Any]:
+    """Expose stable failure codes/suggestions without raw Stata output."""
+
+    payload = report.model_dump(mode="json")
+    failed = report.failed_codes
+    payload["failed_codes"] = failed
+    suggestions = {
+        "contract_missing": "声明完整 result_contract 后重新执行",
+        "required_stats_missing:se": "把 se 加入 required_stats，并确认目标 term 存在",
+        "target_term_mismatch": "核对 target_term 与实际 _b[] term",
+        "estimator_mismatch": "核对 estimator 与 Stata e(cmd)",
+        "dependent_variable_mismatch": "核对 dependent_variable 与 Stata e(depvar)",
+        "vce_mismatch": "核对 vce 与 Stata e(vce)",
+        "cluster_variables_mismatch": "核对 cluster_variables 与 e(clustvar)",
+        "fixed_effects_mismatch": "核对 fixed_effects 与 e(absvars)",
+        "command_hash_mismatch": "不要修改已落账的 do-file，重新执行生成新 run",
+    }
+    payload["suggestion"] = suggestions.get(failed[0], "检查验证报告中的失败项并重新执行") if failed else ""
+    return payload
+
+
 def _summarize_literature(r: dict) -> str:
     """Put citable snippets (not only a hit count) into model context."""
 
@@ -169,11 +198,16 @@ def _summarize_literature(r: dict) -> str:
         return "文献检索无命中（本地材料也可能不完整，请标记为待核对）。"
     lines = ["文献检索片段（来源均为 untrusted，需核对原文）："]
     for hit in hits[:8]:
+        chunk_id = str(hit.get("chunk_id") or "?")
         doc = str(hit.get("doc_id") or "?")
         page = hit.get("page") or "?"
+        role = str(hit.get("source_role") or "?")
         snippet = str(hit.get("text") or "").replace("\n", " ")[:500]
         trust = hit.get("trust") or "untrusted"
-        lines.append(f"- [{trust}] {doc} p.{page}: {snippet}")
+        # Keep the opaque identity in the model-visible context.  The model
+        # needs it to request/sign an explicit citation; paths and raw source
+        # locations remain intentionally absent.
+        lines.append(f"- [{trust}] chunk={chunk_id} role={role} {doc} p.{page}: {snippet}")
     return "\n".join(lines)
 
 
@@ -215,16 +249,8 @@ def _inspect_dataset(args: dict, ctx: ToolContext) -> dict:
     return ok({"summary": text[:1500]})
 
 
-_MACHINE_MARKERS = (
-    'di "MACHINE_N=" e(N)\n'
-    'di "MACHINE_R2=" %9.6f e(r2)\n'
-    'di "STA_ENV version=" c(version)\n'
-    'di "STA_ENV flavor=" c(flavor)'
-)
-
-
 def _run_stata(args: dict, ctx: ToolContext) -> dict:
-    """跑一段 Stata 代码（原子执行，不判断下一步）。自动追加机器层提取标记。"""
+    """跑一段 Stata 代码；结构化结果只由 executor 提取并交 verifier。"""
     code = str(args.get("code") or "").strip()
     if not code:
         return err("code 不能为空", type="missing_param")
@@ -235,27 +261,62 @@ def _run_stata(args: dict, ctx: ToolContext) -> dict:
         return err("未连接 Stata 执行器", type="unavailable", retryable=False,
                    suggestion="检查 STATA_AGENT_EXECUTOR 是否开启、Stata 是否安装")
     from .tools.executor import MachineParseError
+    from .tools.result_verifier import validate_contract
 
     try:
-        execute_kwargs = {"idea": ctx.idea}
+        try:
+            if args.get("result_contract") is not None:
+                validate_contract(args.get("result_contract"))
+        except Exception as error:
+            return err(str(error)[:240], type="contract_invalid",
+                       suggestion="按 schema_version=1 的 ResultContract 修正")
+        execute_kwargs: dict[str, Any] = {"idea": ctx.idea}
         execute = ctx.executor.execute
+        if _supports_keyword(execute, "correlation_id"):
+            execute_kwargs["correlation_id"] = ctx.request_id
+        contract_supplied = "result_contract" in args and args.get("result_contract") is not None
+        if contract_supplied:
+            if not _supports_keyword(execute, "result_contract"):
+                return err(
+                    "当前执行器不支持 result_contract",
+                    type="contract_unsupported",
+                    suggestion="使用支持结构化结果合同的 StataExecutor/FakeExecutor",
+                )
+            execute_kwargs["result_contract"] = args.get("result_contract")
+        elif _supports_keyword(execute, "result_contract"):
+            # An explicit null means exploratory execution: the executor must
+            # not infer a reportable contract from model-authored output.
+            execute_kwargs["result_contract"] = None
         if ctx.cancellation is not None and _supports_keyword(execute, "cancellation"):
             execute_kwargs["cancellation"] = ctx.cancellation
-        out = execute(code + "\n" + _MACHINE_MARKERS, **execute_kwargs)
-        # 证据链完整：run 成功后由 validator 自动签 numeric 卡 + claim（模型不直接写证据）
+        out = execute(code, **execute_kwargs)
+        from .tools.result_verifier import verify_run_record
+
+        rec = None
+        if ctx.store is not None and out.get("run_id"):
+            rec = ctx.store.project(ctx.idea).runs.get(out["run_id"])
+        report = verify_run_record(rec)
         signed = []
-        if out.get("machine"):
+        signing_error = None
+        if report.evidence_ready and ctx.store is not None:
             try:
                 from .tools.evidence_signer import sign_run_numeric_cards
 
                 signed = sign_run_numeric_cards(
                     ctx.store, out["run_id"], idea=ctx.idea,
-                    claim_statement=f"run {out['run_id']} 结果已入证据链")
-            except Exception:  # noqa: BLE001 签卡失败不阻塞（结果已落 run）
-                pass
+                    claim_statement=f"run {out['run_id']} 结果已入证据链",
+                    correlation_id=getattr(ctx, "request_id", None))
+            except Exception as error:  # noqa: BLE001 - expose, never swallow
+                signing_error = {
+                    "type": type(error).__name__,
+                    "message": str(error)[:240],
+                }
         return ok({"machine": out.get("machine"), "run_id": out.get("run_id"),
                    "do_file": out.get("do_file"), "reused": out.get("reused", False),
                    "signed_cards": len(signed),
+                   "evidence_ready": report.evidence_ready,
+                   "verification": _verification_payload(report),
+                   "signing_error": signing_error,
                    "output_head": out.get("output_head", "")})
     except CancellationRequested as e:
         return err(
@@ -296,7 +357,10 @@ def _run_do_file(args: dict, ctx: ToolContext) -> dict:
     if not p.exists():
         return err(f"do 文件不存在：{path}", type="not_found", retryable=True)
     code = p.read_text(encoding="utf-8")
-    return _run_stata({"code": code}, ctx)
+    forwarded: dict[str, Any] = {"code": code}
+    if "result_contract" in args:
+        forwarded["result_contract"] = args.get("result_contract")
+    return _run_stata(forwarded, ctx)
 
 
 def _read_artifact(args: dict, ctx: ToolContext) -> dict:
@@ -350,8 +414,17 @@ def _search_literature(args: dict, ctx: ToolContext) -> dict:
                    suggestion="配置 STATA_AGENT_LIBRARY 指向 PDF 目录，或先用 fetch_source 联网取")
     top_k = max(1, min(int(args.get("top_k") or 5), 10))
     chunks = ctx.rag.search(query, top_k=top_k, roles={"citable_evidence"})
-    data = [{"doc_id": c.doc_id, "page": c.page, "text": c.text[:400],
-             "trust": "local_library_untrusted"} for c in chunks]
+    from .rag.ingest import chunk_text_digest
+
+    data = [{
+        "chunk_id": c.chunk_id,
+        "doc_id": c.doc_id,
+        "page": c.page,
+        "source_role": c.source_role,
+        "text_digest": chunk_text_digest(c.text),
+        "text": c.text[:400],
+        "trust": "local_library_untrusted",
+    } for c in chunks]
     return ok({"hits": data})
 
 
@@ -429,7 +502,7 @@ def _update_research_plan(args: dict, ctx: ToolContext) -> dict:
 
 
 def _verify_result(args: dict, ctx: ToolContext) -> dict:
-    """复核某次 run 的结果（样本/系数），独立于生成。"""
+    """复核某次 run 的结果，返回稳定逐项 VerificationReport。"""
     stopped = _cancelled(ctx)
     if stopped:
         return stopped
@@ -438,12 +511,18 @@ def _verify_result(args: dict, ctx: ToolContext) -> dict:
     rec = proj.runs.get(run_id)
     if rec is None:
         return err(f"run 不存在：{run_id}", type="not_found", retryable=True)
-    if rec.status != "succeeded":
-        return err(f"run 未成功(status={rec.status})", type="stata_error")
+    expected_contract = args.get("result_contract")
+    from .tools.result_verifier import verify_run_record
+
+    try:
+        report = verify_run_record(rec, expected_contract=expected_contract)
+    except Exception as error:  # malformed caller input is a stable tool error
+        return err(str(error)[:240], type="contract_invalid", suggestion="按 ResultContract schema 修正")
     machine = rec.machine or {}
     prov = rec.provenance or {}
     return ok({"run_id": run_id, "machine": machine, "env_sig": prov.get("env_sig"),
-               "do_file": prov.get("do_file")})
+               "do_file": prov.get("do_file"), "evidence_ready": report.evidence_ready,
+               "verification": _verification_payload(report)})
 
 
 def _ask_user(args: dict, ctx: ToolContext) -> dict:
@@ -453,11 +532,85 @@ def _ask_user(args: dict, ctx: ToolContext) -> dict:
     return ok({"ask": str(args.get("question") or "需要你确认一下")})
 
 
+def _atomic_write_pair(files: tuple[tuple[Path, bytes], ...]) -> None:
+    """Commit sibling outputs with rollback if a later replace fails.
+
+    A filesystem has no primitive that atomically replaces two directory
+    entries.  Stage both payloads, move existing targets to private backups,
+    then replace the targets; if the second replacement fails, restore the
+    previous pair so retries do not leave a mixed DOCX/manifest delivery.
+    """
+
+    import os
+    import tempfile
+
+    temporary: list[Path] = []
+    backups: dict[Path, Path] = {}
+    committed: list[Path] = []
+    try:
+        staged: list[tuple[Path, Path]] = []
+        for target, payload in files:
+            fd, temp_name = tempfile.mkstemp(
+                dir=target.parent,
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+            )
+            temp_path = Path(temp_name)
+            temporary.append(temp_path)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            staged.append((target, temp_path))
+
+        for target, _temp_path in staged:
+            if target.exists() or target.is_symlink():
+                fd, backup_name = tempfile.mkstemp(
+                    dir=target.parent,
+                    prefix=f".{target.name}.",
+                    suffix=".bak",
+                )
+                os.close(fd)
+                backup = Path(backup_name)
+                backup.unlink(missing_ok=True)
+                os.replace(target, backup)
+                backups[target] = backup
+
+        for target, temp_path in staged:
+            os.replace(temp_path, target)
+            committed.append(target)
+        temporary.clear()
+    except OSError:
+        for target in reversed(committed):
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for target, backup in backups.items():
+            try:
+                if backup.exists():
+                    os.replace(backup, target)
+            except OSError:
+                pass
+        raise
+    finally:
+        for temp_path in temporary:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for backup in backups.values():
+            try:
+                backup.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def _write_draft(args: dict, ctx: ToolContext) -> dict:
     stopped = _cancelled(ctx)
     if stopped:
         return stopped
-    from .writer.draft_multi import draft_from_ledger
+    from .writer.draft_multi import build_draft_package
 
     proj = ctx.store.project(ctx.idea)
     if not proj.claims and not proj.runs:
@@ -465,10 +618,70 @@ def _write_draft(args: dict, ctx: ToolContext) -> dict:
                    suggestion="先 run_stata 跑出结果并自动签证据，再出稿")
     method = str(args.get("method") or "实证结果（方法段由 agent 撰写）")
     limits = str(args.get("limits") or "")
-    data = draft_from_ledger(proj, method=method, limits=limits)
-    out = (ctx.run_root or ctx.store._path.parent) / f"{ctx.idea}_draft.docx"
-    out.write_bytes(data)
-    return ok({"draft_path": str(out), "bytes": len(data)})
+    library = getattr(ctx.rag, "library", None)
+    figure_items: list[dict[str, object]] = []
+    for card_id, card in sorted(proj.cards.items()):
+        if card.kind != "figure" or not isinstance(card.locator, dict):
+            continue
+        value = card.value if isinstance(card.value, dict) else {}
+        figure_items.append(
+            {
+                "object_id": f"figure:{card_id}",
+                "path": str(card.locator.get("path") or ""),
+                "card_id": card_id,
+                "run_id": card.locator.get("run_id"),
+                "caption": value.get("caption") or "",
+            }
+        )
+    try:
+        data, manifest = build_draft_package(
+            proj,
+            method=method,
+            limits=limits,
+            library=library,
+            figure_items=figure_items or None,
+        )
+    except ValueError as error:
+        return err(
+            str(error)[:240],
+            type="evidence_not_ready",
+            suggestion="先修复 evidence provenance，再重新出稿",
+        )
+    root = Path(ctx.run_root or ctx.store._path.parent)
+    out = root / f"{ctx.idea}_draft.docx"
+    manifest_path = root / f"{ctx.idea}_draft.evidence.json"
+    import json
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        _atomic_write_pair((
+            (out, data),
+            (
+                manifest_path,
+                json.dumps(
+                    manifest.to_dict(),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    indent=2,
+                ).encode("utf-8"),
+            ),
+        ))
+    except OSError:
+        return err(
+            "交付文件写入失败",
+            type="delivery_write_failed",
+            retryable=True,
+            suggestion="检查输出目录后重试",
+        )
+    return ok(
+        {
+            "draft_path": str(out),
+            "manifest_path": str(manifest_path),
+            "bytes": len(data),
+            "delivery_digest": manifest.delivery_digest,
+            "claim_count": len(manifest.claims),
+            "card_count": len(manifest.cards),
+        }
+    )
 
 
 # --------------------------------------------------------------------------- registry
@@ -480,6 +693,31 @@ def _obj(schema: dict) -> dict:
 
 def _has_executor(ctx: ToolContext) -> bool:
     return ctx.executor is not None
+
+
+def _result_contract_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "integer", "const": 1},
+            "target_term": {"type": "string", "minLength": 1},
+            "estimator": {"type": "string", "enum": ["regress", "reghdfe"]},
+            "dependent_variable": {"type": "string", "minLength": 1},
+            "vce": {"type": "string", "enum": ["ols", "robust", "cluster"]},
+            "cluster_variables": {"type": "array", "items": {"type": "string"}},
+            "fixed_effects": {"type": "array", "items": {"type": "string"}},
+            "required_stats": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["coef", "se", "N", "r2"]},
+                "minItems": 2,
+            },
+        },
+        "required": [
+            "target_term", "estimator", "dependent_variable", "vce",
+            "cluster_variables", "fixed_effects", "required_stats",
+        ],
+    }
 
 
 def default_tools() -> dict[str, Tool]:
@@ -500,14 +738,14 @@ def default_tools() -> dict[str, Tool]:
         "run_stata": Tool(
             name="run_stata",
             description=(
-                "执行一段 Stata 代码并返回真实运行结果（样本量 N、R²、run_id、do 文件）。"
-                "当需要真实计算/估计/描述统计时调用；不要用它猜结果，也不要覆盖原始数据。"
-                "若要报告核心系数（如 DID 交互项），在代码里显式加两行："
-                "di \"MACHINE_B=\" %9.6f _b[系数名] 和 di \"MACHINE_SE=\" %9.6f _se[系数名]"
-                "（例如 _b[1.nj#1.post]）。这样系数与标准误会进入机器层并被签名成证据。"
+                "执行一段 Stata 代码并返回真实运行结果。探索命令可以省略 result_contract；"
+                "需要报告系数时必须声明完整合同（target_term、estimator、因变量、VCE、"
+                "聚类/固定效应和 required_stats）。提取由可信 executor 完成，不要在代码中"
+                "自行打印 MACHINE marker；只有 verify_result 的 evidence_ready=true 才能作为数字证据。"
             ),
             input_schema=_obj({"properties": {
-                "code": {"type": "string", "description": "要执行的 Stata 代码"}},
+                "code": {"type": "string", "description": "要执行的 Stata 代码"},
+                "result_contract": _result_contract_schema()},
                 "required": ["code"]}),
             handler=_run_stata, permission="execute", timeout_seconds=300,
             enabled=_has_executor,
@@ -517,7 +755,8 @@ def default_tools() -> dict[str, Tool]:
             name="run_do_file",
             description=("执行一个完整 do 文件。当有现成 do 脚本要复现/重跑时调用。"),
             input_schema=_obj({"properties": {
-                "path": {"type": "string", "description": "do 文件绝对路径"}},
+                "path": {"type": "string", "description": "do 文件绝对路径"},
+                "result_contract": _result_contract_schema()},
                 "required": ["path"]}),
             handler=_run_do_file, permission="execute", timeout_seconds=600,
             enabled=_has_executor,
@@ -575,7 +814,8 @@ def default_tools() -> dict[str, Tool]:
             name="verify_result",
             description=("复核某次 run 的结果（样本量/系数/环境指纹）。当要核对结果是否可信/可复现时调用。只读。"),
             input_schema=_obj({"properties": {
-                "run_id": {"type": "string", "description": "要复核的 run_id"}},
+                "run_id": {"type": "string", "description": "要复核的 run_id"},
+                "result_contract": _result_contract_schema()},
                 "required": ["run_id"]}),
             handler=_verify_result, permission="read",
             summary=lambda r: f"run {r.get('data', {}).get('run_id', '?')} 机器层={r.get('data', {}).get('machine')}",
@@ -592,7 +832,7 @@ def default_tools() -> dict[str, Tool]:
             name="write_draft",
             description=(
                 "把已验证结果渲染成中文 Word 实证初稿（方法+表+结论+引文+局限）。"
-                "当用户要出稿/写初稿时调用；只渲染已签证据，不会现编数字。"
+                "当用户要出稿/写初稿时调用；只渲染已签证据（含当前 idea 的 figure card），不会现编数字。"
             ),
             input_schema=_obj({"properties": {
                 "method": {"type": "string", "description": "方法段一句话"},

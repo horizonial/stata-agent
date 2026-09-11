@@ -3,7 +3,7 @@
 > 用途：给 codex 接手继续开发用的完整交接文档。覆盖：定位、分层架构、关键设计决策、代码地图、事件契约、已完成/遗留、接手清单。
 > 更细的设计在 `design/`（SPEC v0.5 + DD-01…07 + agent-tool-routing.md + rethink-autonomy.md）。
 > 当前实现成熟度、文档权威关系与模块研究顺序见 `design/PROJECT_ARCHITECTURE_AUDIT.md`。
-> 运行环境：Python 3.12 · deepseek(OpenAI 兼容) · 本机 Stata 18 + stata-mcp · SQLite · FastAPI + 原生前端。
+> 运行环境：Python 3.12 · 闭合 provider/model 目录（OpenAI-compatible 起步）· 本机 Stata 18 + stata-mcp · SQLite · FastAPI + 原生前端。
 
 ---
 
@@ -39,8 +39,9 @@ Agent Loop（通用，LLM + function calling，自主多步 + 防循环护栏 + 
 | **写权分离** | EvidenceCard/Claim 只能 validator/evidence_builder 签，模型不能直接写 | `tools/evidence_signer.py` + `events/append.py` |
 | **证据链** | 每个进稿数字 → result_id → card；正文只能引用已验证 claim | `writer/` + `evidence_signer.py` |
 | **隐私三档** | local_strict/approved_remote/mixed_sanitized；fallback 不跨边界 | `privacy/modes.py` + `providers/registry.py` |
-| **流式输出** | LLM 原始流 → 统一 AgentEvent → 带 request_id/heartbeat/no-cache 的 SSE；完成前排空尾事件，切工作区取消旧请求 | `providers/deepseek.py` + `ui.py` + `ui/app.js` |
+| **流式输出** | LLM 原始流 → 统一 AgentEvent → 带 request_id/heartbeat/no-cache 的 SSE；完成前排空尾事件，切工作区取消旧请求 | `providers/catalog.py` + `providers/deepseek.py` + `providers/openai_compatible.py` + `ui.py` + `ui/app.js` |
 | **防循环护栏** | 连续 3 次相同 run_stata 中断（确定性，不靠模型自觉） | `agent_loop.py` |
+| **单请求预算** | `interactive`/`goal` 分别限制一条用户消息内部的 provider 回合（默认 16/64，每条消息重置），另有顶层工具调用上限（默认 128）；发生工具调用后最后一个 provider 回合只用于汇总结果 | `application/agent_budget.py` + `application/settings.py` + `chat_service.py` + `agent_loop.py` |
 | **幂等/恢复** | 同 input_hash 复用；断点续跑；writer lease/fence；reconcile | `executor.py` + `storage/` + `harness/recovery.py` |
 | **长会话** | `ContextAssembler` 按固定层级构造有界 projection；token 压力触发 append-only `compaction.boundary`，保留完整工具尾部与 manifest | `harness/context_assembler.py` + `compaction.py` + `agent_loop.py` |
 | **记忆** | Memory V2 按 workspace 隔离、检索相关约束并附 provenance；项目约定/决定是约束而非证据，与证据库分开；可选候选提取默认关闭且需审核 | `memory/memstore.py` + `memory/pipeline.py` + `toolkit.py` + `ui.py` |
@@ -64,6 +65,7 @@ harness/telemetry.py      两本账遥测(jsonl)
 harness/branch.py         分支 fork/切片/父链
 harness/research_turn.py  旧 research_turn(已弃用，UI 走 agent_loop)
 application/chat_service.py 框架无关的同步 chat use case + 资源生命周期
+application/agent_budget.py 单条消息/目标任务的 provider 回合与顶层工具预算默认值
 application/request_control.py 线程安全的进程内请求控制
 application/task_queue.py 后台任务队列端口 + 明确提交结果
 application/local_task_queue.py 有界单 worker 本地适配器（非持久化）
@@ -79,8 +81,10 @@ domain/reducers.py        fold(事件→投影) + 非法序列拒绝
 domain/family.py          ExperimentFamily(成员/选主结果)
 storage/sqlite_store.py   事件账本 DDL + append/scan/project + writer lease/fence + 快照
 storage/migrations.py     显式、事务化、带历史漂移检测的 SQLite schema migration
-providers/deepseek.py     deepseek(chat/stream_chat) + qwen 兜底
-providers/registry.py     按 env 选 provider + 隐私门
+providers/catalog.py      闭合 provider/model 目录 + capability profile 投影
+providers/deepseek.py     DeepSeek/Qwen 历史适配器（兼容旧调用方）
+providers/openai_compatible.py 目录中通用 OpenAI-compatible 适配器
+providers/registry.py     按 settings/env 选 provider + 隐私门
 providers/capabilities.py ModelCapabilityProfile
 providers/codec.py        ActionProposal 编解码(旧)
 providers/llm.py          chat_structured 重试(旧)
@@ -128,7 +132,7 @@ ui/index.html·app.js·styles.css  前端(纯原生，无框架)
 **当前已实现并由离线测试覆盖**：agent loop（provider 可插拔）· 工具/证据写权分离 ·
 SSE 流式输出 · 多工作区 UI · 有界内容哈希 RAG · 可匹配 Skill · 记忆与缓存的本地持久化 ·
 隐私模式读取。默认无 Stata 执行器，不会伪造回归结果；FakeExecutor 只在 demo 或显式
-`STATA_AGENT_EXECUTOR=fake` 下启用。真 deepseek/Stata 端到端依赖本机凭据与环境，不能当作
+`STATA_AGENT_EXECUTOR=fake` 下启用。真 provider/Stata 端到端依赖本机凭据与环境，不能当作
 默认能力或 CI 事实。
 
 **尚未实现或需继续强化**：
@@ -137,11 +141,11 @@ SSE 流式输出 · 多工作区 UI · 有界内容哈希 RAG · 可匹配 Skill
 3. **Outbox 运维闭环（P1）**：SQLite outbox 已实现原子 intent、claim lease、持续重投、dead-letter 与健康指标；下一步是超长 provider 调用的 lease heartbeat、人工 redrive 和历史任务清理策略。
 4. **附件/图片输入（P1）**：尚未建立上传沙箱、格式嗅探、大小限制、恶意文件测试和 workspace 生命周期清理。
 5. **可观测性/支持（P1）**：需统一 request/operation/outbox correlation，增加结构化日志、错误导出包和真实运行 SLO。
-6. **交互体验（P2）**：工具调用独立节点、Markdown 表格细节、审批“修改后通过”、附件与 stop 状态仍需一次完整人工 UX 回归。
-7. **自进化 skill（P2）**：`evolve.py` 仍在 staging（promote 需人工），且 `skill_candidate_md` 的旧 variants 格式需对齐新 Skill 语义。
+6. **交互体验（P2）**：稳定 tool call identity、可恢复 run 状态、附件历史投影、审批修改与语义化 Markdown 表格已由离线合同覆盖；仍需发布前 Windows 人工 UX 回归。
+7. **自进化 skill（P2）**：Skill V2 schema、结构化 phase/needs 匹配、隔离 staging、内容哈希绑定人工审批、原子 promote 与单一 active 版本已实现；模型不能自动批准或提升 Skill。
 8. **部署扩展（P3）**：只有出现多进程/多机 worker、任务量或运维隔离需求时，再实现 RQ/Redis adapter；当前 SQLite + 本地队列是桌面单机产品的默认方案。
 
-**2026-09-10 当前门禁**：368 collected，364 passed / 4 skipped；Ruff、Mypy、L1–L4 产品评测、77% branch coverage 与 wheel build 均通过。真 Stata doctor 20 次持久会话验收通过。
+**2026-09-11 当前门禁**：577 collected，571 passed / 6 skipped；Ruff、Mypy、L1–L7 产品评测、77% branch coverage、wheel build 与离线 release doctor 均通过。真 Stata doctor 20 次持久会话验收通过；Windows 签名、干净安装、升级/回滚和备份恢复仍需人工验收。
 
 ## 6. 给 codex 的接手清单
 
@@ -154,7 +158,7 @@ SSE 流式输出 · 多工作区 UI · 有界内容哈希 RAG · 可匹配 Skill
 ## 7. 关键环境变量（app/.env）
 
 ```
-DEEPSEEK_API_KEY          deepseek key（优先）
+DEEPSEEK_API_KEY          兼容旧配置；也可在应用设置中选择目录 provider 并填写凭据
 STATA_AGENT_PRIVACY       local_strict / approved_remote / mixed_sanitized
 STATA_AGENT_EXECUTOR      stata(真) / fake(仅显式演示或测试) / 缺省(不可用)
 STATA_AGENT_LIBRARY       文献库目录（RAG）

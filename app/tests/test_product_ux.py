@@ -133,7 +133,7 @@ def test_api_errors_have_one_shape_and_static_ui_contract(tmp_path, monkeypatch)
     assert body["error"]["code"] == "http_404"
     assert body["error"]["message"] == body["detail"]
 
-    root = Path(ui.__file__).with_name("ui")
+    root = Path(ui.__file__).with_name("webui")
     script = (root / "app.js").read_text(encoding="utf-8")
     assert "md-table" in script
     assert "tool-card" in script

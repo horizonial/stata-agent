@@ -261,9 +261,88 @@ def _create_ledger_and_outbox_schema(connection: sqlite3.Connection) -> None:
                 _ensure_column(connection, "events", column, definition)
 
 
+def _add_outbox_state_version(connection: sqlite3.Connection) -> None:
+    """Add the durable outbox generation used for optimistic fencing."""
+
+    _ensure_column(
+        connection,
+        "task_outbox",
+        "state_version",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+
+
+def _create_attachment_schema(connection: sqlite3.Connection) -> None:
+    """Create the workspace-scoped attachment operational index.
+
+    Attachment bytes and extracted text deliberately stay outside SQLite.  The
+    table is only a durable index/state machine coupled to metadata-only
+    ledger events by ``SQLiteStore``.  Keeping this migration additive means
+    old v3 databases upgrade without a second database or a bootstrap side
+    channel.
+    """
+
+    statements = (
+        """
+        CREATE TABLE IF NOT EXISTS attachments (
+          attachment_id       TEXT PRIMARY KEY,
+          workspace_id        TEXT NOT NULL,
+          idea_id             TEXT NOT NULL,
+          display_name        TEXT NOT NULL CHECK (length(display_name) BETWEEN 1 AND 180),
+          declared_media_type TEXT NOT NULL DEFAULT '' CHECK (length(declared_media_type) <= 128),
+          detected_format     TEXT NOT NULL CHECK (detected_format IN ('pdf', 'unknown')),
+          source_role         TEXT NOT NULL CHECK (source_role IN ('style_only', 'citable_evidence')),
+          status              TEXT NOT NULL CHECK (status IN ('pending', 'quarantined', 'ready', 'rejected', 'failed')),
+          byte_size           INTEGER NOT NULL CHECK (byte_size >= 0 AND byte_size <= 26214400),
+          sha256              TEXT CHECK (sha256 IS NULL OR (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*')),
+          storage_key         TEXT CHECK (
+            storage_key IS NULL OR
+            (length(storage_key) BETWEEN 1 AND 512 AND substr(storage_key, 1, 1) NOT IN ('/', char(92))
+             AND instr(storage_key, '..') = 0)
+          ),
+          parser_version      INTEGER CHECK (parser_version IS NULL OR parser_version >= 0),
+          page_count          INTEGER NOT NULL DEFAULT 0 CHECK (page_count >= 0 AND page_count <= 64),
+          chunk_count         INTEGER NOT NULL DEFAULT 0 CHECK (chunk_count >= 0 AND chunk_count <= 10000),
+          extracted_chars     INTEGER NOT NULL DEFAULT 0 CHECK (extracted_chars >= 0 AND extracted_chars <= 2000000),
+          scanned_suspect     INTEGER NOT NULL DEFAULT 0 CHECK (scanned_suspect IN (0, 1)),
+          error_code          TEXT CHECK (error_code IS NULL OR length(error_code) BETWEEN 1 AND 128),
+          created_at          INTEGER NOT NULL,
+          updated_at          INTEGER NOT NULL,
+          ready_at            INTEGER,
+          expires_at          INTEGER,
+          latest_event_seq    INTEGER,
+          state_version       INTEGER NOT NULL DEFAULT 0 CHECK (state_version >= 0),
+          idempotency_key     TEXT CHECK (idempotency_key IS NULL OR length(idempotency_key) BETWEEN 1 AND 256)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_attachments_workspace_status_recency
+        ON attachments(workspace_id, status, updated_at DESC, attachment_id)
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_attachments_workspace_sha256
+        ON attachments(workspace_id, sha256)
+        WHERE sha256 IS NOT NULL
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_attachments_workspace_idempotency
+        ON attachments(workspace_id, idempotency_key)
+        WHERE idempotency_key IS NOT NULL
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_attachments_pending_maintenance
+        ON attachments(workspace_id, status, expires_at, updated_at)
+        """,
+    )
+    for statement in statements:
+        connection.execute(statement)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "memory_storage_v1", _create_memory_schema),
     Migration(2, "ledger_and_task_outbox_v2", _create_ledger_and_outbox_schema),
+    Migration(3, "task_outbox_state_version_v3", _add_outbox_state_version),
+    Migration(4, "workspace_attachments_v4", _create_attachment_schema),
 )
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version
 

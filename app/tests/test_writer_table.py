@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from docx import Document
+import pytest
 
 from stata_agent.domain.models import EvidenceCard
 from stata_agent.storage.sqlite_store import SQLiteStore
@@ -67,6 +68,20 @@ def test_validate_clean_and_tampered():
     assert "-238.800" in validate_cells(tampered, cards)
 
 
+def test_strict_cell_validation_requires_exact_card_binding():
+    cards = _cards()
+    model = table_from_tsv("model\t(1)\ncoef\t-238.894\n")
+    model.rows[0].cells[0].stat_type = "coef"
+    model.rows[0].cells[0].card_id = "c-coef"
+    assert validate_cells(model, cards, require_card_ids=True) == []
+
+    model.rows[0].cells[0].card_id = "c-r2"  # same shape, wrong source
+    assert validate_cells(model, cards, require_card_ids=True)[0].startswith("card_mismatch:")
+
+    model.rows[0].cells[0].card_id = None
+    assert validate_cells(model, cards, require_card_ids=True)[0].startswith("missing_card:")
+
+
 def test_build_run_table_and_docx(tmp_path):
     store = SQLiteStore(str(tmp_path / "l.db"), writer_id="a")
     from stata_agent.domain.action import Act, ActionProposal
@@ -105,3 +120,11 @@ def test_build_run_table_and_docx(tmp_path):
     allcell = " | ".join(c.text for row in doc.tables[0].rows for c in row.cells)
     assert "核心系数" in allcell and "样本量" in allcell
     store.close()
+
+
+def test_tables_to_docx_strict_cards_reject_value_swap():
+    model = table_from_tsv("model\t(1)\ncoef\t-238.894\n")
+    model.rows[0].cells[0].stat_type = "coef"
+    model.rows[0].cells[0].card_id = "c-r2"
+    with pytest.raises(ValueError, match="不匹配"):
+        tables_to_docx("严格表", [model], cards={card.card_id: card for card in _cards()})

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from .embed import Embedder, cosine
 from .ingest import Chunk
-from .retriever import LexicalIndex
+from .retriever import LexicalIndex, _bounded_top_k
 
 
 class VectorIndex:
@@ -23,15 +23,27 @@ class VectorIndex:
             self._vecs[chunk.chunk_id] = self._embedder.embed_text(chunk.text)
             self._chunks[chunk.chunk_id] = chunk
 
-    def search(self, query: str, *, top_k: int = 5, roles: set[str] | None = None) -> list[Chunk]:
+    def search(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        roles: set[str] | None = None,
+        attachment_ids: set[str] | None = None,
+    ) -> list[Chunk]:
+        top_k = _bounded_top_k(top_k)
+        if top_k == 0:
+            return []
         q = self._embedder.embed_text(query)
         scored = []
         for cid, vec in self._vecs.items():
             chunk = self._chunks[cid]
             if roles and chunk.source_role not in roles:
                 continue
+            if attachment_ids and chunk.attachment_id not in attachment_ids:
+                continue
             scored.append((cosine(q, vec), chunk))
-        scored.sort(key=lambda t: t[0], reverse=True)
+        scored.sort(key=lambda t: (-t[0], t[1].chunk_id))
         return [c for _, c in scored[:top_k]]
 
     def __len__(self) -> int:
@@ -46,15 +58,25 @@ class HybridRetriever:
         self._vec = vector
         self._k = rrf_k
 
-    def search(self, query: str, *, top_k: int = 5, roles: set[str] | None = None) -> list[Chunk]:
+    def search(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        roles: set[str] | None = None,
+        attachment_ids: set[str] | None = None,
+    ) -> list[Chunk]:
+        top_k = _bounded_top_k(top_k)
+        if top_k == 0:
+            return []
         scores: dict[str, float] = {}
         order: dict[str, Chunk] = {}
 
-        for rank, c in enumerate(self._lex.search(query, top_k=top_k * 3, roles=roles)):
+        for rank, c in enumerate(self._lex.search(query, top_k=top_k * 3, roles=roles, attachment_ids=attachment_ids)):
             scores[c.chunk_id] = scores.get(c.chunk_id, 0.0) + 1.0 / (self._k + rank + 1)
             order[c.chunk_id] = c
-        for rank, c in enumerate(self._vec.search(query, top_k=top_k * 3, roles=roles)):
+        for rank, c in enumerate(self._vec.search(query, top_k=top_k * 3, roles=roles, attachment_ids=attachment_ids)):
             scores[c.chunk_id] = scores.get(c.chunk_id, 0.0) + 1.0 / (self._k + rank + 1)
             order[c.chunk_id] = c
-        ranked = sorted(scores, key=scores.get, reverse=True)[:top_k]
+        ranked = sorted(scores, key=lambda cid: (-scores[cid], cid))[:top_k]
         return [order[cid] for cid in ranked]

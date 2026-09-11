@@ -448,7 +448,7 @@ Validator 检：数字（命中 NumericClaim，原始值与展示值分离、渲
 
 > 详细设计进展（DD-01…07 已全部产出，M0 实现依此）：**DD-01 领域对象与事件账本**（`dd-01-domain-events.md`，数据契约）· **DD-02 阶段状态机 + harness**（`dd-02-phase-machine-harness.md`，控制流）· **DD-03 上下文/投影/记忆**（`dd-03-context-memory.md`）· **DD-04 工具契约与权限**（`dd-04-tool-permission.md`，含 stata-mcp 10 工具真实策略映射）· **DD-05 Writer+Validator**（`dd-05-writer-validator.md`，esttab 表语义/图/Table1/Word）· **DD-06 评测 L0–L4**（`dd-06-eval.md`，复现 benchmark）· **DD-07 文献管线+skill 规范**（`dd-07-rag-skills.md`）。§7 多数待深化点已落到这些文档。
 > **2026-09-07 Stata 实证审计**：`design/audit-stata-practice.md`。S1（prep/pipeline、env_sig、表语义 locator/figure 卡）已修进 DD-01；S2 门控探索环已修进 DD-02；skill requires 已修进 §4.6；联网/图片 = **新能力方向（§4.10，已记为决策）**，落 DD-03/DD-04。待做：figure 证据接 writer、描述/平衡表模板、esttab 表语义解析器。
-> **落实规划**：`design/impl-plan.md`（切片 0–5 + 代码布局 + §5 默认值表 + 切片 0 详单验收）。当前阶段：规划已出、待用户审后开写切片 0。
+> **规划状态说明**：本 SPEC 保留基础设计语义，但不再维护当前阶段或下一步；唯一有效优先级与实施计划见仓库根目录 `IMPLEMENTATION_PLAN.md`。
 
 **v0.4 已关闭**：ledger.jsonl vs SQLite 冲突、thought 持久化、本地隐私 vs DeepSeek 矛盾、双库只靠 collection 隔离、validator 事后校验。
 **v0.5 新关闭**：events 可重建字段/reconcile（N1）→ §4.4；恢复后健康探针（N2）→ §4.9.3；工具闭合不变量/半截不执行（N3）→ §4.4/§4.9.3；研究完整性闸门+自由度账本（N5）→ §4.9.2；结果三层契约（N6）→ §4.8；分级证据门槛（N7）→ §4.8；上下文投影层（N8）→ §4.9.1；ResearchState 内容层（N9）→ §4.3.1；Claim/EvidenceCard+ExperimentFamily（N10）→ §4.8；写入权分离（N11）→ §4.8；探索/确认护栏（N12）→ §4.9.5；分支语义+rollback 边界（N13）→ §4.4；writer fence（N14）→ §4.4；阶段 0 内核（N16）→ §5。

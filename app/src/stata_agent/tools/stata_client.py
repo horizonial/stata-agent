@@ -25,11 +25,20 @@ STATA_MCP_DIR = Path(os.environ.get("STATA_MCP_DIR", r"C:\Users\user\stata-mcp")
 _STATA_PY = STATA_MCP_DIR / ".venv" / "Scripts" / "python.exe"
 
 
-def server_params() -> StdioServerParameters:
+def server_params(mcp_dir: str | Path | None = None) -> StdioServerParameters:
+    """Build stdio parameters from an explicit request composition.
+
+    The no-argument form remains the legacy environment-compatible path.  A
+    runtime settings snapshot can pass a directory explicitly so an in-flight
+    request never observes a later global environment change.
+    """
+
+    root = Path(mcp_dir) if mcp_dir is not None else STATA_MCP_DIR
+    python_executable = root / ".venv" / "Scripts" / "python.exe"
     return StdioServerParameters(
-        command=str(_STATA_PY),
+        command=str(python_executable),
         args=["-m", "stata_mcp.server"],
-        cwd=str(STATA_MCP_DIR),
+        cwd=str(root),
     )
 
 
@@ -74,11 +83,12 @@ async def _call(
     cancellation=None,
     cancel_token=None,
     errlog: TextIO | None = None,
+    mcp_dir: str | Path | None = None,
 ) -> CallResult:
     token = cancellation or cancel_token
     if is_cancel_requested(token):
         raise StataCancelledError(cancellation_reason(token), uncertain=False)
-    params = server_params()
+    params = server_params(mcp_dir)
     transport = stdio_client(params) if errlog is None else stdio_client(params, errlog=errlog)
     async with transport as (read, write):
         async with ClientSession(read, write) as sess:
@@ -126,8 +136,9 @@ async def _call(
 class StataClient:
     """同步门面（harness 是同步的；内部 asyncio.run 一次调用）。"""
 
-    def __init__(self, *, errlog: TextIO | None = None) -> None:
+    def __init__(self, *, errlog: TextIO | None = None, mcp_dir: str | Path | None = None) -> None:
         self._errlog = errlog
+        self._mcp_dir = Path(mcp_dir) if mcp_dir is not None else None
 
     def run_code(
         self,
@@ -137,6 +148,7 @@ class StataClient:
         cancel_token=None,
         *,
         errlog: TextIO | None = None,
+        mcp_dir: str | Path | None = None,
     ) -> CallResult:
         return asyncio.run(
             _call(
@@ -145,11 +157,12 @@ class StataClient:
                 cancellation=cancellation,
                 cancel_token=cancel_token,
                 errlog=errlog or self._errlog,
+                mcp_dir=mcp_dir if mcp_dir is not None else self._mcp_dir,
             )
         )
 
     async def list_tools(self, *, errlog: TextIO | None = None) -> list[str]:
-        params = server_params()
+        params = server_params(self._mcp_dir)
         target_errlog = errlog or self._errlog
         transport = (
             stdio_client(params)
@@ -179,9 +192,11 @@ class StataSession:
     逐条单行命令执行。本类在专用线程里跑事件循环 + 常驻 stdio，暴露同步 call()。
     """
 
-    def __init__(self, timeout: float = 180.0, *, errlog: TextIO | None = None):
+    def __init__(self, timeout: float = 180.0, *, errlog: TextIO | None = None,
+                 mcp_dir: str | Path | None = None):
         self._timeout = timeout
         self._errlog = errlog
+        self._mcp_dir = Path(mcp_dir) if mcp_dir is not None else None
         self._ready = threading.Event()
         self._err: Exception | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -207,9 +222,9 @@ class StataSession:
                 return
             target_errlog = self._errlog
             transport = (
-                stdio_client(server_params())
+                stdio_client(server_params(self._mcp_dir))
                 if target_errlog is None
-                else stdio_client(server_params(), errlog=target_errlog)
+                else stdio_client(server_params(self._mcp_dir), errlog=target_errlog)
             )
             async with transport as (read, write):
                 async with ClientSession(read, write) as sess:

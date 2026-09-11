@@ -37,6 +37,7 @@ from ..events.schema import (
 from ..storage.sqlite_store import SQLiteStore
 from .summary_service import (
     SUMMARY_MODES,
+    SUMMARY_FIELDS,
     SUMMARY_PROMPT_VERSION,
     MAX_SOURCE_CHARS,
     MAX_SOURCE_ITEMS,
@@ -86,6 +87,41 @@ class Boundary:
     def retained_from_seq(self) -> int | None:
         value = self.payload.get("retained_from_seq")
         return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+@dataclass(frozen=True)
+class CheckpointHealth:
+    """Result of a pure checkpoint/recovery health probe.
+
+    The probe deliberately exposes only stable projection signatures and
+    reason codes.  It never returns summary text, event payloads, tool output,
+    or provider material.  ``ok`` is the single release decision; callers can
+    use ``bool(result)`` or ``result.as_dict()`` without depending on a
+    particular storage implementation.
+    """
+
+    ok: bool
+    issues: tuple[str, ...] = ()
+    boundary_seq: int | None = None
+    expected_projection: tuple | None = None
+    recovered_projection: tuple | None = None
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "issues": list(self.issues),
+            "boundary_seq": self.boundary_seq,
+            "expected_projection": self.expected_projection,
+            "recovered_projection": self.recovered_projection,
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        """Small mapping compatibility helper for status/telemetry callers."""
+
+        return self.as_dict()[key]
 
 
 def _seq(event: Event) -> int:
@@ -204,6 +240,21 @@ def normalize_boundary_payload(payload: Any) -> dict[str, Any]:
     return _normalise_v2(payload)
 
 
+def _canonical_events(events: Iterable[Event], *, upto_seq: int | None = None) -> list[Event]:
+    """Return the canonical event view used by checkpoint validation.
+
+    A boundary is a projection of the ledger *at* ``to_seq``.  Looking at
+    events after that point would make a future claim/run appear to justify a
+    stale checkpoint, so compaction validation must never use the full live
+    ledger as its reference set.
+    """
+
+    result = [event for event in events if event.event_type != EVENT_COMPACTION]
+    if upto_seq is not None:
+        result = [event for event in result if 0 < _seq(event) <= upto_seq]
+    return sorted(result, key=_seq)
+
+
 def _known_ids(events: Iterable[Event], proj: Projection | None = None) -> set[str]:
     known: set[str] = set()
     if proj is not None:
@@ -258,12 +309,20 @@ def validate_boundary(
             raise CompactionValidationError("previous_boundary_seq 与上一个 boundary 不一致")
         if payload["to_seq"] <= previous.to_seq:
             raise CompactionValidationError("连续 boundary 的 to_seq 必须递增")
+    elif payload["version"] >= 2 and payload.get("previous_boundary_seq") is not None:
+        raise CompactionValidationError("首个 boundary 不得声明 previous_boundary_seq")
     event_list = list(events or ())
     if event_list:
-        seqs = [_seq(item) for item in event_list if _seq(item) > 0]
-        if seqs and (payload["from_seq"] < min(seqs) or payload["to_seq"] > max(seqs)):
+        # Only the canonical prefix can prove a checkpoint.  In particular,
+        # future claims must not make a stale boundary's evidence_refs look
+        # valid after a partial/replayed scan.
+        canonical_events = _canonical_events(event_list, upto_seq=payload["to_seq"])
+        seqs = [_seq(item) for item in canonical_events if _seq(item) > 0]
+        if not seqs:
+            raise CompactionValidationError("boundary range 没有 canonical events")
+        if payload["from_seq"] < min(seqs) or payload["to_seq"] > max(seqs):
             raise CompactionValidationError("boundary range 超出 ledger")
-        known = _known_ids(event_list)
+        known = _known_ids(canonical_events)
         if payload["version"] >= 2:
             unknown = sorted(set(payload["summary"]["evidence_refs"]) - known)
             if unknown:
@@ -281,9 +340,28 @@ def validate_boundary(
                     raise CompactionValidationError(
                         f"summary 引用了不存在的 source id: {unknown_sources}"
                     )
-        safe_end = _safe_cut(event_list, payload["to_seq"], lower=payload["from_seq"])
+        safe_end = _safe_cut(canonical_events, payload["to_seq"], lower=payload["from_seq"])
         if safe_end != payload["to_seq"]:
             raise CompactionValidationError("boundary to_seq 切分了未闭合的 semantic unit")
+        retained = payload.get("retained_from_seq")
+        if payload["version"] >= 2 and retained is not None and retained <= payload["to_seq"]:
+            adjusted = _adjust_tail_start(
+                canonical_events,
+                retained,
+                lower=payload["from_seq"],
+                upper=payload["to_seq"],
+            )
+            if adjusted != retained:
+                raise CompactionValidationError("boundary retained_from_seq 切分了未闭合的 semantic unit")
+        if payload["version"] >= 2:
+            issues = _checkpoint_fidelity_issues(
+                event,
+                payload=payload,
+                canonical_events=canonical_events,
+                previous=previous,
+            )
+            if issues:
+                raise CompactionValidationError("; ".join(issues))
     return Boundary(event=event, payload=payload)
 
 
@@ -295,10 +373,10 @@ def _validated_boundaries(events: list[Event]) -> list[Boundary]:
         try:
             boundary = validate_boundary(event, events=events, previous=boundaries[-1] if boundaries else None)
         except CompactionValidationError:
-            # A malformed historical boundary must not become a source for a
-            # new one.  Keep scanning so a later valid boundary can still be
-            # read by a diagnostic tool, but do not silently trust it.
-            continue
+            # A malformed boundary terminates the trusted chain.  A later
+            # boundary might be syntactically valid in isolation but cannot be
+            # used as a recovery base because its predecessor is unknown.
+            break
         boundaries.append(boundary)
     return boundaries
 
@@ -399,16 +477,7 @@ def _structured_summary(
     refs.extend(sorted(str(run_id) for run_id in proj.runs))
     known = _known_ids(events, proj)
     refs = unique([ref for ref in refs if ref in known], cap=128)
-    research_state = "; ".join([
-        f"phase={proj.phase or ''}",
-        f"current_spec={rs.current_spec_id if rs else ''}",
-        f"current_family={rs.current_family_id if rs else ''}",
-        f"sample_sig={rs.sample_sig if rs else ''}",
-        f"claims={len(proj.claims)}",
-        f"cards={len(proj.cards)}",
-        f"runs={len(proj.runs)}",
-        f"evidence_refs={len(refs)}",
-    ])
+    research_state = _summary_state_text(proj, refs)
     return {
         "objective": _objective(events, previous),
         "constraints": unique(constraints),
@@ -449,6 +518,13 @@ def _join_values(value: Any) -> str:
 def _tool_key(event: Event) -> str:
     payload = event.payload if isinstance(event.payload, dict) else {}
     return str(payload.get("call_id") or payload.get("operation_id") or payload.get("tool") or "")
+
+
+def _strict_tool_key(event: Event) -> str:
+    """Resolve a tool identity without using the human-readable tool name."""
+
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    return str(payload.get("call_id") or event.operation_id or payload.get("operation_id") or "")
 
 
 def _semantic_units(events: list[Event]) -> list[tuple[int, int]]:
@@ -530,6 +606,89 @@ def _semantic_units(events: list[Event]) -> list[tuple[int, int]]:
     return [(start, end) for start, end in merged]
 
 
+def _semantic_boundary_issues(events: list[Event], *, lower: int, endpoint: int) -> list[str]:
+    """Check closure and identity of every semantic chain in one prefix.
+
+    ``_semantic_units`` is intentionally permissive for rendering legacy
+    transcripts.  A write boundary is stricter: an unmatched terminal or a
+    request resolved by the wrong id is not a safe checkpoint even when the
+    surrounding events otherwise look like ordinary messages.
+    """
+
+    pending_tools: list[tuple[int, str]] = []
+    pending_approvals: dict[str, int] = {}
+    pending_runs: dict[str, int] = {}
+    issues: list[str] = []
+    for event in sorted(events, key=_seq):
+        seq = _seq(event)
+        if seq < lower or seq > endpoint or event.event_type == EVENT_COMPACTION:
+            continue
+        kind = event.event_type
+        key = _strict_tool_key(event)
+        if kind in {EVENT_TOOL_INVOKED, EVENT_TOOL_CALL}:
+            if not key:
+                issues.append("tool_start_missing_identity")
+            else:
+                pending_tools.append((seq, key))
+            continue
+        if kind in {EVENT_TOOL_DONE, EVENT_TOOL_RESULT}:
+            if not pending_tools:
+                issues.append("tool_terminal_without_start")
+                continue
+            if key:
+                matches = [index for index, (_start, pending_key) in enumerate(pending_tools) if pending_key == key]
+                if not matches:
+                    issues.append("tool_terminal_identity_mismatch")
+                    continue
+                del pending_tools[matches[-1]]
+            elif len(pending_tools) == 1:
+                pending_tools.pop()
+            else:
+                issues.append("tool_terminal_ambiguous_identity")
+            continue
+        if kind == EVENT_APPROVAL_REQ:
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            request_id = str(payload.get("request_id") or payload.get("id") or "")
+            if not request_id:
+                issues.append("approval_request_missing_identity")
+            else:
+                pending_approvals[request_id] = seq
+            continue
+        if kind in {EVENT_APPROVAL_GRANT, EVENT_APPROVAL_REJECT}:
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            request_id = str(payload.get("request_id") or payload.get("id") or "")
+            if not request_id:
+                issues.append("approval_terminal_missing_identity")
+            elif request_id not in pending_approvals:
+                issues.append("approval_terminal_identity_mismatch")
+            else:
+                pending_approvals.pop(request_id)
+            continue
+        if kind == EVENT_RUN_REQ:
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            operation = str(event.operation_id or payload.get("operation_id") or payload.get("run_id") or "")
+            if not operation:
+                issues.append("run_request_missing_identity")
+            else:
+                pending_runs[operation] = seq
+            continue
+        if kind in {EVENT_RUN_SUCCEEDED, EVENT_RUN_FAILED, EVENT_RUN_UNCERTAIN}:
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            operation = str(event.operation_id or payload.get("operation_id") or payload.get("run_id") or "")
+            if not operation or operation not in pending_runs:
+                issues.append("run_terminal_identity_mismatch")
+            else:
+                pending_runs.pop(operation)
+
+    if pending_tools:
+        issues.append("tool_chain_unclosed")
+    if pending_approvals:
+        issues.append("approval_chain_unclosed")
+    if pending_runs:
+        issues.append("run_chain_unclosed")
+    return list(dict.fromkeys(issues))
+
+
 def _safe_cut(events: list[Event], candidate: int, *, lower: int) -> int | None:
     """Find the latest endpoint that closes every chain before it.
 
@@ -548,36 +707,7 @@ def _safe_cut(events: list[Event], candidate: int, *, lower: int) -> int | None:
     for endpoint in available:
         if endpoint not in complete_ends:
             continue
-        pending_tools = 0
-        pending_approvals: set[str] = set()
-        pending_runs: set[str] = set()
-        for event in events:
-            seq = _seq(event)
-            if seq < lower or seq > endpoint or event.event_type == EVENT_COMPACTION:
-                continue
-            kind = event.event_type
-            if kind in {EVENT_TOOL_INVOKED, EVENT_TOOL_CALL}:
-                pending_tools += 1
-            elif kind in {EVENT_TOOL_DONE, EVENT_TOOL_RESULT}:
-                pending_tools = max(0, pending_tools - 1)
-            elif kind == EVENT_APPROVAL_REQ:
-                payload = event.payload if isinstance(event.payload, dict) else {}
-                pending_approvals.add(str(payload.get("request_id") or payload.get("id") or f"seq:{seq}"))
-            elif kind in {EVENT_APPROVAL_GRANT, EVENT_APPROVAL_REJECT}:
-                payload = event.payload if isinstance(event.payload, dict) else {}
-                request_id = str(payload.get("request_id") or payload.get("id") or "")
-                if request_id in pending_approvals:
-                    pending_approvals.remove(request_id)
-                elif pending_approvals:
-                    pending_approvals.pop()
-            elif kind == EVENT_RUN_REQ:
-                payload = event.payload if isinstance(event.payload, dict) else {}
-                pending_runs.add(str(event.operation_id or payload.get("operation_id") or payload.get("run_id") or ""))
-            elif kind in {EVENT_RUN_SUCCEEDED, EVENT_RUN_FAILED, EVENT_RUN_UNCERTAIN}:
-                payload = event.payload if isinstance(event.payload, dict) else {}
-                op = str(event.operation_id or payload.get("operation_id") or payload.get("run_id") or "")
-                pending_runs.discard(op)
-        if not pending_tools and not pending_approvals and not pending_runs:
+        if not _semantic_boundary_issues(events, lower=lower, endpoint=endpoint):
             return endpoint
     return None
 
@@ -593,6 +723,40 @@ def _adjust_tail_start(events: list[Event], requested: int, *, lower: int, upper
 def _projection_at(events: list[Event], idea: str, seq: int) -> Projection:
     selected = [event for event in events if _seq(event) <= seq]
     return fold(selected, idea_id=idea)
+
+
+def _projection_signature(projection: Projection) -> tuple:
+    """Return a stable, non-content projection signature for health checks."""
+
+    state = projection.research_state
+    refs = tuple(sorted(str(ref) for ref in (state.evidence_refs if state else [])))
+    return (
+        projection.idea_id,
+        projection.phase,
+        state.current_spec_id if state else None,
+        state.current_family_id if state else None,
+        state.sample_sig if state else None,
+        tuple(sorted((str(claim_id), str(claim.status)) for claim_id, claim in projection.claims.items())),
+        tuple(sorted(str(card_id) for card_id in projection.cards)),
+        tuple(sorted((str(run_id), str(run.status)) for run_id, run in projection.runs.items())),
+        refs,
+    )
+
+
+def _summary_state_text(projection: Projection, evidence_refs: list[str]) -> str:
+    """Build the canonical research-state line used in V2 summaries."""
+
+    state = projection.research_state
+    return "; ".join([
+        f"phase={projection.phase or ''}",
+        f"current_spec={state.current_spec_id if state else ''}",
+        f"current_family={state.current_family_id if state else ''}",
+        f"sample_sig={state.sample_sig if state else ''}",
+        f"claims={len(projection.claims)}",
+        f"cards={len(projection.cards)}",
+        f"runs={len(projection.runs)}",
+        f"evidence_refs={len(evidence_refs)}",
+    ])
 
 
 def _summary_event_text(event: Event) -> str:
@@ -699,6 +863,270 @@ def _model_summary_payload(
     }
 
 
+def _source_event(source_id: str, events: list[Event]) -> Event | None:
+    """Resolve a summary provenance id against the canonical prefix only."""
+
+    value = str(source_id).strip()
+    if value.startswith("seq:"):
+        try:
+            seq = int(value[4:])
+        except (TypeError, ValueError):
+            return None
+        return next((event for event in events if _seq(event) == seq), None)
+    return next((event for event in events if event.event_id == value), None)
+
+
+def _validate_summary_provenance(
+    payload: dict[str, Any],
+    *,
+    summary: dict[str, Any],
+    canonical_events: list[Event],
+) -> None:
+    """Validate model narrative provenance without trusting model text.
+
+    ``summary_provenance`` is an audit index, not a second source of truth.
+    Every id must resolve inside the compressed canonical prefix and its event
+    type must be eligible for the narrative field it supports.
+    """
+
+    provenance = payload.get("summary_provenance")
+    mode = payload.get("summary_mode")
+    if provenance is None:
+        if mode == "model_validated":
+            raise CompactionValidationError("model summary 缺 summary_provenance")
+        return
+    if not isinstance(provenance, dict):
+        raise CompactionValidationError("summary_provenance 必须是 object")
+
+    allowed_roles = {
+        "objective": {"user_message", "approved_decision"},
+        "constraints": {"user_message", "approved_decision"},
+        "decisions": {
+            "user_message", "approved_decision", "assistant_message", "decision", "rejection_note"
+        },
+        "open_items": {
+            "user_message", "approved_decision", "assistant_message", "decision", "rejection_note"
+        },
+    }
+    expected_ids: set[str] = set()
+    for field, refs in provenance.items():
+        if field not in SUMMARY_FIELDS:
+            raise CompactionValidationError("summary_provenance 字段无效")
+        if not isinstance(refs, list) or not refs:
+            raise CompactionValidationError(f"summary_provenance.{field} 不能为空")
+        for ref in refs:
+            if not isinstance(ref, str) or not ref.strip():
+                raise CompactionValidationError("summary_provenance source id 无效")
+            event = _source_event(ref, canonical_events)
+            if event is None:
+                raise CompactionValidationError(f"summary provenance 引用了不存在的 source id: {ref}")
+            role = _summary_event_role(event)
+            if role not in allowed_roles[field]:
+                raise CompactionValidationError(f"summary provenance.{field} source category 不允许")
+            expected_ids.add(ref)
+
+    source_ids = payload.get("summary_source_ids")
+    if source_ids is not None:
+        if not isinstance(source_ids, list) or any(not isinstance(ref, str) for ref in source_ids):
+            raise CompactionValidationError("summary_source_ids 无效")
+        if set(source_ids) != expected_ids:
+            raise CompactionValidationError("summary_source_ids 与 summary_provenance 不一致")
+
+    # A model-validated field must have an audit source whenever it contains
+    # narrative text.  Empty arrays are valid and need no source entry.
+    if mode == "model_validated":
+        for field in SUMMARY_FIELDS:
+            value = summary.get(field)
+            nonempty = bool(value.strip()) if field == "objective" and isinstance(value, str) else bool(value)
+            if nonempty and field not in provenance:
+                raise CompactionValidationError(f"model summary.{field} 缺 provenance")
+
+
+def _checkpoint_fidelity_issues(
+    event: Event,
+    *,
+    payload: dict[str, Any],
+    canonical_events: list[Event],
+    previous: Boundary | None,
+) -> list[str]:
+    """Return deterministic checkpoint fidelity failures for a V2 payload."""
+
+    version = payload.get("version")
+    if not isinstance(version, int) or version < COMPACTION_VERSION:
+        return []
+    idea = event.idea_id
+    try:
+        projection = _projection_at(canonical_events, idea, int(payload["to_seq"]))
+    except Exception as exc:
+        return [f"canonical projection 非法: {exc.__class__.__name__}"]
+
+    previous_summary = previous.payload.get("summary") if previous else None
+    if isinstance(previous_summary, str):
+        previous_summary = {"legacy_summary": previous_summary}
+    from_seq = int(payload["from_seq"])
+    to_seq = int(payload["to_seq"])
+    delta = [event for event in canonical_events if from_seq <= _seq(event) <= to_seq]
+    expected = _structured_summary(
+        projection,
+        delta,
+        previous=previous_summary if isinstance(previous_summary, dict) else None,
+    )
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        return ["V2 summary 不是 object"]
+    issues: list[str] = []
+    actual_objective = summary.get("objective")
+    expected_objective = expected["objective"]
+    if not isinstance(actual_objective, str) or (expected_objective and not actual_objective.strip()):
+        issues.append("summary objective 丢失")
+    elif expected_objective and actual_objective != expected_objective:
+        # Model wording may be rewritten, but only when it has an eligible
+        # provenance source.  Deterministic/fallback summaries must be exact.
+        if payload.get("summary_mode") != "model_validated":
+            issues.append("summary objective 与 canonical projection 不一致")
+    elif not expected_objective and actual_objective:
+        issues.append("summary objective 新增")
+
+    if summary.get("research_state") != expected["research_state"]:
+        issues.append("summary research_state 与 canonical projection 不一致")
+    actual_refs = summary.get("evidence_refs")
+    if actual_refs != expected["evidence_refs"]:
+        issues.append("summary evidence_refs 与 canonical projection 不一致")
+    try:
+        _validate_summary_provenance(
+            payload,
+            summary=summary,
+            canonical_events=canonical_events,
+        )
+    except CompactionValidationError as exc:
+        issues.append(str(exc))
+    return issues
+
+
+def checkpoint_health(
+    source: SQLiteStore | Iterable[Event],
+    idea: str | None = None,
+) -> CheckpointHealth:
+    """Run the deterministic checkpoint/recovery health probe.
+
+    ``source`` may be a live ``SQLiteStore`` or a replayable event iterable.
+    For a store, the probe compares the store projection with a fresh fold of
+    the canonical ledger, which makes the same check useful after close/reopen.
+    The result contains only stable signatures and reason codes.
+    """
+
+    issues: list[str] = []
+    try:
+        if isinstance(source, SQLiteStore):
+            if not idea:
+                raise ValueError("health probe 需要 idea")
+            events = list(source.scan(idea))
+        else:
+            events = list(source)
+            if idea is None and events:
+                idea = events[0].idea_id
+        if not idea:
+            return CheckpointHealth(ok=False, issues=("missing_idea",))
+    except Exception as exc:
+        return CheckpointHealth(
+            ok=False,
+            issues=(f"scan_failed:{exc.__class__.__name__}",),
+        )
+
+    # A generic replay iterable may contain more than one workspace/idea.  A
+    # probe must never let a foreign event contaminate the projection it
+    # claims to validate.
+    events = [event for event in events if event.idea_id == idea]
+
+    compaction_events = sorted(
+        (event for event in events if event.event_type == EVENT_COMPACTION),
+        key=_seq,
+    )
+    boundaries = _validated_boundaries(events)
+    boundary = boundaries[-1] if boundaries else None
+    if compaction_events and boundary is None:
+        issues.append("no_valid_boundary")
+    elif boundary is not None and _seq(boundary.event) != _seq(compaction_events[-1]):
+        # The latest compaction is damaged or disconnected from the trusted
+        # chain; recovery must stop at the prior valid checkpoint.
+        issues.append("latest_boundary_invalid")
+
+    expected_projection: tuple | None = None
+    recovered_projection: tuple | None = None
+    canonical = _canonical_events(events)
+    try:
+        current = fold(canonical, idea_id=idea)
+        recovered_projection = _projection_signature(current)
+    except Exception:
+        issues.append("canonical_projection_invalid")
+        current = None
+
+    if boundary is not None:
+        try:
+            # Re-run exactly the append preflight against the latest boundary;
+            # restart and live paths therefore share one validation contract.
+            previous: Boundary | None = None
+            for candidate in boundaries[:-1]:
+                previous = candidate
+            validate_boundary(boundary.event, events=events, previous=previous)
+            prefix = _canonical_events(events, upto_seq=boundary.to_seq)
+            expected_projection = _projection_signature(_projection_at(prefix, idea, boundary.to_seq))
+        except Exception:
+            issues.append("checkpoint_fidelity_failed")
+
+    if isinstance(source, SQLiteStore) and current is not None:
+        try:
+            actual = source.project(idea)
+            actual_signature = _projection_signature(actual)
+            if actual_signature != recovered_projection:
+                issues.append("recovery_projection_mismatch")
+        except Exception as exc:
+            # Keep the public health surface deterministic and content-free.
+            issues.append(f"recovery_projection_failed:{exc.__class__.__name__}")
+
+    return CheckpointHealth(
+        ok=not issues,
+        issues=tuple(dict.fromkeys(issues)),
+        boundary_seq=boundary.seq if boundary else None,
+        expected_projection=expected_projection,
+        recovered_projection=recovered_projection,
+    )
+
+
+# ``health_probe`` is the short name used by the harness design; retain the
+# descriptive alias for callers that want to make the checkpoint scope clear.
+health_probe = checkpoint_health
+
+
+def _next_sequence(store: SQLiteStore, events: list[Event]) -> int:
+    """Read the next global sequence without changing the storage contract."""
+
+    local_next = max((_seq(event) for event in events), default=0) + 1
+    connection = getattr(store, "connection", None)
+    if connection is None:
+        return local_next
+    try:
+        row = connection.execute("SELECT MAX(seq) AS seq FROM events").fetchone()
+        global_last = int(row["seq"] or 0) if row is not None else 0
+        return max(local_next, global_last + 1)
+    except Exception:
+        # A LedgerStore-compatible test double may expose no SQL connection;
+        # the local sequence is still sufficient for preflight ordering.
+        return local_next
+
+
+def _boundary_chain_error(events: list[Event], previous: Boundary | None) -> str | None:
+    """Reject a damaged boundary suffix before creating a new checkpoint."""
+
+    compactions = [event for event in events if event.event_type == EVENT_COMPACTION]
+    for event in compactions:
+        if previous is not None and _seq(event) <= previous.seq:
+            continue
+        if previous is None or _seq(event) > previous.seq:
+            return "存在无法验证的历史 compaction boundary"
+    return None
+
+
 def compact(
     store: SQLiteStore,
     idea: str,
@@ -722,7 +1150,11 @@ def compact(
     events = list(store.scan(idea))
     if not events:
         raise ValueError("无可压缩事件")
+    revision_before = getattr(store, "revision", None)
     previous = latest_valid_boundary(events)
+    chain_error = _boundary_chain_error(events, previous)
+    if chain_error:
+        raise CompactionValidationError(chain_error)
     previous_to = previous.to_seq if previous else 0
     previous_event_seq = previous.seq if previous else 0
     source_start = previous_to + 1 if previous else min(_seq(event) for event in events if _seq(event) > 0)
@@ -812,6 +1244,17 @@ def compact(
     payload.update(summary_metadata)
     if phase_scope is not None:
         payload["phase_scope"] = str(phase_scope)
+    # A provider summary can take time.  Re-check the immutable input before
+    # creating the candidate so a concurrent append cannot produce a boundary
+    # whose summary describes an older sequence view.
+    current_revision = getattr(store, "revision", None)
+    current_events = list(store.scan(idea))
+    if revision_before is not None and current_revision != revision_before:
+        raise CompactionValidationError("ledger 在 compaction preflight 期间发生变化")
+    if [(event.seq, event.event_id) for event in current_events] != [
+        (event.seq, event.event_id) for event in events
+    ]:
+        raise CompactionValidationError("ledger sequence 在 compaction preflight 期间发生变化")
     candidate_event = Event(
         idea_id=idea,
         event_type=EVENT_COMPACTION,
@@ -819,16 +1262,23 @@ def compact(
         source=ACTOR_ORCH,
         phase=projection.phase,
         payload=payload,
+        seq=_next_sequence(store, current_events),
     )
-    normalize_boundary_payload(payload)
+    # Full preflight happens before store.append.  SQLiteStore deliberately
+    # accepts compaction as a reducer-neutral event, so this explicit check is
+    # the guard that prevents an invalid checkpoint from entering the ledger.
+    validate_boundary(candidate_event, events=current_events, previous=previous)
     seq = store.append(candidate_event)
     stored_events = list(store.scan(idea))
     stored = next((event for event in reversed(stored_events) if event.event_type == EVENT_COMPACTION), None)
-    if stored is not None:
-        try:
-            validate_boundary(stored, events=stored_events, previous=previous)
-        except CompactionValidationError as exc:
-            raise ValueError(f"append 后 boundary 校验失败: {exc}") from exc
+    if stored is None:
+        raise ValueError("append 后未找到 compaction boundary")
+    try:
+        validate_boundary(stored, events=stored_events, previous=previous)
+    except CompactionValidationError as exc:
+        raise ValueError(f"append 后 boundary 校验失败: {exc}") from exc
+    if stored.seq != seq:
+        raise ValueError("append 后 boundary sequence 不一致")
     rendered = render_summary(summary)
     return {
         "seq": seq,
@@ -870,10 +1320,13 @@ def build_context_after(store: SQLiteStore, idea: str) -> str:
 
 __all__ = [
     "Boundary",
+    "CheckpointHealth",
     "COMPACTION_VERSION",
     "CompactionValidationError",
     "build_context_after",
+    "checkpoint_health",
     "compact",
+    "health_probe",
     "latest_valid_boundary",
     "normalize_boundary_payload",
     "render_summary",

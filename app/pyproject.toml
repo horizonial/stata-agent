@@ -7,24 +7,37 @@ name = "stata-agent"
 version = "0.1.0"
 description = "实证研究 agent —— 切片 0：无 Agent 事件内核（事件账本 + 领域 reducer + 权限/阶段最小）"
 requires-python = ">=3.12"
-dependencies = ["pydantic>=2.0"]
+dependencies = [
+  "pydantic>=2.0",
+  "fastapi",
+  "uvicorn[standard]",
+  "pymupdf",
+  "python-docx",
+  "mcp>=2,<3",
+]
 
 [project.scripts]
 stata-agent-eval = "stata_agent.eval.runner:main"
+stata-agent-capability-eval = "stata_agent.eval.capability:main"
 stata-agent-stata-check = "stata_agent.stata_doctor:main"
+stata-agent-backup = "stata_agent.application.release_ops:main"
+stata-agent-release-check = "stata_agent.release_doctor:main"
+stata-agent-provider-check = "stata_agent.providers.provider_check:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "coverage>=7.6", "ruff>=0.6", "mypy>=1.10", "build>=1.2"]
-stata = ["mcp>=2,<3"]
-rag = ["pymupdf"]
-writing = ["python-docx"]
-ui = ["fastapi", "uvicorn[standard]", "pymupdf", "python-docx", "mcp>=2,<3"]
+# Kept as compatibility aliases for existing install commands.  Product
+# entrypoints import these components directly, so their dependencies are core.
+stata = []
+rag = []
+writing = []
+ui = []
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-stata_agent = ["ui/*.html", "ui/*.css", "ui/*.js", "skills/*.md", "eval/*.json"]
+stata_agent = ["webui/*.html", "webui/*.css", "webui/*.js", "skills/*.md", "eval/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

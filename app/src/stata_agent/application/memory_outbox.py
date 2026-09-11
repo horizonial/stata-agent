@@ -15,6 +15,9 @@ pending for a later pump.
 
 from __future__ import annotations
 
+import math
+import threading
+import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -194,6 +197,17 @@ class MemoryOutboxRepository(Protocol):
 
         ...
 
+    def renew(
+        self,
+        kind: str,
+        key: str,
+        lease_token: str,
+        lease_seconds: float,
+    ) -> bool:
+        """Extend an active claim; return False only for definite lease loss."""
+
+        ...
+
     def retry(
         self,
         kind: str,
@@ -304,6 +318,84 @@ def _submit_status(value: object) -> TaskSubmitStatus:
     return TaskSubmitStatus.ACCEPTED if bool(value) else TaskSubmitStatus.FULL
 
 
+def _normalize_lease_seconds(value: float) -> float:
+    """Validate one lease duration without allowing NaN/Infinity or bools."""
+
+    if isinstance(value, bool):
+        raise ValueError("lease_seconds must be positive and finite")
+    try:
+        duration = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("lease_seconds must be positive and finite") from exc
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("lease_seconds must be positive and finite")
+    return duration
+
+
+class _LeaseHeartbeat:
+    """Renew one claim until its callback reaches an outbox transition."""
+
+    def __init__(
+        self,
+        repository: MemoryOutboxRepository,
+        *,
+        kind: str,
+        claim: MemoryOutboxClaim,
+        lease_seconds: float,
+        interval_seconds: float,
+    ) -> None:
+        self._repository = repository
+        self._kind = kind
+        self._claim = claim
+        self._lease_seconds = lease_seconds
+        self._interval_seconds = interval_seconds
+        self._stop_event = threading.Event()
+        self._lost_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def lost(self) -> bool:
+        return self._lost_event.is_set()
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None:
+                return
+            thread = threading.Thread(
+                target=self._run,
+                name="stata-agent-outbox-heartbeat",
+                daemon=True,
+            )
+            self._thread = thread
+            thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is None or thread is threading.current_thread():
+            return
+        thread.join(timeout=min(1.0, max(0.05, self._interval_seconds)))
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._interval_seconds):
+            try:
+                renewed = self._repository.renew(
+                    self._kind,
+                    self._claim.key,
+                    self._claim.lease_token,
+                    self._lease_seconds,
+                )
+            except Exception:
+                # A transient storage failure is not proof of lease loss.  The
+                # next tick gets another chance; a definite False is the
+                # fail-closed ownership signal.
+                continue
+            if not renewed:
+                self._lost_event.set()
+                return
+
+
 class MemoryOutboxDispatcher:
     """Pump leased outbox intents into a bounded application task queue."""
 
@@ -319,29 +411,33 @@ class MemoryOutboxDispatcher:
         claim_limit: int = DEFAULT_OUTBOX_CLAIM_LIMIT,
         retry_seconds: float = DEFAULT_OUTBOX_RETRY_SECONDS,
         admission_retry_seconds: float = DEFAULT_OUTBOX_ADMISSION_RETRY_SECONDS,
+        heartbeat_seconds: float | None = None,
         kind: str = MEMORY_EXTRACTION_KIND,
     ) -> None:
         if not callable(worker):
             raise TypeError("worker must be callable")
         if not callable(terminal_checker):
             raise TypeError("terminal_checker must be callable")
-        if isinstance(lease_seconds, bool) or float(lease_seconds) <= 0:
-            raise ValueError("lease_seconds must be positive")
+        duration = _normalize_lease_seconds(lease_seconds)
         if isinstance(claim_limit, bool) or int(claim_limit) <= 0:
             raise ValueError("claim_limit must be positive")
         if isinstance(retry_seconds, bool) or float(retry_seconds) < 0:
             raise ValueError("retry_seconds must be non-negative")
         if isinstance(admission_retry_seconds, bool) or float(admission_retry_seconds) < 0:
             raise ValueError("admission_retry_seconds must be non-negative")
+        interval = duration / 3 if heartbeat_seconds is None else _normalize_lease_seconds(heartbeat_seconds)
+        if interval >= duration:
+            raise ValueError("heartbeat_seconds must be shorter than lease_seconds")
         self.repository = repository
         self.queue = queue
         self.worker = worker
         self.terminal_checker = terminal_checker
         self.owner = str(owner or f"memory-outbox-{uuid.uuid4().hex}")
-        self.lease_seconds = float(lease_seconds)
+        self.lease_seconds = duration
         self.claim_limit = int(claim_limit)
         self.retry_seconds = float(retry_seconds)
         self.admission_retry_seconds = float(admission_retry_seconds)
+        self.heartbeat_seconds = interval
         self.kind = str(kind)
         if self.kind != MEMORY_EXTRACTION_KIND:
             raise ValueError(f"unsupported outbox kind: {self.kind!r}")
@@ -381,11 +477,22 @@ class MemoryOutboxDispatcher:
         submitted = retained = retried = errors = 0
         for raw_claim in raw_claims:
             claim: MemoryOutboxClaim | None = None
+            heartbeat: _LeaseHeartbeat | None = None
             try:
                 claim = _coerce_claim(raw_claim)
+                heartbeat = _LeaseHeartbeat(
+                    self.repository,
+                    kind=self.kind,
+                    claim=claim,
+                    lease_seconds=self.lease_seconds,
+                    interval_seconds=self.heartbeat_seconds,
+                )
+                # The claim is owned before queue admission; starting here
+                # also protects time spent waiting in a bounded queue.
+                heartbeat.start()
                 result = self.queue.submit(
                     claim.key,
-                    self._callback(claim),
+                    self._callback(claim, heartbeat),
                 )
                 status = _submit_status(result)
                 if status is TaskSubmitStatus.ACCEPTED:
@@ -399,17 +506,26 @@ class MemoryOutboxDispatcher:
                     TaskSubmitStatus.CLOSED: "queue_closed",
                     TaskSubmitStatus.DUPLICATE: "queue_duplicate",
                 }.get(status, "queue_not_admitted")
-                if self._release(claim, error_code=code):
+                heartbeat.stop()
+                if heartbeat.lost:
+                    errors += 1
+                elif self._release(claim, error_code=code):
                     retried += 1
                     retained += 1
                 else:
                     errors += 1
             except Exception:
                 errors += 1
+                if heartbeat is not None:
+                    heartbeat.stop()
                 # A malformed claim cannot safely be acknowledged.  It is
                 # already leased, so retry it only when normalization yielded
                 # a valid claim with a usable token.
-                if claim is not None and self._retry(claim, error_code="dispatch_error"):
+                if (
+                    claim is not None
+                    and (heartbeat is None or not heartbeat.lost)
+                    and self._retry(claim, error_code="dispatch_error")
+                ):
                     retried += 1
                     retained += 1
         return OutboxDispatchReport(
@@ -436,17 +552,43 @@ class MemoryOutboxDispatcher:
 
     close = shutdown
 
-    def _execute_claim(self, claim: MemoryOutboxClaim) -> None:
+    def _execute_claim(self, claim: MemoryOutboxClaim, heartbeat: _LeaseHeartbeat) -> None:
+        if heartbeat.lost:
+            return
+        try:
+            # A terminal event is authoritative even when the previous
+            # process died before it could acknowledge the outbox row.
+            terminal = bool(self.terminal_checker(claim))
+        except Exception:
+            terminal = False
+        if terminal:
+            heartbeat.stop()
+            if heartbeat.lost:
+                return
+            if not self.repository.complete(self.kind, claim.key, claim.lease_token):
+                if heartbeat.lost:
+                    return
+                raise MemoryOutboxLeaseError("terminal event observed but outbox completion was fenced")
+            return
+        if heartbeat.lost:
+            return
         try:
             # The callback receives the immutable intent, including the
             # original privacy mode and provider identity.  It must not read
             # current process configuration to relax those frozen fields.
             self.worker(claim)
         except MemoryOutboxDeferred as exc:
-            self._release(claim, error_code=_error_code(exc, "runtime_deferred"))
+            heartbeat.stop()
+            if not heartbeat.lost:
+                self._release(claim, error_code=_error_code(exc, "runtime_deferred"))
             return
         except Exception as exc:  # noqa: BLE001 - retry is the durable outcome
-            self._retry(claim, error_code=_error_code(exc, "worker_error"))
+            heartbeat.stop()
+            if not heartbeat.lost:
+                self._retry(claim, error_code=_error_code(exc, "worker_error"))
+            return
+        heartbeat.stop()
+        if heartbeat.lost:
             return
         try:
             terminal = bool(self.terminal_checker(claim))
@@ -454,16 +596,25 @@ class MemoryOutboxDispatcher:
             terminal = False
         if terminal:
             if not self.repository.complete(self.kind, claim.key, claim.lease_token):
+                if heartbeat.lost:
+                    return
                 raise MemoryOutboxLeaseError("terminal event observed but outbox completion was fenced")
             return
         self._retry(claim, error_code="terminal_event_missing")
 
-    def _callback(self, claim: MemoryOutboxClaim) -> Callable[[], object]:
+    def _callback(
+        self,
+        claim: MemoryOutboxClaim,
+        heartbeat: _LeaseHeartbeat,
+    ) -> Callable[[], object]:
         """Bind one immutable claim for a queue callback (and for mypy)."""
 
         def run() -> object:
-            self._execute_claim(claim)
-            return None
+            try:
+                self._execute_claim(claim, heartbeat)
+                return None
+            finally:
+                heartbeat.stop()
 
         return run
 
@@ -505,10 +656,19 @@ class FakeMemoryOutboxRepository:
     protocol with an atomic requested-event/outbox write.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Callable[[], float] | None = None) -> None:
+        if clock is not None and not callable(clock):
+            raise TypeError("clock must be callable")
+        self._clock = clock or time.monotonic
+        self._lock = threading.RLock()
         self.intents: dict[str, MemoryOutboxIntent] = {}
         self.status: dict[str, str] = {}
         self.claims: dict[str, MemoryOutboxClaim] = {}
+        self.lease_until: dict[str, float] = {}
+        self.renewals: list[tuple[str, float]] = []
+        self.renew_exception: Exception | None = None
+        self.renew_event = threading.Event()
+        self.renew_lost_event = threading.Event()
         self.terminal: set[str] = set()
         self.retries: list[tuple[str, str]] = []
         self.releases: list[tuple[str, str]] = []
@@ -516,11 +676,12 @@ class FakeMemoryOutboxRepository:
         self.backfill_count = 0
 
     def ensure_outbox_intent(self, intent: MemoryOutboxIntent) -> bool:
-        if intent.key in self.intents:
-            return False
-        self.intents[intent.key] = intent
-        self.status[intent.key] = "pending"
-        return True
+        with self._lock:
+            if intent.key in self.intents:
+                return False
+            self.intents[intent.key] = intent
+            self.status[intent.key] = "pending"
+            return True
 
     def backfill_outbox_intents(self, *, kind: str, idea_id: str | None = None) -> int:
         del kind, idea_id
@@ -534,29 +695,75 @@ class FakeMemoryOutboxRepository:
         *,
         limit: int = DEFAULT_OUTBOX_CLAIM_LIMIT,
     ) -> list[MemoryOutboxClaim]:
-        del lease_seconds
+        duration = _normalize_lease_seconds(lease_seconds)
+        if isinstance(limit, bool) or int(limit) <= 0:
+            raise ValueError("limit must be positive")
+        now = float(self._clock())
         result: list[MemoryOutboxClaim] = []
-        for key, intent in self.intents.items():
-            if len(result) >= limit or self.status.get(key) != "pending" or intent.kind != kind:
-                continue
-            claim = MemoryOutboxClaim(
-                intent=intent,
-                lease_token=uuid.uuid4().hex,
-                owner=owner,
-                outbox_id=key,
-            )
-            self.status[key] = "processing"
-            self.claims[key] = claim
-            result.append(claim)
+        with self._lock:
+            for key, intent in self.intents.items():
+                if self.status.get(key) == "processing" and self.lease_until.get(key, 0.0) <= now:
+                    self.status[key] = "pending"
+                    self.claims.pop(key, None)
+                    self.lease_until.pop(key, None)
+                if len(result) >= int(limit) or self.status.get(key) != "pending" or intent.kind != kind:
+                    continue
+                claim = MemoryOutboxClaim(
+                    intent=intent,
+                    lease_token=uuid.uuid4().hex,
+                    owner=owner,
+                    outbox_id=key,
+                )
+                self.status[key] = "processing"
+                self.claims[key] = claim
+                self.lease_until[key] = now + duration
+                result.append(claim)
         return result
 
     def complete(self, kind: str, key: str, lease_token: str) -> bool:
-        claim = self.claims.get(key)
-        if claim is None or claim.intent.kind != kind or claim.lease_token != lease_token:
-            return False
-        self.status[key] = "completed"
-        self.completions.append(key)
-        return True
+        with self._lock:
+            claim = self.claims.get(key)
+            if (
+                claim is None
+                or claim.intent.kind != kind
+                or claim.lease_token != lease_token
+                or self.status.get(key) != "processing"
+                or self.lease_until.get(key, 0.0) <= float(self._clock())
+            ):
+                return False
+            self.status[key] = "completed"
+            self.lease_until.pop(key, None)
+            self.completions.append(key)
+            return True
+
+    def renew(
+        self,
+        kind: str,
+        key: str,
+        lease_token: str,
+        lease_seconds: float,
+    ) -> bool:
+        duration = _normalize_lease_seconds(lease_seconds)
+        with self._lock:
+            if self.renew_exception is not None:
+                error = self.renew_exception
+                self.renew_exception = None
+                raise error
+            claim = self.claims.get(key)
+            now = float(self._clock())
+            if (
+                claim is None
+                or claim.intent.kind != kind
+                or claim.lease_token != lease_token
+                or self.status.get(key) != "processing"
+                or self.lease_until.get(key, 0.0) <= now
+            ):
+                self.renew_lost_event.set()
+                return False
+            self.lease_until[key] = max(self.lease_until[key], now + duration)
+            self.renewals.append((key, duration))
+            self.renew_event.set()
+            return True
 
     def retry(
         self,
@@ -568,12 +775,20 @@ class FakeMemoryOutboxRepository:
         delay_seconds: float = 0.0,
     ) -> bool:
         del delay_seconds
-        claim = self.claims.get(key)
-        if claim is None or claim.intent.kind != kind or claim.lease_token != lease_token:
-            return False
-        self.status[key] = "pending"
-        self.retries.append((key, error_code))
-        return True
+        with self._lock:
+            claim = self.claims.get(key)
+            if (
+                claim is None
+                or claim.intent.kind != kind
+                or claim.lease_token != lease_token
+                or self.status.get(key) != "processing"
+                or self.lease_until.get(key, 0.0) <= float(self._clock())
+            ):
+                return False
+            self.status[key] = "pending"
+            self.lease_until.pop(key, None)
+            self.retries.append((key, error_code))
+            return True
 
     def release(
         self,
@@ -585,12 +800,20 @@ class FakeMemoryOutboxRepository:
         delay_seconds: float = 0.0,
     ) -> bool:
         del delay_seconds
-        claim = self.claims.get(key)
-        if claim is None or claim.intent.kind != kind or claim.lease_token != lease_token:
-            return False
-        self.status[key] = "pending"
-        self.releases.append((key, error_code))
-        return True
+        with self._lock:
+            claim = self.claims.get(key)
+            if (
+                claim is None
+                or claim.intent.kind != kind
+                or claim.lease_token != lease_token
+                or self.status.get(key) != "processing"
+                or self.lease_until.get(key, 0.0) <= float(self._clock())
+            ):
+                return False
+            self.status[key] = "pending"
+            self.lease_until.pop(key, None)
+            self.releases.append((key, error_code))
+            return True
 
 
 class SQLiteMemoryOutboxRepository:
@@ -808,6 +1031,37 @@ class SQLiteMemoryOutboxRepository:
             return True
         except Exception:  # noqa: BLE001 - stale leases are not acknowledgements
             return False
+        finally:
+            self._close(store)
+
+    def renew(
+        self,
+        kind: str,
+        key: str,
+        lease_token: str,
+        lease_seconds: float,
+    ) -> bool:
+        """Renew a live SQLite claim while preserving operational failures."""
+
+        duration = _normalize_lease_seconds(lease_seconds)
+        store = self._store_factory()
+        try:
+            record = store.get_outbox(idempotency_key=key)
+            if record is None or record.task_type != kind:
+                return False
+            try:
+                store.renew_outbox_lease(
+                    record,
+                    lease_token,
+                    lease_seconds=duration,
+                )
+            except Exception as exc:  # noqa: BLE001 - classify only known lease loss
+                from ..storage.store import OutboxLeaseError
+
+                if isinstance(exc, OutboxLeaseError):
+                    return False
+                raise
+            return True
         finally:
             self._close(store)
 

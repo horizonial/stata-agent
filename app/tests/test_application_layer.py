@@ -8,8 +8,11 @@ import pytest
 from stata_agent.application import (
     ChatService,
     ChatTurnRequest,
+    INTERACTIVE_MAX_STEPS_DEFAULT,
+    MAX_TOOL_CALLS_DEFAULT,
     RequestControlNotFound,
     RequestControlRegistry,
+    terminal_outcome_for,
 )
 from stata_agent.harness.agent_loop import LoopResult
 from stata_agent.toolkit import ToolContext
@@ -77,6 +80,46 @@ def test_request_control_registry_is_scoped_idempotent_and_terminal_wins() -> No
     assert registry.snapshot("req-1") is None
 
 
+@pytest.mark.parametrize(
+    ("reason", "status", "code"),
+    [
+        ("model_stop", "completed", None),
+        ("ask_user", "completed", None),
+        ("cancelled", "cancelled", "run_cancelled"),
+        ("cancel_requested", "uncertain", "uncertain"),
+        ("provider_error", "failed", "provider_error"),
+        ("context_error", "failed", "context_error"),
+        ("context_budget", "paused", "context_budget"),
+        ("future_unknown_reason", "failed", "operation_failed"),
+    ],
+)
+def test_terminal_outcome_mapping_is_fail_closed(reason, status, code) -> None:
+    outcome = terminal_outcome_for(reason)
+    assert outcome.status == status
+    assert outcome.code == code
+    if status == "uncertain":
+        assert outcome.support_action == "download_diagnostics"
+    if status == "paused":
+        assert outcome.retryable is True
+
+
+def test_request_control_preserves_terminal_metadata() -> None:
+    registry = RequestControlRegistry()
+    registry.register("req-meta", "workspace", threading.Event())
+    terminal = registry.finish(
+        "req-meta",
+        "uncertain",
+        terminal_reason="cancel_requested",
+        error_code="uncertain",
+        retryable=False,
+    )
+    assert terminal == registry.snapshot("req-meta")
+    assert terminal and terminal["status"] == "uncertain"
+    assert terminal["terminal_reason"] == "cancel_requested"
+    assert terminal["error_code"] == "uncertain"
+    assert terminal["retryable"] is False
+
+
 def test_request_control_registry_disconnect_and_latest_active_are_thread_safe() -> None:
     registry = RequestControlRegistry()
     events = [threading.Event() for _ in range(8)]
@@ -120,9 +163,10 @@ def test_chat_service_runs_one_turn_and_closes_resources() -> None:
         store_factory=lambda: store,
         provider_factory=lambda: "provider",
         executor_factory=lambda _store: executor,
-        context_factory=lambda **kwargs: ToolContext(
-            idea=kwargs["request"].idea,
-            store=kwargs["store"],
+            context_factory=lambda **kwargs: ToolContext(
+                idea=kwargs["request"].idea,
+                request_id=kwargs["request"].request_id,
+                store=kwargs["store"],
             executor=kwargs["executor"],
             memory=memory,
             cancellation=kwargs["cancellation"],
@@ -133,6 +177,7 @@ def test_chat_service_runs_one_turn_and_closes_resources() -> None:
         post_turn_hook=lambda **kwargs: calls.update({
             "hook_provider": kwargs["provider"],
             "hook_store_open": not kwargs["store"].closed,
+            "hook_request_id": kwargs["request"].request_id,
         }),
         state_factory=lambda state_store, idea: {
             "idea": idea,
@@ -147,15 +192,20 @@ def test_chat_service_runs_one_turn_and_closes_resources() -> None:
     assert result.ask is None
     assert result.tool_calls == 2
     assert result.terminal_reason == "model_stop"
+    assert result.terminal_status == "completed"
+    assert result.outcome.code is None
     assert result.state == {"idea": "w1", "events": 1}
     assert store.events and store.events[0].event_type == "user.message"
     assert store.events[0].payload == {"text": "hello", "request_id": "req-1"}
-    assert calls["max_steps"] == 1
-    assert calls["max_tool_calls"] == 32
+    assert store.events[0].correlation_id == "req-1"
+    assert calls["max_steps"] == INTERACTIVE_MAX_STEPS_DEFAULT
+    assert calls["max_tool_calls"] == MAX_TOOL_CALLS_DEFAULT
     assert calls["store"] is not store
     assert list(calls["store"].scan("w1")) == []
     assert calls["context"].store is store
+    assert calls["context"].request_id == "req-1"
     assert calls["hook_provider"] == "provider"
+    assert calls["hook_request_id"] == "req-1"
     assert calls["hook_store_open"] is True
     assert memory.closed
     assert executor.closed
@@ -188,6 +238,49 @@ def test_chat_service_goal_mode_and_exception_still_close_resources() -> None:
 
     assert captured["max_steps"] == 7
     assert captured["max_tool_calls"] == 9
+    assert executor.closed
+    assert store.closed
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"interactive_max_steps": 1}, "interactive_max_steps"),
+        ({"goal_max_steps": 1}, "goal_max_steps"),
+        ({"max_tool_calls": 0}, "max_tool_calls"),
+    ],
+)
+def test_chat_service_rejects_budgets_that_cannot_complete_a_tool_round_trip(kwargs, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        ChatService(store_factory=lambda: _Store(), provider_factory=lambda: object(), **kwargs)
+
+
+def test_chat_service_context_factory_failure_is_safe_and_durable() -> None:
+    store = _Store()
+    executor = _Executor()
+
+    def failing_context(**_kwargs):
+        raise RuntimeError("SECRET_CONTEXT_PATH")
+
+    service = ChatService(
+        store_factory=lambda: store,
+        provider_factory=lambda: object(),
+        executor_factory=lambda _store: executor,
+        context_factory=failing_context,
+        bootstrapper=lambda _store, _idea, _text: None,
+    )
+
+    result = service.run(ChatTurnRequest(idea="w1", text="hello", request_id="req-context"))
+
+    assert result.terminal_status == "failed"
+    assert result.terminal_reason == "context_error"
+    assert result.failure_code == "context_error"
+    assert result.reply == "上下文组装失败，本轮未调用模型。"
+    assert store.events[-1].payload == {
+        "reply": "上下文组装失败，本轮未调用模型。",
+        "terminal_reason": "context_error",
+    }
+    assert "SECRET_CONTEXT_PATH" not in str(store.events)
     assert executor.closed
     assert store.closed
 
@@ -238,3 +331,74 @@ def test_chat_service_rejects_invalid_request_before_opening_store() -> None:
     with pytest.raises(ValueError, match="mode"):
         service.run(ChatTurnRequest(idea="w1", text="hello", mode="invalid"))
     assert not opened
+
+
+@pytest.mark.parametrize(
+    "request_id",
+    ["", "  ", " req-1", "req-1 ", "x" * 129, 7, True, "bad\nvalue"],
+)
+def test_chat_service_rejects_invalid_request_id_before_opening_store(request_id) -> None:
+    opened = False
+
+    def store_factory():
+        nonlocal opened
+        opened = True
+        return _Store()
+
+    service = ChatService(store_factory=store_factory, provider_factory=lambda: object())
+    with pytest.raises(ValueError, match="request_id"):
+        service.run(ChatTurnRequest(idea="w1", text="hello", request_id=request_id))
+    assert not opened
+
+
+def test_chat_service_resolves_attachment_manifest_without_exposing_storage() -> None:
+    store = _Store()
+    captured: dict[str, object] = {}
+
+    def resolve(_store, workspace_id, attachment_ids):
+        assert workspace_id == "workspace-1"
+        assert tuple(attachment_ids) == ("attachment-1",)
+        return [{
+            "attachment_id": "attachment-1",
+            "display_name": "paper.pdf",
+            "source_role": "citable_evidence",
+            "detected_format": "pdf",
+            "page_count": 2,
+            "storage_key": "private/secret.pdf",
+            "sha256": "secret-hash",
+        }]
+
+    def run_loop(*_args, **kwargs):
+        captured.update(kwargs)
+        return LoopResult(reply="ok", terminal_reason="model_stop")
+
+    service = ChatService(
+        store_factory=lambda: store,
+        provider_factory=lambda: object(),
+        executor_factory=lambda _store: _Executor(),
+        context_factory=lambda **kwargs: ToolContext(
+            store=kwargs["store"], executor=kwargs["executor"]
+        ),
+        tools_factory=lambda: {},
+        loop_runner=run_loop,
+        bootstrapper=lambda *_args: None,
+        attachment_resolver=resolve,
+    )
+    service.run(ChatTurnRequest(
+        idea="w1",
+        text="use the paper",
+        workspace_id="workspace-1",
+        attachment_ids=("attachment-1",),
+    ))
+
+    manifest = store.events[0].payload["attachments"]
+    assert manifest == [{
+        "attachment_id": "attachment-1",
+        "display_name": "paper.pdf",
+        "source_role": "citable_evidence",
+        "detected_format": "pdf",
+        "page_count": 2,
+    }]
+    assert "UNTRUSTED ATTACHMENT MANIFEST" in captured["user_text"]
+    assert "private/secret.pdf" not in str(store.events[0].payload)
+    assert "secret-hash" not in captured["user_text"]

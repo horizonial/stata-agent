@@ -12,6 +12,7 @@ import pytest
 
 from stata_agent.storage.sqlite_store import SQLiteStore
 from stata_agent.tools.executor import StataExecutor, auto_regress_script
+from stata_agent.tools.result_verifier import ResultContract, verify_run_record
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("STATA_LIVE") != "1",
@@ -49,4 +50,60 @@ def test_failed_script_records_run_failed(tmp_path):
     proj = store.project("i1")
     # 失败也要留痕（run.failed），不许静默
     assert any(rec.status == "failed" for rec in proj.runs.values())
+    store.close()
+
+
+def test_real_contracted_regression_is_verified(tmp_path):
+    store = SQLiteStore(str(tmp_path / "contracted.db"), writer_id="contracted")
+    ex = StataExecutor(store, run_root=tmp_path / "runs")
+    contract = ResultContract(
+        target_term="mpg",
+        estimator="regress",
+        dependent_variable="price",
+        vce="ols",
+        required_stats=["coef", "se", "N"],
+    )
+    out = ex.execute(
+        "sysuse auto, clear\nreg price mpg",
+        result_contract=contract,
+    )
+    assert out["machine"]["N"] == 74
+    assert out["machine"]["model"] == {
+        "target_term": "mpg",
+        "estimator": "regress",
+        "dependent_variable": "price",
+        "vce": "ols",
+        "cluster_variables": "",
+        "fixed_effects": "",
+    }
+    report = verify_run_record(store.project("i1").runs[out["run_id"]])
+    assert report.evidence_ready
+    store.close()
+
+
+def test_real_reghdfe_contract_is_verified_when_ado_is_available(tmp_path):
+    from stata_agent.tools.ado import missing_ados
+
+    if missing_ados(["reghdfe"]):
+        pytest.skip("reghdfe ado 不可用")
+    store = SQLiteStore(str(tmp_path / "reghdfe.db"), writer_id="reghdfe")
+    ex = StataExecutor(store, run_root=tmp_path / "runs-reghdfe")
+    contract = ResultContract(
+        target_term="mpg",
+        estimator="reghdfe",
+        dependent_variable="price",
+        vce="robust",
+        cluster_variables=[],
+        fixed_effects=["foreign"],
+        required_stats=["coef", "se", "N"],
+    )
+    out = ex.execute(
+        "sysuse auto, clear\nreghdfe price mpg, absorb(foreign) vce(robust)",
+        result_contract=contract,
+        require_ados=["reghdfe"],
+    )
+    assert out["machine"]["N"] == 74
+    assert out["machine"]["model"]["estimator"] == "reghdfe"
+    assert out["machine"]["model"]["fixed_effects"] == "foreign"
+    assert verify_run_record(store.project("i1").runs[out["run_id"]]).evidence_ready
     store.close()

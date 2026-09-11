@@ -11,6 +11,7 @@ from docx import Document
 
 from ..tools.robustness import check_robustness, stars
 from .table import Cell, Row, TableModel, add_table_to_doc
+from .validation import DeliveryManifestV1
 
 
 def _f(x, digits=3):
@@ -49,67 +50,42 @@ def table1_from_long(path) -> TableModel | None:
     return model
 
 
-def draft_from_ledger(proj, *, title: str = "实证研究初稿",
-                      method: str = "", limits: str = "") -> bytes:
-    """从事件账本投影渲染完整初稿：方法段 + 运行表 + 已签 claims + 引文块 + 局限。
+def build_draft_package(
+    proj,
+    *,
+    title: str = "实证研究初稿",
+    method: str = "",
+    limits: str = "",
+    library=None,
+    figure_items: list[dict] | None = None,
+) -> tuple[bytes, DeliveryManifestV1]:
+    """Build a validated DOCX and its derived evidence manifest."""
 
-    数字一律来自 run.machine / claim 卡（可回链），不做任何现写。
-    """
-    from ..writer.ground import render_claim_sentence
-
-    doc = Document()
-    doc.add_heading(title, level=0)
-    if method:
-        doc.add_paragraph(method)
-
+    from .ground import render_claim_sentence
+    from .validation import preflight_delivery
     from .table import build_run_table
 
-    ok_runs = [(rid, rec) for rid, rec in proj.runs.items()
-               if rec.status == "succeeded" and rec.machine]
-    # A raw machine dict is not publishable.  Build/validate every run table
-    # first so a missing card fails loudly instead of producing a partial DOCX.
+    ok_runs = [
+        (rid, rec)
+        for rid, rec in proj.runs.items()
+        if rec.status == "succeeded" and rec.machine
+    ]
     run_models = {rid: build_run_table(proj, rid, title="") for rid, _rec in ok_runs}
-
-    active_claims = []
-    for claim in sorted(proj.claims.values(), key=lambda c: c.claim_id):
-        if claim.status != "supported":
-            continue
-        missing = [card_id for card_id in claim.cards if card_id not in proj.cards]
-        if missing:
-            raise ValueError(f"active claim {claim.claim_id!r} 缺 EvidenceCard: {missing}")
-        if not claim.cards:
-            raise ValueError(f"active claim {claim.claim_id!r} 没有 EvidenceCard，不能出稿")
-        for card_id in claim.cards:
-            card = proj.cards[card_id]
-            if card.kind != "numeric":
-                continue
-            loc = card.locator or {}
-            run_id = loc.get("run_id")
-            stat_type = loc.get("stat_type")
-            rec = proj.runs.get(run_id)
-            if rec is None or rec.status != "succeeded" or stat_type not in rec.machine:
-                raise ValueError(f"active claim {claim.claim_id!r} 的 numeric card {card_id!r} provenance 不完整")
-            import hashlib
-            import json
-            machine_hash = hashlib.sha256(
-                json.dumps(rec.machine, sort_keys=True, ensure_ascii=False).encode()
-            ).hexdigest()
-            if card.machine_hash != machine_hash or not isinstance(card.value, dict):
-                raise ValueError(f"active claim {claim.claim_id!r} 的 numeric card {card_id!r} provenance 不匹配")
-            try:
-                if float(card.value.get("value")) != float(rec.machine[stat_type]):
-                    raise ValueError(f"active claim {claim.claim_id!r} 的 numeric card {card_id!r} 数值不一致")
-            except (TypeError, ValueError) as error:
-                if isinstance(error, ValueError) and "数值不一致" in str(error):
-                    raise
-                raise ValueError(f"active claim {claim.claim_id!r} 的 numeric card {card_id!r} 数值无效") from error
-        active_claims.append(claim)
-    citation_cards = [c for c in proj.cards.values() if c.kind == "citation"]
-    if not ok_runs and not active_claims and not citation_cards:
+    active_claims = [
+        claim
+        for claim in sorted(proj.claims.values(), key=lambda c: c.claim_id)
+        if claim.status == "supported"
+    ]
+    if not ok_runs and not active_claims and not (figure_items or []):
         raise ValueError("没有 active claim 或含 provenance 的 run，不能出稿")
+
+    table_model = None
+    table_objects: list[dict] = []
     if ok_runs:
-        model = TableModel(title="回归结果（由事件账本渲染）",
-                           columns=[rid[:14] for rid, _ in ok_runs])
+        table_model = TableModel(
+            title="回归结果（由事件账本渲染）",
+            columns=[rid[:14] for rid, _ in ok_runs],
+        )
         labels = {
             "系数": "核心系数",
             "标准误": "SE",
@@ -126,20 +102,108 @@ def draft_from_ledger(proj, *, title: str = "实证研究初稿",
                 if source is None:
                     cells.append(Cell(text="-", stat_type=label))
                 else:
-                    cells.append(Cell(text=source.text, stat_type=label,
-                                      numeric=source.numeric, card_id=source.card_id))
-            model.rows.append(Row(label=label, cells=cells))
-        add_table_to_doc(doc, model)
+                    cells.append(
+                        Cell(
+                            text=source.text,
+                            stat_type=source.stat_type,
+                            numeric=source.numeric,
+                            card_id=source.card_id,
+                        )
+                    )
+            table_model.rows.append(Row(label=label, cells=cells))
+        from .table import numeric_cells
 
+        for row_index, col_index, cell in numeric_cells(table_model):
+            table_objects.append(
+                {
+                    "object_type": "table_cell",
+                    "object_id": f"regression:{row_index}:{col_index}",
+                    "card_ids": [cell.card_id] if cell.card_id else [],
+                }
+            )
+
+    claim_texts: list[dict] = []
+    citation_texts: list[dict] = []
+    for claim in active_claims:
+        sentence = render_claim_sentence(claim, proj.cards)
+        claim_texts.append(
+            {
+                "object_id": claim.claim_id,
+                "text": sentence,
+                "card_ids": [str(card_id) for card_id in claim.cards],
+            }
+        )
+        citation_ids = [
+            card_id
+            for card_id in claim.cards
+            if card_id in proj.cards and proj.cards[card_id].kind == "citation"
+        ]
+        if citation_ids:
+            citation_texts.append(
+                {
+                    "object_id": claim.claim_id,
+                    "text": sentence,
+                    "card_ids": citation_ids,
+                }
+            )
+
+    objects = table_objects + [
+        {
+            "object_type": "claim",
+            "object_id": claim.claim_id,
+            "card_ids": [str(card_id) for card_id in claim.cards],
+        }
+        for claim in active_claims
+    ]
+    for index, item in enumerate(figure_items or []):
+        card_id = str(item.get("card_id") or "")
+        objects.append(
+            {
+                "object_type": "figure",
+                "object_id": str(item.get("object_id") or f"figure:{index}"),
+                "card_ids": [card_id] if card_id else [],
+            }
+        )
+    preflight = preflight_delivery(
+        proj,
+        objects=objects,
+        tables=[table_model] if table_model is not None else None,
+        claim_texts=claim_texts,
+        citation_texts=citation_texts or None,
+        library=library,
+        figure_items=figure_items,
+    )
+    if not preflight.ok or preflight.manifest is None:
+        codes = ", ".join(issue.code for issue in preflight.issues[:8])
+        if any(issue.code in {"card_missing", "object_card_missing"} for issue in preflight.issues):
+            raise ValueError(f"交付 preflight 失败：缺 EvidenceCard ({codes})")
+        raise ValueError(f"交付 preflight 失败：{codes or 'evidence_not_ready'}")
+
+    doc = Document()
+    doc.add_heading(title, level=0)
+    if method:
+        doc.add_paragraph(method)
+    if table_model is not None:
+        add_table_to_doc(doc, table_model)
     for claim in active_claims:
         doc.add_paragraph(render_claim_sentence(claim, proj.cards) + f"  [{claim.claim_id}]")
-
-    cit = citation_cards
-    if cit:
+    citation_ids = sorted(
+        {
+            card_id
+            for claim in active_claims
+            for card_id in claim.cards
+            if card_id in proj.cards and proj.cards[card_id].kind == "citation"
+        }
+    )
+    if citation_ids:
         doc.add_paragraph("引用文献（citable 块）")
-        for c in sorted(cit, key=lambda x: x.card_id):
-            loc = c.locator or {}
-            doc.add_paragraph(f"- {loc.get('doc_id', '?')} p{loc.get('page', '?')}  {c.card_id}")
+        for card_id in citation_ids:
+            loc = proj.cards[card_id].locator or {}
+            doc.add_paragraph(f"- {loc.get('doc_id', '?')} p{loc.get('page', '?')}  {card_id}")
+    if figure_items:
+        from .figure import add_figures_to_doc
+
+        add_figures_to_doc(doc, figure_items, proj.cards, require_card_validation=True)
     if limits:
         doc.add_paragraph("局限：" + limits)
 
@@ -147,7 +211,29 @@ def draft_from_ledger(proj, *, title: str = "实证研究初稿",
 
     buf = io.BytesIO()
     doc.save(buf)
-    return buf.getvalue()
+    return buf.getvalue(), preflight.manifest
+
+
+def draft_from_ledger(
+    proj,
+    *,
+    title: str = "实证研究初稿",
+    method: str = "",
+    limits: str = "",
+    library=None,
+    figure_items: list[dict] | None = None,
+) -> bytes:
+    """Compatibility wrapper returning only DOCX bytes."""
+
+    data, _manifest = build_draft_package(
+        proj,
+        title=title,
+        method=method,
+        limits=limits,
+        library=library,
+        figure_items=figure_items,
+    )
+    return data
 
 
 def draft_docx(results: dict[str, dict], *, title: str = "实证研究初稿",

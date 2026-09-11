@@ -248,7 +248,8 @@ def test_loop_invalid_provider_response_and_duplicate_run_guard(tmp_path):
         {"run_stata": run_tool},
         ToolContext(idea="i1", store=store),
         user_text="repeat",
-        max_steps=3,
+        # Three duplicate attempts plus the reserved result-finalization turn.
+        max_steps=4,
     )
     assert result.terminal_reason == "duplicate_run_blocked"
     assert result.tool_calls == 2

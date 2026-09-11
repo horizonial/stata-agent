@@ -3,9 +3,10 @@
 > Baseline: `57c737c` (`feat: add live Stata release acceptance gate`)
 >
 > Date: 2026-09-10
-> Purpose: describe the current system, identify verified gaps, and order future
-> module research. This document does not replace the architectural constraints in
-> `../ARCHITECTURE.md`.
+> Status: frozen architecture snapshot. It describes the system and the reasoning
+> behind the module sequence, but no longer owns current status or priority.
+> The only live priority and implementation plan is `../IMPLEMENTATION_PLAN.md`;
+> this document does not replace `../ARCHITECTURE.md`.
 
 ## 1. Executive conclusion
 
@@ -20,20 +21,19 @@ module at a time and preserve the existing boundaries.
 
 ## 2. Document authority
 
-Documents have accumulated across several design generations. Use this order when
-they disagree:
+Documents have accumulated across several design generations. Use this authority
+order when they disagree:
 
 1. `ARCHITECTURE.md`: current architectural constraints and component map.
-2. This audit: current implementation maturity, risks, and research order.
-3. Latest focused designs: `agent-tool-routing.md`, `rethink-autonomy.md`,
+2. Root `IMPLEMENTATION_PLAN.md`: the only live priority list and current round.
+3. Root `IMPLEMENTATION_REPORT.md`: the latest completed round, not the next step.
+4. This frozen audit and focused designs: architecture/research evidence only.
+5. Latest focused designs: `agent-tool-routing.md`, `rethink-autonomy.md`,
    `CONTEXT_MEMORY_V2*.md`, and `PHASE3_APPLICATION_STORAGE.md`.
-4. `SPEC.md` and DD-01 through DD-07: foundational contracts that remain valid unless
+6. `SPEC.md` and DD-01 through DD-07: foundational contracts that remain valid unless
    a later focused design explicitly supersedes them.
-5. `research/codex_report.md`: research rationale and alternatives, not current state.
-6. `PRODUCTIZATION_PLAN.md` and `audit-code-gaps.md`: historical planning snapshots;
-   their completion markers must not be treated as current facts.
-7. Root `IMPLEMENTATION_PLAN.md` and `IMPLEMENTATION_REPORT.md`: the latest completed
-   development round only.
+7. `research/codex_report.md` and `audit-code-gaps.md`: historical rationale and
+   planning snapshots; their completion markers are not current facts.
 
 Important supersession: the current product is a normal LLM-first agent with tool
 calling. Research phases constrain tools and evidence; they are not a second rigid
@@ -134,7 +134,11 @@ All module work must preserve these invariants:
 | P2 | RAG quality is unmeasured on the target corpus | Hybrid retrieval exists without a domain gold set | Retrieval dataset, ablation, OCR/rerank decision |
 | P2 | UI state diverges under failures | Main paths are tested; full manual regression remains | Release UX matrix covering stop, disconnect, approval and recovery |
 
-## 8. Ordered module research plan
+## 8. Historical ordered module research plan
+
+This sequence explains earlier decisions only. Completion state and the executable
+order have moved to the root `IMPLEMENTATION_PLAN.md`; do not execute this section
+as a second roadmap.
 
 Each research round should produce a focused design, an implementation plan for one
 primary objective, and explicit acceptance evidence. Do not combine adjacent rounds.

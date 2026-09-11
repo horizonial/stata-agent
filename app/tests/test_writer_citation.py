@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from stata_agent.rag.ingest import SOURCE_ROLE_CITABLE, SOURCE_ROLE_STYLE, Chunk
+from stata_agent.domain.models import EvidenceCard
+from stata_agent.rag.ingest import SOURCE_ROLE_CITABLE, SOURCE_ROLE_STYLE, Chunk, chunk_text_digest
 from stata_agent.rag.library import Library
 from stata_agent.storage.sqlite_store import SQLiteStore
 from stata_agent.writer.citation import (
@@ -18,8 +19,9 @@ from stata_agent.writer.ground import render_claim_sentence
 
 def _lib():
     lib = Library()
+    text = "本文用双重差分识别政策效应，并进行平行趋势检验。"
     lib.add(Chunk(chunk_id="d1", doc_id="AER2020.pdf", source_role=SOURCE_ROLE_CITABLE, page=12,
-                  text="本文用双重差分识别政策效应，并进行平行趋势检验。"))
+                  text=text, text_digest=chunk_text_digest(text)))
     lib.add(Chunk(chunk_id="s1", doc_id="style.pdf", source_role=SOURCE_ROLE_STYLE, page=1,
                   text="结果见表 3。"))
     return lib
@@ -63,3 +65,19 @@ def test_validate_citations_clean_and_broken(tmp_path):
     fake = "乱引" + citation_marker("ghost")
     assert any("无来源引用" in i for i in validate_citations(fake, cards))
     store.close()
+
+
+def test_citation_validation_rechecks_library_digest_and_marker():
+    lib = _lib()
+    card = EvidenceCard(
+        card_id="card-cit-d1",
+        kind="citation",
+        locator={"chunk_id": "d1", "doc_id": "AER2020.pdf", "page": 12, "source_role": SOURCE_ROLE_CITABLE},
+        value={"text_digest": lib.text_digest("d1")},
+        signed_by="validator",
+    )
+    text = "平行趋势。" + citation_marker("d1")
+    assert validate_citations(text, [card], library=lib) == []
+
+    lib.get("d1").text = "被替换的内容"
+    assert any("已变化" in issue for issue in validate_citations(text, [card], library=lib))

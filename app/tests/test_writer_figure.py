@@ -54,6 +54,16 @@ def test_sign_figure_requires_success_and_file(tmp_path):
     store.close()
 
 
+def test_sign_figure_rejects_non_image_artifact(tmp_path):
+    store = _run_store(tmp_path)
+    run_id = next(iter(store.project("i1").runs))
+    text_file = tmp_path / "not-an-image.bin"
+    text_file.write_bytes(b"not an image")
+    with pytest.raises(ValueError, match="图片"):
+        sign_figure_card(store, run_id, text_file)
+    store.close()
+
+
 def test_figure_docx_embeds_image(tmp_path):
     store = _run_store(tmp_path)
     run_id = next(iter(store.project("i1").runs))
@@ -68,4 +78,44 @@ def test_figure_docx_embeds_image(tmp_path):
     assert len(doc.inline_shapes) >= 1          # 真的嵌了图
     texts = [para.text for para in doc.paragraphs]
     assert any("coefplot" in t and card_id in t for t in texts)
+    store.close()
+
+
+def test_figure_card_hash_is_rechecked_before_render(tmp_path):
+    store = _run_store(tmp_path)
+    run_id = next(iter(store.project("i1").runs))
+    img = tmp_path / "coef.png"
+    img.write_bytes(PNG)
+    card_id = sign_figure_card(store, run_id, img, caption="coefplot")
+    card = store.project("i1").cards[card_id]
+
+    data = figure_docx(
+        "实证图",
+        [{"path": str(img), "caption": "coefplot", "card_id": card_id, "run_id": run_id}],
+        cards={card_id: card},
+        require_card_validation=True,
+    )
+    assert data
+
+    img.write_bytes(PNG + b"tampered")
+    with pytest.raises(ValueError, match="artifact_digest_mismatch"):
+        figure_docx(
+            "实证图",
+            [{"path": str(img), "caption": "coefplot", "card_id": card_id, "run_id": run_id}],
+            cards={card_id: card},
+            require_card_validation=True,
+        )
+
+
+def test_figure_card_id_changes_for_same_stem(tmp_path):
+    store = _run_store(tmp_path)
+    run_id = next(iter(store.project("i1").runs))
+    first = tmp_path / "coef.png"
+    second = tmp_path / "other" / "coef.png"
+    second.parent.mkdir()
+    first.write_bytes(PNG)
+    second.write_bytes(PNG + b"different")
+    first_id = sign_figure_card(store, run_id, first)
+    second_id = sign_figure_card(store, run_id, second)
+    assert first_id != second_id
     store.close()

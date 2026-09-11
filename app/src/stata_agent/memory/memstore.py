@@ -331,6 +331,92 @@ def _confidence_score(confidence: str) -> int:
     return {CONFIDENCE_EXPLICIT: 3, CONFIDENCE_VERIFIED: 2, CONFIDENCE_INFERRED: 1}.get(confidence, 0)
 
 
+def _memory_relevance(entry: Mapping[str, Any], query_tokens: set[str]) -> float:
+    """Return the deterministic lexical relevance used by both facades."""
+
+    if not query_tokens:
+        return 0.0
+    entry_tokens = set(tokenize(str(entry.get("text", ""))))
+    return len(query_tokens & entry_tokens) / max(len(query_tokens), 1)
+
+
+def _rank_memory_entry(
+    entry: Mapping[str, Any],
+    query_tokens: set[str],
+    *,
+    exact_workspace: bool,
+) -> tuple[float, int, int, int, int, str]:
+    """Build one stable ranking tuple for JSON and SQLite memory."""
+
+    lexical = _memory_relevance(entry, query_tokens)
+    # A phrase/substring match is useful only after lexical overlap has been
+    # established.  The sorted token form is intentionally stable across
+    # callers and Python hash seeds.
+    query_text = " ".join(sorted(query_tokens))
+    text_lower = str(entry.get("text", "")).lower()
+    if query_text and query_text in text_lower:
+        lexical += 0.25
+    confidence = _confidence_score(str(entry.get("confidence", CONFIDENCE_INFERRED)))
+    used = max(0, _safe_int(entry.get("use_count", entry.get("used", 0))))
+    recency = max(0, _safe_int(entry.get("updated_at", entry.get("updated", 0))))
+    return (
+        lexical,
+        1 if exact_workspace else 0,
+        confidence,
+        used,
+        recency,
+        str(entry.get("id", "")),
+    )
+
+
+def _format_memory_context(entry: Mapping[str, Any]) -> str:
+    """Format one complete memory item without exposing it as evidence."""
+
+    source_ids = entry.get("source_ids") or []
+    source_text = ", ".join(str(source) for source in source_ids) if source_ids else "unspecified"
+    return (
+        f"[memory/{entry.get('kind', KIND_PREFERENCE)}; working knowledge, not evidence] "
+        f"{entry.get('text', '')} (provenance: {source_text})"
+    )
+
+
+def _lifecycle_issues(records: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+    """Check explicit supersede links without guessing natural-language conflicts."""
+
+    by_id = {str(record.get("id")): record for record in records if str(record.get("id", "")).strip()}
+    successors: dict[str, list[Mapping[str, Any]]] = {}
+    issues: set[str] = set()
+    for record in records:
+        target = str(record.get("supersedes") or "").strip()
+        if not target:
+            continue
+        if target not in by_id:
+            issues.add("supersedes_orphan")
+            continue
+        successors.setdefault(target, []).append(record)
+    for target, replacements in successors.items():
+        active_replacements = [item for item in replacements if item.get("status") == STATUS_ACTIVE]
+        if len(active_replacements) > 1:
+            issues.add("supersedes_multiple_active_successors")
+        predecessor = by_id[target]
+        if predecessor.get("status") == STATUS_ACTIVE and active_replacements:
+            issues.add("active_superseded_predecessor")
+    for record in records:
+        target = str(record.get("supersedes") or "").strip()
+        seen: set[str] = set()
+        current = str(record.get("id", ""))
+        while target:
+            if target in seen or target == current:
+                issues.add("supersedes_cycle")
+                break
+            seen.add(target)
+            parent = by_id.get(target)
+            if parent is None:
+                break
+            target = str(parent.get("supersedes") or "").strip()
+    return tuple(sorted(issues))
+
+
 def _copy_record(record: Mapping[str, Any]) -> dict[str, Any]:
     copied = dict(record)
     for key in ("source_ids",):
@@ -994,6 +1080,39 @@ class MemoryStore:
                 return None
         return _copy_record(record)
 
+    def lifecycle_issues(
+        self,
+        *,
+        workspace_id: str | Path | None = None,
+        workspace: str | Path | None = None,
+    ) -> tuple[str, ...]:
+        """Return structural issues in explicit supersede links.
+
+        This deliberately does not infer semantic conflicts from text.  It
+        only validates IDs and status transitions that the caller explicitly
+        recorded, so a corrupted lifecycle can fail closed before context
+        selection without rewriting history.
+        """
+
+        selected_workspace = workspace_id if workspace_id is not None else workspace
+        normalized = None if selected_workspace is None else _normalise_workspace(selected_workspace, self._workspace_id)
+        records = [
+            record
+            for record in self._entries
+            if normalized is None or str(record.get("workspace_id")) == normalized
+        ]
+        return _lifecycle_issues(records)
+
+    def validate_lifecycle(
+        self,
+        *,
+        workspace_id: str | Path | None = None,
+        workspace: str | Path | None = None,
+    ) -> None:
+        issues = self.lifecycle_issues(workspace_id=workspace_id, workspace=workspace)
+        if issues:
+            raise MemoryCandidateRejected("memory_lifecycle_invalid:" + ",".join(issues))
+
     def _visible(
         self,
         entry: Mapping[str, Any],
@@ -1024,19 +1143,7 @@ class MemoryStore:
         *,
         exact_workspace: bool,
     ) -> tuple[float, int, int, int, int, str]:
-        entry_tokens = tokenize(str(entry.get("text", "")))
-        token_set = set(entry_tokens)
-        overlap = len(query_tokens & token_set)
-        # A phrase/substring match outranks a coincidental token overlap, but
-        # lexical relevance remains the first ranking dimension.
-        query_text = " ".join(sorted(query_tokens))
-        text_lower = str(entry.get("text", "")).lower()
-        phrase_bonus = 0.25 if query_text and query_text in text_lower else 0.0
-        lexical = overlap / max(len(query_tokens), 1) + phrase_bonus
-        confidence = _confidence_score(str(entry.get("confidence", CONFIDENCE_INFERRED)))
-        used = max(0, _safe_int(entry.get("use_count", entry.get("used", 0))))
-        recency = max(0, _safe_int(entry.get("updated_at", entry.get("updated", 0))))
-        return (lexical, 1 if exact_workspace else 0, confidence, used, recency, str(entry.get("id", "")))
+        return _rank_memory_entry(entry, query_tokens, exact_workspace=exact_workspace)
 
     def search(
         self,
@@ -1049,6 +1156,7 @@ class MemoryStore:
         include_global: bool | None = None,
         include_inactive: bool = False,
         now: int | None = None,
+        min_relevance: float = 0.0,
     ) -> list[dict[str, Any]]:
         """Search active records with deterministic project-aware ranking."""
 
@@ -1069,6 +1177,7 @@ class MemoryStore:
         else:
             kind_set = {str(kind) for kind in kinds}
         now_value = _now() if now is None else _safe_int(now, _now())
+        relevance_floor = max(0.0, min(1.0, float(min_relevance)))
 
         candidates: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         for entry in self._entries:
@@ -1082,8 +1191,8 @@ class MemoryStore:
             ):
                 continue
             if query_tokens:
-                entry_tokens = set(tokenize(str(entry.get("text", ""))))
-                if not query_tokens & entry_tokens:
+                relevance = _memory_relevance(entry, query_tokens)
+                if relevance <= 0.0 or relevance < relevance_floor:
                     continue
             exact = entry.get("scope") != SCOPE_GLOBAL and entry.get("workspace_id") == current_workspace
             rank = self._rank(entry, query_tokens, exact_workspace=exact)
@@ -1111,6 +1220,8 @@ class MemoryStore:
         include_global: bool | None = None,
         touch: bool = True,
         now: int | None = None,
+        min_relevance: float = 0.0,
+        whole_items: bool = False,
     ) -> MemoryContextSelection:
         """Select a bounded context projection and touch only selected rows."""
 
@@ -1131,14 +1242,19 @@ class MemoryStore:
 
         # Request all potential records up to the item limit.  Search already
         # filters by project and performs relevance ordering.
+        # Whole-item mode may skip an over-cap high-ranked record. Fetch a
+        # small bounded candidate window so a fitting lower-ranked memory can
+        # still be selected without exposing an unbounded scan to callers.
+        search_limit = max(limit, 32) if whole_items else max(limit, 1)
         records = self.search(
             query,
-            limit=max(limit, 1),
+            limit=search_limit,
             workspace_id=workspace_id,
             workspace=workspace,
             kinds=kinds,
             include_global=include_global,
             now=now,
+            min_relevance=min_relevance,
         )
         formatted: list[str] = []
         selected: list[dict[str, Any]] = []
@@ -1147,16 +1263,16 @@ class MemoryStore:
         was_truncated = False
         for record in records:
             source_ids = record.get("source_ids") or []
-            source_text = ", ".join(str(source) for source in source_ids) if source_ids else "unspecified"
-            line = (
-                f"[memory/{record.get('kind', KIND_PREFERENCE)}; working knowledge, not evidence] "
-                f"{record.get('text', '')} (provenance: {source_text})"
-            )
+            line = _format_memory_context(record)
             separator_chars = 1 if formatted else 0
             remaining = max_chars - consumed_chars - separator_chars
             if remaining <= 0:
                 break
             if len(line) > remaining:
+                if whole_items:
+                    # A partial constraint is worse than omitting it. Keep
+                    # looking for a shorter item and do not touch this row.
+                    continue
                 line = line[:remaining]
                 was_truncated = True
                 if line:

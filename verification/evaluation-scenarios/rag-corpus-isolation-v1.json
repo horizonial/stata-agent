@@ -1,0 +1,97 @@
+{
+  "schema_version": "stata-research-agent.evaluation-scenario/v1",
+  "scenario_id": "agent.rag.corpus-isolation",
+  "revision": 1,
+  "title": "Canonical RAG retrieves expected evidence without crossing corpus roles",
+  "suite": "regression",
+  "split": "development",
+  "level": "subsystem",
+  "subsystem_mode": "intrinsic",
+  "subsystems": ["rag", "knowledge_retrieval"],
+  "tags": ["canonical-ir", "corpus-isolation", "retrieval"],
+  "interaction_mode": "autonomous",
+  "initial_user_message": "Evaluate canonical retrieval across Literature and Stata Help without corpus-role leakage.",
+  "fixtures": [
+    {
+      "fixture_id": "rag-gold-example",
+      "role": "rag_gold_dataset",
+      "locator": "verification/rag-gold.example.json",
+      "media_type": "application/json",
+      "sha256": "4a89581ae4c262959b167a0dd4838e836f48ac262e478fc8bb8498a203168651"
+    },
+    {
+      "fixture_id": "rag-literature-design",
+      "role": "rag_literature",
+      "locator": "verification/evaluation-fixtures/rag-corpus/literature/design.md",
+      "media_type": "text/markdown",
+      "sha256": "3019337e9e1dd2a7cd2b164de8c4274396caa4f858f52f95aa05ea5c5282e1e3"
+    },
+    {
+      "fixture_id": "rag-style-paper",
+      "role": "rag_style",
+      "locator": "verification/evaluation-fixtures/rag-corpus/style-references/selected-paper.md",
+      "media_type": "text/markdown",
+      "sha256": "b387eb24ee6837f76f9f6ed27ef0118eceb1ea9346c2f1e2134304c3e73f43b1"
+    },
+    {
+      "fixture_id": "rag-stata-regress-help",
+      "role": "rag_stata_help",
+      "locator": "verification/evaluation-fixtures/rag-corpus/stata-help/regress.sthlp",
+      "media_type": "text/plain",
+      "sha256": "7f936a71832918e80c65943b8ac4f8901b5811203f441e2f5efa81d02bdb9338"
+    }
+  ],
+  "interaction": [],
+  "faults": [],
+  "required_outcomes": [
+    "rag.retrieval_thresholds_met",
+    "rag.corpus_roles_isolated",
+    "rag.report_persisted",
+    "rag.multihop_trace_valid",
+    "rag.no_answer_abstained"
+  ],
+  "forbidden_outcomes": [
+    "rag.corpus_role_leak",
+    "rag.no_answer_fabricated"
+  ],
+  "permitted_freedom": [
+    "Retrieval ranks may vary when the frozen retrieval policy still meets all thresholds."
+  ],
+  "graders": [
+    {
+      "grader_id": "core.observation_contract",
+      "kind": "invariant",
+      "role": "hard_gate",
+      "revision": "observation-contract/v1",
+      "required": true,
+      "config": {}
+    },
+    {
+      "grader_id": "rag.retrieval_report",
+      "kind": "outcome",
+      "role": "quality",
+      "revision": "rag-report/v1",
+      "required": true,
+      "config": {
+        "minimum_macro_recall_at_k": 0.8,
+        "minimum_macro_precision_at_k": 0.1,
+        "minimum_mean_reciprocal_rank": 0.5,
+        "minimum_evidence_group_coverage": 0.8,
+        "maximum_role_leaks": 0
+      }
+    }
+  ],
+  "trial_policy": {
+    "trials": 3,
+    "reliability_k": 3,
+    "max_steps": 8,
+    "max_tool_calls": 8,
+    "max_provider_attempts": 1,
+    "max_wall_clock_seconds": 120
+  },
+  "reference": {
+    "status": "verified",
+    "locator": "verification/rag-gold.example.json",
+    "sha256": "4a89581ae4c262959b167a0dd4838e836f48ac262e478fc8bb8498a203168651"
+  }
+}

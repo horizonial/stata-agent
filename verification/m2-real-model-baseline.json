@@ -1,0 +1,18 @@
+{
+  "baseline": "m2-real-model-v1",
+  "date": "2026-09-19",
+  "model": "deepseek-chat",
+  "provider": "deepseek",
+  "raw_model_output_retained": false,
+  "scenarios": {
+    "actionable_tool_selection": "pass",
+    "completion_after_tool_result": "pass",
+    "semantic_ambiguity_escalation": "pass"
+  },
+  "secret_retained": false,
+  "usage_kinds": [
+    "exact",
+    "exact",
+    "exact"
+  ]
+}

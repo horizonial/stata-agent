@@ -1,0 +1,13 @@
+{
+  "schema_version": "context-compiler-benchmark/v1",
+  "dataset_id": "context-compiler-core-v1",
+  "required_checks": [
+    "user_message_preserved",
+    "research_constraint_preserved",
+    "newest_duplicate_selected",
+    "local_only_excluded_remote",
+    "decisions_cover_sources",
+    "privacy_fail_closed",
+    "mandatory_budget_fail_closed"
+  ]
+}

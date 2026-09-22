@@ -1,0 +1,12 @@
+{
+  "schema_version": "stata-research-agent.skill-source/v1",
+  "name": "econ-visualization",
+  "version": "1.0.0",
+  "license": "CC0-1.0",
+  "upstream_repository": "https://github.com/JonasWeinert/EconAgentSkills",
+  "upstream_revision": "c1b8b1ef7ab59e6858fe3599a39d4732e5a76142",
+  "adapted_from": [
+    "_skills/communication/econ-visualization/SKILL.md"
+  ],
+  "executable_code_included": false
+}

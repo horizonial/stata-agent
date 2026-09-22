@@ -1,0 +1,41 @@
+{
+  "schema_version": "memory-quality-benchmark/v1",
+  "dataset_id": "memory-quality-core-v1",
+  "cases": [
+    {
+      "case_id": "memory-train-01",
+      "split": "train",
+      "prompt": "For this project, always report clustered standard errors.",
+      "expected_memories": [{"kind": "research_constraint", "required_markers": ["clustered standard errors"], "lifecycle": "active", "source_message_id": "msg_train_01"}],
+      "forbidden_markers": []
+    },
+    {
+      "case_id": "memory-test-decision",
+      "split": "test",
+      "prompt": "Use price as the primary outcome in this research path.",
+      "expected_memories": [{"kind": "research_decision", "required_markers": ["price", "primary outcome"], "lifecycle": "active", "source_message_id": "msg_test_decision"}],
+      "forbidden_markers": ["weight is the primary outcome"]
+    },
+    {
+      "case_id": "memory-test-tentative",
+      "split": "test",
+      "prompt": "I might prefer shorter tables, but let us decide after seeing the results.",
+      "expected_memories": [{"kind": "user_preference", "required_markers": ["shorter tables"], "lifecycle": "proposed", "source_message_id": "msg_test_tentative"}],
+      "forbidden_markers": ["always use shorter tables"]
+    },
+    {
+      "case_id": "memory-test-no-assistant-invention",
+      "split": "test",
+      "prompt": "The assistant suggests winsorizing, but the user has not accepted it.",
+      "expected_memories": [],
+      "forbidden_markers": ["winsorizing is required", "user accepted winsorizing"]
+    },
+    {
+      "case_id": "memory-test-correction",
+      "split": "test",
+      "prompt": "Correction: do not log price. Keep price in levels.",
+      "expected_memories": [{"kind": "research_decision", "required_markers": ["price", "levels"], "lifecycle": "active", "source_message_id": "msg_test_correction"}],
+      "forbidden_markers": ["log price"]
+    }
+  ]
+}

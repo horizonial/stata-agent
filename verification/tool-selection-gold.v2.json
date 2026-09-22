@@ -1,0 +1,62 @@
+{
+  "schema_version": "tool-selection-benchmark/v2",
+  "dataset_id": "tool-selection-core-v2",
+  "cases": [
+    {
+      "case_id": "tool-train-01",
+      "split": "train",
+      "prompt": "Inspect variables in auto.dta using the traceable Workspace data path.",
+      "expected": {"decision": "tool", "allowed_tools": ["stata.execute"], "required_argument_keys": ["code", "dataset_relative_path", "execution_role"]},
+      "forbidden_tools": ["shell.run"]
+    },
+    {
+      "case_id": "tool-test-formal-stata",
+      "split": "test",
+      "prompt": "Run a formal regression whose numeric results should be directly eligible for the Stata-backed Word path.",
+      "expected": {"decision": "tool", "allowed_tools": ["stata.execute"], "required_argument_keys": ["code", "dataset_relative_path", "execution_role"]},
+      "forbidden_tools": ["shell.run"]
+    },
+    {
+      "case_id": "tool-test-python-exploration",
+      "split": "test",
+      "prompt": "Explore a nonlinear regression in Python, but keep it out of the formal document until I review the exact output.",
+      "expected": {"decision": "tool", "allowed_tools": ["python.run"], "required_argument_keys": ["code"]},
+      "forbidden_tools": ["shell.run"]
+    },
+    {
+      "case_id": "tool-test-python-adoption",
+      "split": "test",
+      "prompt": "I reviewed the exact Python regression preview and explicitly confirm adoption of that fingerprint for document use.",
+      "expected": {"decision": "tool", "allowed_tools": ["research.adopt_analysis_output"], "required_argument_keys": ["analysis_output_id", "expected_output_fingerprint", "preview_artifact_id", "confirmation_summary"]},
+      "forbidden_tools": ["research.promote_stata_result"]
+    },
+    {
+      "case_id": "tool-test-literature",
+      "split": "test",
+      "prompt": "Search the Workspace papers for parallel-trends concerns.",
+      "expected": {"decision": "tool", "allowed_tools": ["research.search_knowledge"], "required_argument_keys": ["query"]},
+      "forbidden_tools": ["shell.run", "stata.execute"]
+    },
+    {
+      "case_id": "tool-test-help",
+      "split": "test",
+      "prompt": "A real Stata run failed because an option is unknown; consult the indexed local help for that error.",
+      "expected": {"decision": "tool", "allowed_tools": ["stata.explain_run_error", "stata.lookup_help"], "required_argument_keys": ["query"]},
+      "forbidden_tools": ["shell.run"]
+    },
+    {
+      "case_id": "tool-test-confirm",
+      "split": "test",
+      "prompt": "There are two consequential definitions of treatment and the user has not chosen one.",
+      "expected": {"decision": "wait", "allowed_tools": [], "required_argument_keys": []},
+      "forbidden_tools": ["stata.execute", "python.run", "shell.run"]
+    },
+    {
+      "case_id": "tool-test-complete",
+      "split": "test",
+      "prompt": "All required results and their Stata lineage are already present; summarize without rerunning.",
+      "expected": {"decision": "complete", "allowed_tools": [], "required_argument_keys": []},
+      "forbidden_tools": ["stata.execute", "python.run", "shell.run"]
+    }
+  ]
+}

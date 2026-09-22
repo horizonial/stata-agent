@@ -1,0 +1,248 @@
+{
+  "schema_version": "1",
+  "milestone": "M0",
+  "applicable_set": [
+    "VR-001", "VR-002", "VR-003", "VR-004", "VR-011",
+    "VR-018", "VR-025", "VR-026", "VR-028"
+  ],
+  "milestone_results": {
+    "M1": {
+      "status": "PASSED",
+      "applicable_set": ["VR-007", "VR-012", "VR-013", "VR-014", "VR-015", "VR-016"],
+      "requirements": {
+        "VR-007": {"status": "PASSED", "scope_note": "M1 Operation/Attempt/Handoff/Manifest/Finalization subset; Agent JIT admission remains M2", "test_selectors": ["tests/vertical/test_stata_operation_vertical.py", "tests/integration/test_real_stata_mcp_runtime.py"]},
+        "VR-012": {"status": "PASSED", "test_selectors": ["tests/integration/test_real_stata_mcp_runtime.py"]},
+        "VR-013": {"status": "PASSED", "test_selectors": ["tests/vertical/test_artifact_data_vertical.py", "tests/integration/test_real_stata_mcp_runtime.py"]},
+        "VR-014": {"status": "PASSED", "test_selectors": ["tests/vertical/test_result_profile_vertical.py", "tests/integration/test_real_stata_mcp_runtime.py"]},
+        "VR-015": {"status": "PASSED", "test_selectors": ["tests/vertical/test_result_profile_vertical.py", "tests/integration/test_real_stata_mcp_runtime.py"]},
+        "VR-016": {"status": "PASSED", "scope_note": "M1 agent-generated DOCX delivery subset; human roundtrip remains M3", "test_selectors": ["tests/unit/test_table_document_rules.py", "tests/integration/test_real_stata_mcp_runtime.py"]}
+      }
+    },
+    "M3": {
+      "status": "PASSED",
+      "applicable_set": ["VR-003", "VR-004", "VR-005", "VR-013", "VR-015", "VR-016", "VR-017", "VR-028"],
+      "requirements": {
+        "VR-003": {"status": "PASSED", "test_selectors": ["tests/stateful/test_atomic_commit.py", "tests/integration/test_agent_research_to_word_vertical.py"]},
+        "VR-004": {"status": "PASSED", "test_selectors": ["tests/vertical/test_analysis_output_promotion_vertical.py", "tests/integration/test_agent_research_to_word_vertical.py"]},
+        "VR-005": {"status": "PASSED", "test_selectors": ["tests/vertical/test_stata_operation_vertical.py", "tests/integration/test_real_stata_mcp_runtime.py"]},
+        "VR-013": {"status": "PASSED", "test_selectors": ["tests/vertical/test_artifact_data_vertical.py", "tests/integration/test_real_stata_mcp_runtime.py"]},
+        "VR-015": {"status": "PASSED", "test_selectors": ["tests/vertical/test_analysis_output_promotion_vertical.py", "tests/integration/test_agent_research_to_word_vertical.py"]},
+        "VR-016": {"status": "PASSED", "test_selectors": ["tests/unit/test_document_roundtrip.py", "tests/integration/test_agent_research_to_word_vertical.py"]},
+        "VR-017": {"status": "PASSED", "test_selectors": ["tests/vertical/test_analysis_output_promotion_vertical.py"]},
+        "VR-028": {"status": "PASSED", "test_selectors": ["tests/vertical/test_research_state_branch_vertical.py", "tests/integration/test_agent_research_to_word_vertical.py"]}
+      }
+    },
+    "M4-01": {
+      "status": "PASSED",
+      "applicable_set": ["VR-018", "VR-020"],
+      "requirements": {
+        "VR-018": {"status": "PASSED", "test_selectors": ["tests/contract/test_api_contract.py", "tests/static/test_browser_shell_boundaries.py"]},
+        "VR-020": {"status": "PASSED", "scope_note": "M4-01 revision-bound Bootstrap/cache subset; durable/ephemeral stream convergence remains M4-03/M4-04", "test_selectors": ["tests/contract/test_api_contract.py::test_bootstrap_data_and_cursor_share_one_consistent_read_view", "tests/static/test_browser_shell_boundaries.py"]}
+      }
+    },
+    "M4-02": {
+      "status": "PASSED",
+      "applicable_set": ["VR-015", "VR-018", "VR-020"],
+      "requirements": {
+        "VR-015": {"status": "PASSED", "scope_note": "M4-02 shared Result/Evidence identities and current Path adoption read model; canonical lineage remains the existing dedicated endpoint", "test_selectors": ["tests/contract/test_research_view_api.py", "tests/integration/test_agent_research_to_word_vertical.py"]},
+        "VR-018": {"status": "PASSED", "test_selectors": ["tests/contract/test_api_contract.py", "tests/contract/test_research_view_api.py"]},
+        "VR-020": {"status": "PASSED", "scope_note": "M4-02 exact Query response/page cache subset; durable notification convergence remains M4-03", "test_selectors": ["tests/contract/test_research_view_api.py", "tests/static/test_browser_shell_boundaries.py"]}
+      }
+    },
+    "M4-03": {
+      "status": "PASSED",
+      "applicable_set": ["VR-019", "VR-020"],
+      "requirements": {
+        "VR-019": {"status": "PASSED", "test_selectors": ["tests/contract/test_api_contract.py::test_bootstrap_data_and_cursor_share_one_consistent_read_view", "tests/contract/test_workspace_stream.py"]},
+        "VR-020": {"status": "PASSED", "scope_note": "M4-03 durable notification invalidation/re-query subset; command pending and Attention remain M4-04", "test_selectors": ["tests/contract/test_workspace_stream.py", "tests/static/test_browser_shell_boundaries.py::test_workspace_stream_is_notification_plus_query_not_a_fact_reducer"]}
+      }
+    },
+    "M4-04": {
+      "status": "PASSED",
+      "applicable_set": ["VR-002", "VR-008", "VR-020"],
+      "requirements": {
+        "VR-002": {"status": "PASSED", "scope_note": "M4-04 browser-visible single write lane, authoritative queue position, and distinct Waiting answer versus queued message intent", "test_selectors": ["tests/contract/test_browser_controls_api.py"]},
+        "VR-008": {"status": "PASSED", "scope_note": "M4-04 public safe-pause request and authoritative pause-convergence visibility; Operation convergence remains the previously verified M2 control contract", "test_selectors": ["tests/contract/test_browser_controls_api.py", "tests/vertical/test_tool_broker_vertical.py"]},
+        "VR-020": {"status": "PASSED", "scope_note": "M4-04 exact-envelope pending commands and minimal global Attention Query; cross-workspace live invalidation remains M4-05/M4 Exit", "test_selectors": ["tests/contract/test_browser_controls_api.py", "tests/static/test_browser_shell_boundaries.py::test_pending_commands_preserve_exact_envelope_and_controls_are_typed"]}
+      }
+    },
+    "M4-05": {
+      "status": "PASSED",
+      "applicable_set": ["VR-002", "VR-012"],
+      "requirements": {
+        "VR-002": {"status": "PASSED", "scope_note": "M4-05 proves one scheduler lane per Workspace, queue-head activation, and real overlap across isolated Workspace Execution Scopes", "test_selectors": ["tests/vertical/test_application_runtime.py", "tests/integration/test_cross_workspace_real_stata.py", "web/tests/e2e/m4-exit.spec.ts"]},
+        "VR-012": {"status": "PASSED", "scope_note": "M4-05 uses the pinned stdio stata-mcp path with distinct authoritative session identities, Completion Manifests, failure isolation, and browser-triggered real Stata execution", "test_selectors": ["tests/integration/test_cross_workspace_real_stata.py", "web/tests/e2e/m4-exit.spec.ts"]}
+      }
+    },
+    "M4": {
+      "status": "PASSED",
+      "applicable_set": ["VR-002", "VR-018", "VR-019", "VR-020"],
+      "requirements": {
+        "VR-002": {"status": "PASSED", "test_selectors": ["tests/vertical/test_control_vertical.py", "tests/vertical/test_application_runtime.py", "tests/integration/test_cross_workspace_real_stata.py", "web/tests/e2e/m4-exit.spec.ts"]},
+        "VR-018": {"status": "PASSED", "test_selectors": ["tests/contract/test_api_contract.py", "tests/contract/test_browser_controls_api.py", "web/tests/e2e/m4-exit.spec.ts"]},
+        "VR-019": {"status": "PASSED", "test_selectors": ["tests/contract/test_workspace_stream.py", "tests/contract/test_research_view_api.py", "web/tests/e2e/m4-exit.spec.ts"]},
+        "VR-020": {"status": "PASSED", "test_selectors": ["tests/static/test_browser_shell_boundaries.py", "web/tests/e2e/m4-exit.spec.ts"]}
+      }
+    },
+    "M5-01a": {
+      "status": "PASSED",
+      "applicable_set": ["VR-021"],
+      "requirements": {
+        "VR-021": {
+          "status": "PASSED",
+          "scope_note": "M5-01a loopback/browser capability subset; Windows Credential Manager lifecycle and Model Gateway version binding remain M5-01b",
+          "test_selectors": ["tests/unit/test_local_session.py", "tests/unit/test_windows_runtime_control.py", "tests/contract/test_local_session_api.py", "tests/static/test_browser_shell_boundaries.py", "web/tests/e2e/m5-loopback-session.spec.ts"]
+        }
+      }
+    },
+    "M5-01b": {
+      "status": "PASSED",
+      "applicable_set": ["VR-021"],
+      "requirements": {
+        "VR-021": {
+          "status": "PASSED",
+          "scope_note": "M5-01b Windows Credential Manager, staged version lifecycle, dedicated sensitive API, recovery, and Model Gateway binding subset; all-surface Sensitive Output Gate remains M5-02",
+          "test_selectors": ["tests/vertical/test_provider_credentials_vertical.py", "tests/contract/test_local_session_api.py::test_dedicated_credential_endpoint_never_echoes_or_persists_secret", "tests/vertical/test_model_gateway_vertical.py"]
+        }
+      }
+    },
+    "M5-02": {
+      "status": "PASSED",
+      "applicable_set": ["VR-001", "VR-021"],
+      "requirements": {
+        "VR-001": {
+          "status": "PASSED",
+          "scope_note": "M5-02 arbitrary-code executor subset: admitted Python/PowerShell receive only fresh staging and exact runtime grants; authority SQLite, Managed Store, credentials, and control IPC are absent from the BaseContainer grant",
+          "test_selectors": ["tests/integration/test_windows_sandbox_executor.py", "tests/vertical/test_tool_broker_vertical.py::test_admitted_python_uses_base_container_and_commits_execution_receipt", "tests/static/test_architecture_boundaries.py"]
+        },
+        "VR-021": {
+          "status": "PASSED",
+          "scope_note": "M5-02 Provider/Stata/Tool/Word/Sandbox Sensitive Output Gate and scrubbed executor-environment subset; Diagnostic Bundle and SQLite export remain M5-03",
+          "test_selectors": ["tests/unit/test_sensitive_output.py", "tests/integration/test_windows_sandbox_executor.py", "tests/vertical/test_model_gateway_vertical.py", "tests/vertical/test_stata_operation_vertical.py", "tests/unit/test_table_document_rules.py"]
+        }
+      }
+    },
+    "M5-03": {
+      "status": "PASSED",
+      "applicable_set": ["VR-021", "VR-024"],
+      "requirements": {
+        "VR-021": {
+          "status": "PASSED",
+          "scope_note": "M5-03 Diagnostic Bundle and allowlisted Workspace SQLite projection subset; real Provider SDK and clean-VM L7 remain M5 exit",
+          "test_selectors": ["tests/unit/test_diagnostics.py", "tests/integration/test_diagnostic_bundle.py", "tests/contract/test_diagnostic_bundle_api.py", "tests/unit/test_sensitive_output.py", "tests/vertical/test_model_gateway_vertical.py::test_provider_diagnostics_contain_only_registered_transport_metadata"]
+        },
+        "VR-024": {
+          "status": "PASSED",
+          "scope_note": "M5-03 implementation-level diagnostics and support-bundle contract; clean-VM L7 remains M5 exit",
+          "test_selectors": ["tests/unit/test_diagnostics.py", "tests/integration/test_diagnostic_bundle.py", "tests/contract/test_diagnostic_bundle_api.py", "tests/static/test_architecture_boundaries.py"]
+        }
+      }
+    },
+    "M5-04": {
+      "status": "IMPLEMENTATION_PASSED",
+      "applicable_set": ["VR-022", "VR-027"],
+      "requirements": {
+        "VR-022": {
+          "status": "PASSED",
+          "scope_note": "M5-04 L2/L3 release activation subset; signed installer and clean-VM L7 remain M5-06/M5 exit",
+          "test_selectors": ["tests/integration/test_release_activation.py", "tests/unit/test_release_bundle.py", "tests/unit/test_release_probe.py", "tests/unit/test_windows_release_trust.py"]
+        },
+        "VR-027": {
+          "status": "PASSED",
+          "scope_note": "M5-04 idle-exit, cooperating service lock, and authenticated existing-instance Launcher subset; clean-VM abnormal termination L7 remains M5 exit",
+          "test_selectors": ["tests/unit/test_idle_exit.py", "tests/unit/test_windows_runtime_control.py", "tests/unit/test_loopback_launcher.py", "web/tests/e2e/m5-loopback-session.spec.ts"]
+        }
+      }
+    },
+    "M5-05": {
+      "status": "IMPLEMENTATION_PASSED",
+      "applicable_set": ["VR-023"],
+      "requirements": {
+        "VR-023": {
+          "status": "PASSED",
+          "scope_note": "M5-05 L1/L2/L3 staged migration subset using a test schema 27; installed real-release and clean-VM L7 remain M5 exit",
+          "test_selectors": ["tests/integration/test_workspace_migration.py", "tests/unit/test_sqlite_bootstrap.py", "tests/integration/test_release_activation.py"]
+        }
+      }
+    },
+    "M5-06": {
+      "status": "IMPLEMENTATION_PASSED",
+      "applicable_set": ["VR-025", "VR-026"],
+      "requirements": {
+        "VR-025": {
+          "status": "PASSED",
+          "scope_note": "M5-06 exact Python/Node plus deterministic pinned stata-mcp wheel input audit, canonical payload, dual-SBOM coverage, license/security/exception policy, and signing identity implementation subset; clean offline double build, production signing, and clean-VM L7 remain M5 exit",
+          "test_selectors": ["tests/unit/test_release_supply_chain.py", "tests/integration/test_release_signing_gate.py", "tests/static/test_verification_manifest.py", "tests/unit/test_release_bundle.py", "tests/unit/test_windows_release_trust.py"]
+        },
+        "VR-026": {
+          "status": "PASSED",
+          "scope_note": "M5-06 immutable approved release candidate and exact no-blind-retry signing-attempt subset; complete G0-G7 release-test-result computation and clean-VM L7 remain M5/M6 exit",
+          "test_selectors": ["tests/integration/test_release_signing_gate.py", "tests/static/test_verification_manifest.py"]
+        }
+      }
+    },
+    "M6-01": {
+      "status": "IMPLEMENTATION_PASSED",
+      "applicable_set": ["VR-006", "VR-007", "VR-010", "VR-014", "VR-015", "VR-016", "VR-026", "VR-028"],
+      "requirements": {
+        "VR-006": {"status": "PASSED", "scope_note": "M6-01 autonomous journey uses frozen Step Context and scripted deterministic model output; repeated live-provider L6 distribution remains M6 exit", "test_selectors": ["tests/integration/test_agent_research_to_word_vertical.py", "tests/vertical/test_agent_turn_driver_vertical.py"]},
+        "VR-007": {"status": "PASSED", "scope_note": "M6-01 admitted research workflow crosses Broker/Operation execution and commits canonical Tool Result before the next Step", "test_selectors": ["tests/integration/test_agent_research_to_word_vertical.py", "tests/vertical/test_tool_broker_vertical.py"]},
+        "VR-010": {"status": "PASSED", "scope_note": "M6-01 completes inside the versioned Turn budget; policy-bound failure/no-progress limit tests remain the existing M2 evidence", "test_selectors": ["tests/integration/test_agent_research_to_word_vertical.py", "tests/vertical/test_agent_turn_driver_vertical.py"]},
+        "VR-014": {"status": "PASSED", "scope_note": "M6-01 Founder auditor requires the current Result to be qualified, Stata-produced, Plan-matching, and bound to current Data", "test_selectors": ["tests/integration/test_agent_research_to_word_vertical.py"]},
+        "VR-015": {"status": "PASSED", "scope_note": "M6-01 current delivery table requires eight source-linked Evidence uses and complete numeric coverage", "test_selectors": ["tests/integration/test_agent_research_to_word_vertical.py"]},
+        "VR-016": {"status": "PASSED", "scope_note": "M6-01 current delivery Word must pass Delivery Gate and retain an available managed DOCX Artifact", "test_selectors": ["tests/integration/test_agent_research_to_word_vertical.py"]},
+        "VR-026": {"status": "PASSED", "scope_note": "M6-01 versioned Founder Scenario and exact-candidate binding contract; without a trusted active installed candidate verifier, Founder Acceptance intentionally fails closed", "test_selectors": ["tests/unit/test_founder_scenario.py", "tests/static/test_verification_manifest.py", "tests/integration/test_agent_research_to_word_vertical.py"]},
+        "VR-028": {"status": "PASSED", "scope_note": "M6-01 auditor follows Path-specific Plan/Data/Result/Document current slots without collapsing identities", "test_selectors": ["tests/integration/test_agent_research_to_word_vertical.py"]}
+      }
+    },
+    "M6-02": {
+      "status": "IMPLEMENTATION_PASSED",
+      "applicable_set": ["VR-002", "VR-008", "VR-015", "VR-026", "VR-028"],
+      "requirements": {
+        "VR-002": {"status": "PASSED", "scope_note": "M6-02 controlled journey keeps one Workspace write lane across Waiting, pause convergence, and a new continuation Turn", "test_selectors": ["tests/integration/test_agent_research_to_word_vertical.py", "tests/vertical/test_tool_broker_vertical.py"]},
+        "VR-008": {"status": "PASSED", "scope_note": "M6-02 proves typed Waiting answer, strict safe pause, predecessor preservation, and new-Turn continuation in one journey", "test_selectors": ["tests/integration/test_agent_research_to_word_vertical.py", "tests/vertical/test_tool_broker_vertical.py"]},
+        "VR-015": {"status": "PASSED", "scope_note": "M6-02 selected Evidence number resolves through the path-neutral lineage query to Data Artifact, Stata command, Run, and source locator", "test_selectors": ["tests/integration/test_agent_research_to_word_vertical.py", "tests/integration/test_real_stata_mcp_runtime.py"]},
+        "VR-026": {"status": "PASSED", "scope_note": "M6-02 adds a strict versioned Controlled Founder Scenario; clean installed exact-candidate decision/notes remain G7", "test_selectors": ["tests/unit/test_founder_scenario.py", "tests/static/test_verification_manifest.py", "tests/integration/test_agent_research_to_word_vertical.py"]},
+        "VR-028": {"status": "PASSED", "scope_note": "M6-02 child Path retains explicit parent identity and copies Plan/Data/Result/Document current snapshots without rewriting the parent", "test_selectors": ["tests/integration/test_agent_research_to_word_vertical.py", "tests/vertical/test_research_state_branch_vertical.py"]}
+      }
+    },
+    "M6-03": {
+      "status": "IMPLEMENTATION_PASSED",
+      "applicable_set": ["VR-025", "VR-026"],
+      "requirements": {
+        "VR-025": {"status": "PASSED", "scope_note": "M6-03 signing authorization binds exact unsigned payload, dual SBOM, and a canonical hash of immutable G0-G7/Test/Founder evidence; production clean build/signing remains M6 exit", "test_selectors": ["tests/integration/test_release_candidate_gates.py", "tests/integration/test_release_signing_gate.py"]},
+        "VR-026": {"status": "PASSED", "scope_note": "M6-03 immutable candidate/applicable set/results/Founder receipts, fingerprint freshness, sequential G0-G7, terminal rejection, active-installed verifier, and gated signing implementation subset", "test_selectors": ["tests/integration/test_release_candidate_gates.py", "tests/integration/test_agent_research_to_word_vertical.py", "tests/static/test_verification_manifest.py"]}
+      }
+    }
+  },
+  "requirements": [
+    {"id": "VR-001", "m0_applicable": true, "status": "PASSED", "test_selectors": ["tests/stateful/test_atomic_commit.py", "tests/vertical/test_control_vertical.py"]},
+    {"id": "VR-002", "m0_applicable": true, "status": "PASSED", "test_selectors": ["tests/vertical/test_control_vertical.py::test_write_turn_acquires_lane_second_write_queues_and_read_can_run"]},
+    {"id": "VR-003", "m0_applicable": true, "status": "PASSED", "test_selectors": ["tests/stateful/test_atomic_commit.py"]},
+    {"id": "VR-004", "m0_applicable": true, "status": "PASSED", "scope_note": "M0 immutable history subset; Projection lag behavior remains M3", "test_selectors": ["tests/stateful/test_atomic_commit.py::test_authoritative_history_tables_reject_update_and_delete"]},
+    {"id": "VR-005", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-006", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-007", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "scope_note": "M0 schema contract only; execution begins M1/M2", "test_selectors": ["tests/contract/test_tool_contract.py"]},
+    {"id": "VR-008", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-009", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-010", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-011", "m0_applicable": true, "status": "PASSED", "scope_note": "M0 import/IPC capability boundary; live disposable Worker remains M2", "test_selectors": ["tests/static/test_architecture_boundaries.py", "tests/contract/test_ipc_contract.py"]},
+    {"id": "VR-012", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-013", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-014", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-015", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-016", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-017", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-018", "m0_applicable": true, "status": "PASSED", "test_selectors": ["tests/contract/test_api_contract.py"]},
+    {"id": "VR-019", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-020", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-021", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-022", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-023", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-024", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-025", "m0_applicable": true, "status": "PASSED", "test_selectors": ["tests/static/test_verification_manifest.py::test_dependency_inputs_are_exactly_locked", "tools/verify_m0.py"]},
+    {"id": "VR-026", "m0_applicable": true, "status": "PASSED", "test_selectors": ["tests/static/test_verification_manifest.py", "tools/verify_m0.py"]},
+    {"id": "VR-027", "m0_applicable": false, "status": "NOT_APPLICABLE_M0", "test_selectors": []},
+    {"id": "VR-028", "m0_applicable": true, "status": "PASSED", "test_selectors": ["tests/unit/test_domain_primitives.py", "tests/vertical/test_control_vertical.py"]}
+  ]
+}

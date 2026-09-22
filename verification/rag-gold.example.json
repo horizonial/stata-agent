@@ -1,0 +1,24 @@
+{
+  "schema_version": "rag-gold-v1",
+  "cases": [
+    {
+      "case_id": "literature-identification-example",
+      "query": "parallel trends identification and pre-trend diagnostics",
+      "corpus_roles": ["literature_evidence"],
+      "expected_source_locators": ["literature/design.md"],
+      "expected_content_markers": ["parallel trends", "event-study leads"],
+      "evidence_groups": [
+        ["parallel trends"],
+        ["event-study leads", "pre-trend"]
+      ],
+      "k": 6
+    },
+    {
+      "case_id": "stata-help-stored-results-example",
+      "query": "regress stored coefficient vector",
+      "corpus_roles": ["stata_help"],
+      "expected_content_markers": ["e(b)"],
+      "k": 6
+    }
+  ]
+}

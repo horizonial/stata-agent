@@ -1,0 +1,78 @@
+{
+  "schema_version": "adaptive-pdf-structure-gold/v1",
+  "cases": [
+    {
+      "case_id": "callaway-santanna-irreversibility-equation",
+      "paper_id": "callaway-santanna-2021",
+      "page_number": 5,
+      "kind": "formula",
+      "required_markers": [
+        "D _ { t - 1 } = 1",
+        "D _ { t } = 1"
+      ]
+    },
+    {
+      "case_id": "de-chaisemartin-twfe-equation",
+      "paper_id": "de-chaisemartin-dhaultfoeuille-2022",
+      "page_number": 5,
+      "kind": "formula",
+      "required_markers": [
+        "\\widehat { \\beta } _ { f e } D _ { g , t }",
+        "\\tag{2.1}"
+      ]
+    },
+    {
+      "case_id": "sun-abraham-event-study-equation",
+      "paper_id": "sun-abraham-2021",
+      "page_number": 2,
+      "kind": "formula",
+      "required_markers": [
+        "\\sum _ { \\ell } \\mu _ { \\ell }",
+        "\\tag{1}"
+      ]
+    },
+    {
+      "case_id": "continuous-treatment-twfe-equation",
+      "paper_id": "callaway-goodman-bacon-santanna-2021",
+      "page_number": 3,
+      "kind": "formula",
+      "required_markers": [
+        "\\beta ^ { t w f e }",
+        "\\tag{1.1}"
+      ]
+    },
+    {
+      "case_id": "callaway-santanna-weight-table",
+      "paper_id": "callaway-santanna-2021",
+      "page_number": 15,
+      "kind": "table",
+      "minimum_markdown_rows": 7,
+      "required_markers": [
+        "| Parameter | w(g,t) |",
+        "theta"
+      ]
+    },
+    {
+      "case_id": "sun-abraham-specification-table",
+      "paper_id": "sun-abraham-2021",
+      "page_number": 37,
+      "kind": "table",
+      "minimum_markdown_rows": 10,
+      "required_markers": [
+        "| Paper | Binary Absorbing Treatment",
+        "Bailey and Goodman-Bacon"
+      ]
+    },
+    {
+      "case_id": "sun-abraham-summary-statistics-table",
+      "paper_id": "sun-abraham-2021",
+      "page_number": 38,
+      "kind": "table",
+      "minimum_markdown_rows": 20,
+      "required_markers": [
+        "|  | N | Mean | Std. Dev |",
+        "| Age at admission | 656 | 56 | 2.29 |"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,404 @@
+{
+  "schema_version": "1",
+  "schemas": {
+    "CanonicalToolCallEnvelope": {
+      "additionalProperties": false,
+      "properties": {
+        "arguments_hash": {
+          "maxLength": 64,
+          "minLength": 64,
+          "title": "Arguments Hash",
+          "type": "string"
+        },
+        "assistant_output_id": {
+          "title": "Assistant Output Id",
+          "type": "string"
+        },
+        "call_ordinal": {
+          "minimum": 1,
+          "title": "Call Ordinal",
+          "type": "integer"
+        },
+        "canonical_arguments": {
+          "additionalProperties": true,
+          "title": "Canonical Arguments",
+          "type": "object"
+        },
+        "canonical_arguments_snapshot_id": {
+          "title": "Canonical Arguments Snapshot Id",
+          "type": "string"
+        },
+        "created_revision": {
+          "minimum": 1,
+          "title": "Created Revision",
+          "type": "integer"
+        },
+        "proposal_status": {
+          "enum": [
+            "proposed",
+            "awaiting_confirmation",
+            "rejected",
+            "scheduled",
+            "admitted",
+            "resolved",
+            "blocked"
+          ],
+          "title": "Proposal Status",
+          "type": "string"
+        },
+        "provider_tool_call_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider Tool Call Id"
+        },
+        "raw_arguments_snapshot_id": {
+          "title": "Raw Arguments Snapshot Id",
+          "type": "string"
+        },
+        "requested_tool_name": {
+          "pattern": "^[a-z][a-z0-9_-]*(?:\\.[a-z][a-z0-9_-]*)+$",
+          "title": "Requested Tool Name",
+          "type": "string"
+        },
+        "resolved_tool_contract_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resolved Tool Contract Id"
+        },
+        "schema_version": {
+          "const": "1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "tool_call_id": {
+          "pattern": "^toolcall_.+",
+          "title": "Tool Call Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "tool_call_id",
+        "assistant_output_id",
+        "call_ordinal",
+        "requested_tool_name",
+        "raw_arguments_snapshot_id",
+        "canonical_arguments_snapshot_id",
+        "canonical_arguments",
+        "arguments_hash",
+        "proposal_status",
+        "created_revision"
+      ],
+      "title": "CanonicalToolCallEnvelope",
+      "type": "object"
+    },
+    "CanonicalToolResultEnvelope": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_references": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Artifact References",
+          "type": "array"
+        },
+        "content_hash": {
+          "maxLength": 64,
+          "minLength": 64,
+          "title": "Content Hash",
+          "type": "string"
+        },
+        "created_revision": {
+          "minimum": 1,
+          "title": "Created Revision",
+          "type": "integer"
+        },
+        "full_payload_artifact_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Full Payload Artifact Id"
+        },
+        "is_truncated": {
+          "default": false,
+          "title": "Is Truncated",
+          "type": "boolean"
+        },
+        "operation_references": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Operation References",
+          "type": "array"
+        },
+        "result_kind": {
+          "enum": [
+            "success",
+            "error",
+            "rejected",
+            "denied",
+            "cancelled",
+            "blocked"
+          ],
+          "title": "Result Kind",
+          "type": "string"
+        },
+        "result_schema_version": {
+          "title": "Result Schema Version",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        },
+        "tool_call_id": {
+          "pattern": "^toolcall_.+",
+          "title": "Tool Call Id",
+          "type": "string"
+        },
+        "tool_result_id": {
+          "title": "Tool Result Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "tool_result_id",
+        "tool_call_id",
+        "result_kind",
+        "result_schema_version",
+        "summary",
+        "content_hash",
+        "created_revision"
+      ],
+      "title": "CanonicalToolResultEnvelope",
+      "type": "object"
+    },
+    "CompletionManifestEnvelope": {
+      "$defs": {
+        "ManifestArtifact": {
+          "additionalProperties": false,
+          "properties": {
+            "candidate_id": {
+              "title": "Candidate Id",
+              "type": "string"
+            },
+            "managed_locator": {
+              "title": "Managed Locator",
+              "type": "string"
+            },
+            "sha256": {
+              "maxLength": 64,
+              "minLength": 64,
+              "title": "Sha256",
+              "type": "string"
+            },
+            "size": {
+              "minimum": 0,
+              "title": "Size",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "candidate_id",
+            "managed_locator",
+            "size",
+            "sha256"
+          ],
+          "title": "ManifestArtifact",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "artifacts": {
+          "items": {
+            "$ref": "#/$defs/ManifestArtifact"
+          },
+          "title": "Artifacts",
+          "type": "array"
+        },
+        "attempt_id": {
+          "pattern": "^attempt_.+",
+          "title": "Attempt Id",
+          "type": "string"
+        },
+        "execution_status": {
+          "enum": [
+            "completed",
+            "failed"
+          ],
+          "title": "Execution Status",
+          "type": "string"
+        },
+        "manifest_id": {
+          "pattern": "^manifest_.+",
+          "title": "Manifest Id",
+          "type": "string"
+        },
+        "operation_id": {
+          "pattern": "^op_.+",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "session_generation": {
+          "minimum": 1,
+          "title": "Session Generation",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "manifest_id",
+        "operation_id",
+        "attempt_id",
+        "session_generation",
+        "execution_status",
+        "artifacts"
+      ],
+      "title": "CompletionManifestEnvelope",
+      "type": "object"
+    },
+    "OperationAttemptEnvelope": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt_id": {
+          "pattern": "^attempt_.+",
+          "title": "Attempt Id",
+          "type": "string"
+        },
+        "attempt_ordinal": {
+          "minimum": 1,
+          "title": "Attempt Ordinal",
+          "type": "integer"
+        },
+        "operation_id": {
+          "pattern": "^op_.+",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "session_generation": {
+          "minimum": 1,
+          "title": "Session Generation",
+          "type": "integer"
+        },
+        "status": {
+          "enum": [
+            "created",
+            "handoff_committed",
+            "completed",
+            "failed",
+            "interrupted"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "attempt_id",
+        "operation_id",
+        "attempt_ordinal",
+        "session_generation",
+        "status"
+      ],
+      "title": "OperationAttemptEnvelope",
+      "type": "object"
+    },
+    "OperationEnvelope": {
+      "additionalProperties": false,
+      "properties": {
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "operation_id": {
+          "pattern": "^op_.+",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "proposed",
+            "authorized",
+            "admitted",
+            "handoff_committed",
+            "completed",
+            "failed",
+            "interrupted"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "tool_call_id": {
+          "pattern": "^toolcall_.+",
+          "title": "Tool Call Id",
+          "type": "string"
+        },
+        "tool_contract_id": {
+          "title": "Tool Contract Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "operation_id",
+        "tool_call_id",
+        "tool_contract_id",
+        "status"
+      ],
+      "title": "OperationEnvelope",
+      "type": "object"
+    }
+  }
+}

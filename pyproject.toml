@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools==72.1.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stata-research-agent"
+version = "0.0.0"
+description = "A local-first, traceable research agent for Stata workflows."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "Proprietary" }
+authors = [{ name = "Stata Research Agent" }]
+dependencies = [
+  "fastapi==0.136.3",
+  "httpx==0.28.1",
+  "mcp==2.2.0",
+  "pypdf==6.9.1",
+  "pydantic==2.13.5",
+  "uvicorn==0.53.0",
+]
+
+[project.scripts]
+stata-research-agent = "stata_research_agent.interfaces.service_main:main"
+
+[dependency-groups]
+dev = [
+  "build==1.6.0",
+  "mypy==1.19.1",
+  "pyinstaller==6.12.0",
+  "pytest==9.1.1",
+  "ruff==0.13.2",
+  "wheel==0.43.0",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["stata_research_agent*"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["stata_research_agent"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [
+  ".candidate-rehearsal-*",
+  ".installed-mcp-smoke",
+  ".pytest-*",
+  ".tmp-real-stata-*",
+  ".release-readiness-*",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["stata_research_agent"]

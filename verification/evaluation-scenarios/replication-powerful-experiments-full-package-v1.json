@@ -1,0 +1,95 @@
+{
+  "schema_version": "stata-research-agent.evaluation-scenario/v1",
+  "scenario_id": "agent.replication.powerful-experiments-full-package",
+  "revision": 1,
+  "title": "Official World Bank package reproduces the Powerful Experiments figures and statistics",
+  "suite": "regression",
+  "split": "development",
+  "level": "subsystem",
+  "subsystem_mode": "extrinsic",
+  "subsystems": ["stata_execution", "result_provenance", "figure_export"],
+  "tags": ["public-paper", "replication", "experiment-design", "graph-export", "world-bank"],
+  "interaction_mode": "autonomous",
+  "initial_user_message": "Run the supplied official World Bank replication package and reproduce its descriptive-statistics oracle and Figure 1 artifacts.",
+  "fixtures": [
+    {
+      "fixture_id": "powerful-experiments-master-do",
+      "role": "package_master_do",
+      "locator": "verification/replication-benchmarks/powerful-experiments-wp-2025/source/package/RR_WLD_2025_394/Reproducibility package/FiscalStudies.do",
+      "media_type": "text/plain",
+      "sha256": "6150abd6d73fe5d9f8ab1e442735a1ebde82a6ad40373e79bc4065eb068f983b"
+    },
+    {
+      "fixture_id": "powerful-experiments-baseline-data",
+      "role": "package_baseline_data",
+      "locator": "verification/replication-benchmarks/powerful-experiments-wp-2025/source/package/RR_WLD_2025_394/Reproducibility package/BaselineConstructed.dta",
+      "media_type": "application/x-stata-dta",
+      "sha256": "e3835da6f6faf54e69ee86fc7e16ce32c03236942d2c95cbe69e818fec12b5c6"
+    },
+    {
+      "fixture_id": "powerful-experiments-export-data",
+      "role": "package_export_data",
+      "locator": "verification/replication-benchmarks/powerful-experiments-wp-2025/source/package/RR_WLD_2025_394/Reproducibility package/ExportOutcomes.dta",
+      "media_type": "application/x-stata-dta",
+      "sha256": "f961565c6cff4f9e3c3f25db6c90ba6948f738dedc129eed279a3ce1e02e1d90"
+    },
+    {
+      "fixture_id": "powerful-experiments-harness",
+      "role": "replication_harness",
+      "locator": "verification/replication-benchmarks/powerful-experiments-wp-2025/harness/run-full-package.do",
+      "media_type": "text/plain",
+      "sha256": "83c08b53e7bb3978592e9a625367225b730c2f0b1f93f76a9d0cee42210030ca"
+    },
+    {
+      "fixture_id": "powerful-experiments-reference",
+      "role": "replication_reference",
+      "locator": "verification/replication-benchmarks/powerful-experiments-wp-2025/reference/full-package.json",
+      "media_type": "application/json",
+      "sha256": "f781f19b9d923ebcacc8e4487b0c0445718251e2d25a346ea3c698ef27da7116"
+    }
+  ],
+  "interaction": [],
+  "faults": [],
+  "required_outcomes": [
+    "replication.source_integrity_verified",
+    "replication.stata_execution_succeeded",
+    "replication.numeric_oracle_matched",
+    "replication.required_artifacts_created"
+  ],
+  "forbidden_outcomes": ["replication.stata_execution_failed"],
+  "permitted_freedom": [
+    "Graph binary bytes may vary across compatible Stata builds; valid non-empty GPH plus PNG and PDF exports are required.",
+    "The evaluation grades reported outcomes and provenance, not byte identity of generated figures."
+  ],
+  "graders": [
+    {
+      "grader_id": "core.observation_contract",
+      "kind": "invariant",
+      "role": "hard_gate",
+      "revision": "observation-contract/v1",
+      "required": true,
+      "config": {}
+    },
+    {
+      "grader_id": "replication.package_numeric_and_artifact_oracle",
+      "kind": "reproducibility",
+      "role": "hard_gate",
+      "revision": "replication-package-oracle/v1",
+      "required": true,
+      "config": {"harness_sha256": "83c08b53e7bb3978592e9a625367225b730c2f0b1f93f76a9d0cee42210030ca"}
+    }
+  ],
+  "trial_policy": {
+    "trials": 1,
+    "reliability_k": 1,
+    "max_steps": 4,
+    "max_tool_calls": 2,
+    "max_provider_attempts": 1,
+    "max_wall_clock_seconds": 180
+  },
+  "reference": {
+    "status": "verified",
+    "locator": "verification/replication-benchmarks/powerful-experiments-wp-2025/reference/full-package.json",
+    "sha256": "f781f19b9d923ebcacc8e4487b0c0445718251e2d25a346ea3c698ef27da7116"
+  }
+}

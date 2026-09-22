@@ -1,0 +1,82 @@
+{
+  "schema_version": "stata-research-agent.evaluation-scenario/v1",
+  "scenario_id": "agent.memory.correction",
+  "revision": 1,
+  "title": "A corrected research decision replaces stale project memory",
+  "suite": "regression",
+  "split": "development",
+  "level": "subsystem",
+  "subsystem_mode": "intrinsic",
+  "subsystems": ["memory", "context"],
+  "tags": ["correction", "source-linkage", "stale-memory"],
+  "interaction_mode": "supervised",
+  "initial_user_message": "Use log price as the primary outcome.",
+  "fixtures": [
+    {
+      "fixture_id": "memory-quality-core-v1",
+      "role": "hidden_gold_dataset",
+      "locator": "verification/memory-quality-gold.v1.json",
+      "media_type": "application/json",
+      "sha256": "34e5ac71a2f2095cf0f8d0cea2efcfccbed1d58fd65a9ea75e66057c996ef3a8"
+    }
+  ],
+  "interaction": [
+    {
+      "event_id": "correction-message",
+      "event_kind": "user_message",
+      "content": "Correction: keep price in levels; do not use log price."
+    },
+    {
+      "event_id": "new-conversation",
+      "event_kind": "conversation_boundary",
+      "content": "Start a later conversation in the same Workspace."
+    }
+  ],
+  "faults": [],
+  "required_outcomes": [
+    "memory.current_decision_correct",
+    "memory.stale_decision_inactive",
+    "memory.source_message_linked"
+  ],
+  "forbidden_outcomes": [
+    "memory.assistant_invention_active",
+    "memory.stale_decision_reactivated"
+  ],
+  "permitted_freedom": [
+    "The memory wording may differ while preserving the corrected meaning."
+  ],
+  "graders": [
+    {
+      "grader_id": "core.observation_contract",
+      "kind": "invariant",
+      "role": "hard_gate",
+      "revision": "observation-contract/v1",
+      "required": true,
+      "config": {}
+    },
+    {
+      "grader_id": "memory.intrinsic_quality",
+      "kind": "outcome",
+      "role": "quality",
+      "revision": "memory-intrinsic/v1",
+      "required": false,
+      "config": {
+        "minimum_activation_precision": 0.95,
+        "minimum_source_accuracy": 0.95
+      }
+    }
+  ],
+  "trial_policy": {
+    "trials": 3,
+    "reliability_k": 3,
+    "max_steps": 16,
+    "max_tool_calls": 16,
+    "max_provider_attempts": 24,
+    "max_wall_clock_seconds": 300
+  },
+  "reference": {
+    "status": "verified",
+    "locator": "verification/memory-quality-gold.v1.json",
+    "sha256": "34e5ac71a2f2095cf0f8d0cea2efcfccbed1d58fd65a9ea75e66057c996ef3a8"
+  }
+}

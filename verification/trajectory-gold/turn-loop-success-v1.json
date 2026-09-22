@@ -1,0 +1,31 @@
+{
+  "schema_version": "stata-research-agent.trajectory-reference/v1",
+  "reference_id": "turn-loop-success-v1",
+  "purpose": "Prove that natural model stop is only accepted after a supervised Tool Result satisfies the required obligation.",
+  "expected_sequence": [
+    "Step 1 context is frozen",
+    "Model proposes one Stata Tool Call",
+    "Tool Call crosses JIT Admission and creates exactly one Operation",
+    "Operation and Completion Manifest reach completed state",
+    "Canonical Tool Result is committed",
+    "Step 2 receives the Tool Result",
+    "Model proposes natural completion",
+    "Goal coverage is satisfied",
+    "Stop Guard terminates with succeed"
+  ],
+  "hard_invariants": [
+    "No Operation exists without a Tool Admission.",
+    "The Operation identity referenced by Admission is the executed Operation.",
+    "The canonical Tool Result belongs to the admitted Tool Call.",
+    "The Stop Guard decision is no earlier than the successful Tool Result.",
+    "The Turn cannot be succeeded while required goal coverage is incomplete."
+  ],
+  "expected_counts": {
+    "steps": 2,
+    "tool_calls": 1,
+    "tool_admissions": 1,
+    "operations": 1,
+    "canonical_tool_results": 1,
+    "stop_guard_decisions": 1
+  }
+}

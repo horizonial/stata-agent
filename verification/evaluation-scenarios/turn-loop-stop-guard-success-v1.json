@@ -1,0 +1,85 @@
+{
+  "schema_version": "stata-research-agent.evaluation-scenario/v1",
+  "scenario_id": "agent.trajectory.turn-loop-success",
+  "revision": 1,
+  "title": "Turn Loop admits one Stata call and stops only after authoritative evidence",
+  "suite": "regression",
+  "split": "development",
+  "level": "agent_loop",
+  "subsystem_mode": null,
+  "subsystems": [
+    "turn_driver",
+    "model_gateway",
+    "tool_admission",
+    "stata_execution",
+    "runtime_evaluator",
+    "stop_guard"
+  ],
+  "tags": [
+    "trajectory",
+    "two-step",
+    "authoritative-evidence",
+    "natural-stop"
+  ],
+  "interaction_mode": "autonomous",
+  "initial_user_message": "Inspect the traceable Stata data and stop only after the Tool Result exists.",
+  "fixtures": [
+    {
+      "fixture_id": "turn-loop-success-reference",
+      "role": "trajectory_reference",
+      "locator": "verification/trajectory-gold/turn-loop-success-v1.json",
+      "media_type": "application/json",
+      "sha256": "ba558ef29c390a9c61b235f6aa27d88557b1b1c2a8b05bc1cf8af5cc83694bfa"
+    }
+  ],
+  "interaction": [],
+  "faults": [],
+  "required_outcomes": [
+    "turn.succeeded",
+    "turn.two_steps_completed",
+    "tool.admitted_before_execution",
+    "tool.result_committed",
+    "goal.coverage_satisfied",
+    "stop_guard.terminate_after_evidence"
+  ],
+  "forbidden_outcomes": [
+    "turn.succeeded_without_evidence",
+    "operation.created_without_admission",
+    "stop_guard.terminated_before_tool_result"
+  ],
+  "permitted_freedom": [
+    "Provider retry attempts may vary while remaining within the same logical Step.",
+    "Non-authoritative explanatory text may vary; the authoritative causal sequence may not."
+  ],
+  "graders": [
+    {
+      "grader_id": "core.observation_contract",
+      "kind": "invariant",
+      "role": "hard_gate",
+      "revision": "observation-contract/v1",
+      "required": true,
+      "config": {}
+    },
+    {
+      "grader_id": "trajectory.turn_loop_authority",
+      "kind": "trace",
+      "role": "hard_gate",
+      "revision": "turn-loop-authority/v1",
+      "required": true,
+      "config": {}
+    }
+  ],
+  "trial_policy": {
+    "trials": 3,
+    "reliability_k": 3,
+    "max_steps": 4,
+    "max_tool_calls": 2,
+    "max_provider_attempts": 2,
+    "max_wall_clock_seconds": 30
+  },
+  "reference": {
+    "status": "verified",
+    "locator": "verification/trajectory-gold/turn-loop-success-v1.json",
+    "sha256": "ba558ef29c390a9c61b235f6aa27d88557b1b1c2a8b05bc1cf8af5cc83694bfa"
+  }
+}

@@ -1,0 +1,1058 @@
+{
+  "main_to_worker": {
+    "$defs": {
+      "WorkerAdvance": {
+        "additionalProperties": false,
+        "description": "Authorize the disposable Worker to request one logical model invocation.",
+        "properties": {
+          "context_revision": {
+            "minimum": 1,
+            "title": "Context Revision",
+            "type": "integer"
+          },
+          "message_id": {
+            "title": "Message Id",
+            "type": "string"
+          },
+          "message_type": {
+            "const": "worker_advance",
+            "title": "Message Type",
+            "type": "string"
+          },
+          "protocol_version": {
+            "const": "2",
+            "title": "Protocol Version",
+            "type": "string"
+          },
+          "remaining_step_budget": {
+            "minimum": 1,
+            "title": "Remaining Step Budget",
+            "type": "integer"
+          },
+          "remaining_tool_budget": {
+            "minimum": 0,
+            "title": "Remaining Tool Budget",
+            "type": "integer"
+          },
+          "step_ordinal": {
+            "minimum": 1,
+            "title": "Step Ordinal",
+            "type": "integer"
+          },
+          "trigger": {
+            "enum": [
+              "initial",
+              "tool_results_committed",
+              "stop_guard_continue",
+              "driver_feedback"
+            ],
+            "title": "Trigger",
+            "type": "string"
+          },
+          "turn_id": {
+            "pattern": "^turn_.+",
+            "title": "Turn Id",
+            "type": "string"
+          },
+          "worker_session_id": {
+            "pattern": "^worker_.+",
+            "title": "Worker Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "protocol_version",
+          "message_type",
+          "message_id",
+          "worker_session_id",
+          "turn_id",
+          "context_revision",
+          "step_ordinal",
+          "trigger",
+          "remaining_step_budget",
+          "remaining_tool_budget"
+        ],
+        "title": "WorkerAdvance",
+        "type": "object"
+      },
+      "WorkerBootstrap": {
+        "additionalProperties": false,
+        "properties": {
+          "context": {
+            "$ref": "#/$defs/WorkerBootstrapContext"
+          },
+          "context_revision": {
+            "minimum": 1,
+            "title": "Context Revision",
+            "type": "integer"
+          },
+          "message_id": {
+            "title": "Message Id",
+            "type": "string"
+          },
+          "message_type": {
+            "const": "worker_bootstrap",
+            "title": "Message Type",
+            "type": "string"
+          },
+          "protocol_version": {
+            "const": "2",
+            "title": "Protocol Version",
+            "type": "string"
+          },
+          "turn_id": {
+            "pattern": "^turn_.+",
+            "title": "Turn Id",
+            "type": "string"
+          },
+          "worker_session_id": {
+            "pattern": "^worker_.+",
+            "title": "Worker Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "protocol_version",
+          "message_type",
+          "message_id",
+          "worker_session_id",
+          "turn_id",
+          "context_revision",
+          "context"
+        ],
+        "title": "WorkerBootstrap",
+        "type": "object"
+      },
+      "WorkerBootstrapContext": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_refs": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Artifact Refs",
+            "type": "array"
+          },
+          "data_version_ids": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Data Version Ids",
+            "type": "array"
+          },
+          "execution_scope_id": {
+            "pattern": "^scope_.+",
+            "title": "Execution Scope Id",
+            "type": "string"
+          },
+          "plan_revision_id": {
+            "anyOf": [
+              {
+                "pattern": "^planrev_.+",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Plan Revision Id"
+          },
+          "remaining_step_budget": {
+            "minimum": 0,
+            "title": "Remaining Step Budget",
+            "type": "integer"
+          },
+          "remaining_tool_budget": {
+            "minimum": 0,
+            "title": "Remaining Tool Budget",
+            "type": "integer"
+          },
+          "research_path_id": {
+            "pattern": "^path_.+",
+            "title": "Research Path Id",
+            "type": "string"
+          },
+          "research_state_revision": {
+            "minimum": 0,
+            "title": "Research State Revision",
+            "type": "integer"
+          },
+          "tool_names": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Tool Names",
+            "type": "array"
+          },
+          "workspace_id": {
+            "pattern": "^ws_.+",
+            "title": "Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "execution_scope_id",
+          "research_path_id",
+          "research_state_revision",
+          "remaining_step_budget",
+          "remaining_tool_budget"
+        ],
+        "title": "WorkerBootstrapContext",
+        "type": "object"
+      },
+      "WorkerCompletion": {
+        "additionalProperties": false,
+        "properties": {
+          "disposition": {
+            "enum": [
+              "succeed",
+              "partial",
+              "pause",
+              "fail"
+            ],
+            "title": "Disposition",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "disposition",
+          "summary"
+        ],
+        "title": "WorkerCompletion",
+        "type": "object"
+      },
+      "WorkerEvaluation": {
+        "additionalProperties": false,
+        "properties": {
+          "findings": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Findings",
+            "type": "array"
+          },
+          "verdict": {
+            "enum": [
+              "pass",
+              "warn",
+              "fail",
+              "unknown"
+            ],
+            "title": "Verdict",
+            "type": "string"
+          }
+        },
+        "required": [
+          "verdict"
+        ],
+        "title": "WorkerEvaluation",
+        "type": "object"
+      },
+      "WorkerModelOutput": {
+        "additionalProperties": false,
+        "properties": {
+          "completion": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WorkerCompletion"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "context_revision": {
+            "minimum": 1,
+            "title": "Context Revision",
+            "type": "integer"
+          },
+          "evaluation": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WorkerEvaluation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "message_id": {
+            "title": "Message Id",
+            "type": "string"
+          },
+          "message_type": {
+            "const": "worker_model_output",
+            "title": "Message Type",
+            "type": "string"
+          },
+          "plan": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WorkerPlan"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "protocol_version": {
+            "const": "2",
+            "title": "Protocol Version",
+            "type": "string"
+          },
+          "step_ordinal": {
+            "minimum": 1,
+            "title": "Step Ordinal",
+            "type": "integer"
+          },
+          "text": {
+            "default": "",
+            "title": "Text",
+            "type": "string"
+          },
+          "tool_calls": {
+            "default": [],
+            "items": {
+              "$ref": "#/$defs/WorkerToolCall"
+            },
+            "title": "Tool Calls",
+            "type": "array"
+          },
+          "turn_id": {
+            "pattern": "^turn_.+",
+            "title": "Turn Id",
+            "type": "string"
+          },
+          "waiting": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WorkerWaiting"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "worker_session_id": {
+            "pattern": "^worker_.+",
+            "title": "Worker Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "protocol_version",
+          "message_type",
+          "message_id",
+          "worker_session_id",
+          "turn_id",
+          "context_revision",
+          "step_ordinal"
+        ],
+        "title": "WorkerModelOutput",
+        "type": "object"
+      },
+      "WorkerPlan": {
+        "additionalProperties": false,
+        "properties": {
+          "structured_plan": {
+            "additionalProperties": true,
+            "title": "Structured Plan",
+            "type": "object"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "structured_plan"
+        ],
+        "title": "WorkerPlan",
+        "type": "object"
+      },
+      "WorkerShutdown": {
+        "additionalProperties": false,
+        "properties": {
+          "context_revision": {
+            "minimum": 1,
+            "title": "Context Revision",
+            "type": "integer"
+          },
+          "message_id": {
+            "title": "Message Id",
+            "type": "string"
+          },
+          "message_type": {
+            "const": "worker_shutdown",
+            "title": "Message Type",
+            "type": "string"
+          },
+          "protocol_version": {
+            "const": "2",
+            "title": "Protocol Version",
+            "type": "string"
+          },
+          "turn_id": {
+            "pattern": "^turn_.+",
+            "title": "Turn Id",
+            "type": "string"
+          },
+          "worker_session_id": {
+            "pattern": "^worker_.+",
+            "title": "Worker Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "protocol_version",
+          "message_type",
+          "message_id",
+          "worker_session_id",
+          "turn_id",
+          "context_revision"
+        ],
+        "title": "WorkerShutdown",
+        "type": "object"
+      },
+      "WorkerToolCall": {
+        "additionalProperties": false,
+        "properties": {
+          "arguments": {
+            "additionalProperties": true,
+            "title": "Arguments",
+            "type": "object"
+          },
+          "call_ordinal": {
+            "minimum": 1,
+            "title": "Call Ordinal",
+            "type": "integer"
+          },
+          "tool_name": {
+            "title": "Tool Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "call_ordinal",
+          "tool_name",
+          "arguments"
+        ],
+        "title": "WorkerToolCall",
+        "type": "object"
+      },
+      "WorkerWaiting": {
+        "additionalProperties": false,
+        "properties": {
+          "prompt": {
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Prompt",
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "user_input",
+              "user_confirmation",
+              "external_resolution"
+            ],
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "prompt"
+        ],
+        "title": "WorkerWaiting",
+        "type": "object"
+      }
+    },
+    "discriminator": {
+      "mapping": {
+        "worker_advance": "#/$defs/WorkerAdvance",
+        "worker_bootstrap": "#/$defs/WorkerBootstrap",
+        "worker_model_output": "#/$defs/WorkerModelOutput",
+        "worker_shutdown": "#/$defs/WorkerShutdown"
+      },
+      "propertyName": "message_type"
+    },
+    "oneOf": [
+      {
+        "$ref": "#/$defs/WorkerBootstrap"
+      },
+      {
+        "$ref": "#/$defs/WorkerAdvance"
+      },
+      {
+        "$ref": "#/$defs/WorkerModelOutput"
+      },
+      {
+        "$ref": "#/$defs/WorkerShutdown"
+      }
+    ]
+  },
+  "schema_version": "1",
+  "worker_to_main": {
+    "$defs": {
+      "CompletionProposal": {
+        "additionalProperties": false,
+        "properties": {
+          "context_revision": {
+            "minimum": 1,
+            "title": "Context Revision",
+            "type": "integer"
+          },
+          "disposition": {
+            "enum": [
+              "succeed",
+              "partial",
+              "pause",
+              "fail"
+            ],
+            "title": "Disposition",
+            "type": "string"
+          },
+          "message_id": {
+            "title": "Message Id",
+            "type": "string"
+          },
+          "message_type": {
+            "const": "completion_proposal",
+            "title": "Message Type",
+            "type": "string"
+          },
+          "protocol_version": {
+            "const": "2",
+            "title": "Protocol Version",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          },
+          "turn_id": {
+            "pattern": "^turn_.+",
+            "title": "Turn Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "protocol_version",
+          "message_type",
+          "message_id",
+          "turn_id",
+          "context_revision",
+          "disposition",
+          "summary"
+        ],
+        "title": "CompletionProposal",
+        "type": "object"
+      },
+      "ContextRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "context_revision": {
+            "minimum": 1,
+            "title": "Context Revision",
+            "type": "integer"
+          },
+          "message_id": {
+            "title": "Message Id",
+            "type": "string"
+          },
+          "message_type": {
+            "const": "context_request",
+            "title": "Message Type",
+            "type": "string"
+          },
+          "protocol_version": {
+            "const": "2",
+            "title": "Protocol Version",
+            "type": "string"
+          },
+          "reference_id": {
+            "title": "Reference Id",
+            "type": "string"
+          },
+          "request_kind": {
+            "enum": [
+              "artifact_excerpt",
+              "research_fact",
+              "tool_schema"
+            ],
+            "title": "Request Kind",
+            "type": "string"
+          },
+          "turn_id": {
+            "pattern": "^turn_.+",
+            "title": "Turn Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "protocol_version",
+          "message_type",
+          "message_id",
+          "turn_id",
+          "context_revision",
+          "request_kind",
+          "reference_id"
+        ],
+        "title": "ContextRequest",
+        "type": "object"
+      },
+      "EvaluationProposal": {
+        "additionalProperties": false,
+        "properties": {
+          "context_revision": {
+            "minimum": 1,
+            "title": "Context Revision",
+            "type": "integer"
+          },
+          "findings": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Findings",
+            "type": "array"
+          },
+          "message_id": {
+            "title": "Message Id",
+            "type": "string"
+          },
+          "message_type": {
+            "const": "evaluation_proposal",
+            "title": "Message Type",
+            "type": "string"
+          },
+          "protocol_version": {
+            "const": "2",
+            "title": "Protocol Version",
+            "type": "string"
+          },
+          "turn_id": {
+            "pattern": "^turn_.+",
+            "title": "Turn Id",
+            "type": "string"
+          },
+          "verdict": {
+            "enum": [
+              "pass",
+              "warn",
+              "fail",
+              "unknown"
+            ],
+            "title": "Verdict",
+            "type": "string"
+          }
+        },
+        "required": [
+          "protocol_version",
+          "message_type",
+          "message_id",
+          "turn_id",
+          "context_revision",
+          "verdict",
+          "findings"
+        ],
+        "title": "EvaluationProposal",
+        "type": "object"
+      },
+      "LifecycleEvent": {
+        "additionalProperties": false,
+        "properties": {
+          "context_revision": {
+            "minimum": 1,
+            "title": "Context Revision",
+            "type": "integer"
+          },
+          "event": {
+            "enum": [
+              "worker_ready",
+              "step_output_processed",
+              "worker_stopping",
+              "worker_failed"
+            ],
+            "title": "Event",
+            "type": "string"
+          },
+          "message_id": {
+            "title": "Message Id",
+            "type": "string"
+          },
+          "message_type": {
+            "const": "lifecycle_event",
+            "title": "Message Type",
+            "type": "string"
+          },
+          "protocol_version": {
+            "const": "2",
+            "title": "Protocol Version",
+            "type": "string"
+          },
+          "safe_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Safe Code"
+          },
+          "turn_id": {
+            "pattern": "^turn_.+",
+            "title": "Turn Id",
+            "type": "string"
+          },
+          "worker_session_id": {
+            "pattern": "^worker_.+",
+            "title": "Worker Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "protocol_version",
+          "message_type",
+          "message_id",
+          "worker_session_id",
+          "turn_id",
+          "context_revision",
+          "event"
+        ],
+        "title": "LifecycleEvent",
+        "type": "object"
+      },
+      "ModelInvocationProposal": {
+        "additionalProperties": false,
+        "description": "A credential-free request from the Worker for the next frozen Step.",
+        "properties": {
+          "context_revision": {
+            "minimum": 1,
+            "title": "Context Revision",
+            "type": "integer"
+          },
+          "message_id": {
+            "title": "Message Id",
+            "type": "string"
+          },
+          "message_type": {
+            "const": "model_invocation_proposal",
+            "title": "Message Type",
+            "type": "string"
+          },
+          "protocol_version": {
+            "const": "2",
+            "title": "Protocol Version",
+            "type": "string"
+          },
+          "remaining_step_budget": {
+            "minimum": 1,
+            "title": "Remaining Step Budget",
+            "type": "integer"
+          },
+          "remaining_tool_budget": {
+            "minimum": 0,
+            "title": "Remaining Tool Budget",
+            "type": "integer"
+          },
+          "step_ordinal": {
+            "minimum": 1,
+            "title": "Step Ordinal",
+            "type": "integer"
+          },
+          "trigger": {
+            "enum": [
+              "initial",
+              "tool_results_committed",
+              "stop_guard_continue",
+              "driver_feedback"
+            ],
+            "title": "Trigger",
+            "type": "string"
+          },
+          "turn_id": {
+            "pattern": "^turn_.+",
+            "title": "Turn Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "protocol_version",
+          "message_type",
+          "message_id",
+          "turn_id",
+          "context_revision",
+          "step_ordinal",
+          "trigger",
+          "remaining_step_budget",
+          "remaining_tool_budget"
+        ],
+        "title": "ModelInvocationProposal",
+        "type": "object"
+      },
+      "PlanProposal": {
+        "additionalProperties": false,
+        "properties": {
+          "context_revision": {
+            "minimum": 1,
+            "title": "Context Revision",
+            "type": "integer"
+          },
+          "message_id": {
+            "title": "Message Id",
+            "type": "string"
+          },
+          "message_type": {
+            "const": "plan_proposal",
+            "title": "Message Type",
+            "type": "string"
+          },
+          "protocol_version": {
+            "const": "2",
+            "title": "Protocol Version",
+            "type": "string"
+          },
+          "structured_plan": {
+            "additionalProperties": true,
+            "title": "Structured Plan",
+            "type": "object"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          },
+          "turn_id": {
+            "pattern": "^turn_.+",
+            "title": "Turn Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "protocol_version",
+          "message_type",
+          "message_id",
+          "turn_id",
+          "context_revision",
+          "summary",
+          "structured_plan"
+        ],
+        "title": "PlanProposal",
+        "type": "object"
+      },
+      "ResponseDelta": {
+        "additionalProperties": false,
+        "properties": {
+          "context_revision": {
+            "minimum": 1,
+            "title": "Context Revision",
+            "type": "integer"
+          },
+          "message_id": {
+            "title": "Message Id",
+            "type": "string"
+          },
+          "message_type": {
+            "const": "response_delta",
+            "title": "Message Type",
+            "type": "string"
+          },
+          "protocol_version": {
+            "const": "2",
+            "title": "Protocol Version",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "turn_id": {
+            "pattern": "^turn_.+",
+            "title": "Turn Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "protocol_version",
+          "message_type",
+          "message_id",
+          "turn_id",
+          "context_revision",
+          "text"
+        ],
+        "title": "ResponseDelta",
+        "type": "object"
+      },
+      "ToolProposal": {
+        "additionalProperties": false,
+        "properties": {
+          "arguments": {
+            "additionalProperties": true,
+            "title": "Arguments",
+            "type": "object"
+          },
+          "call_ordinal": {
+            "minimum": 1,
+            "title": "Call Ordinal",
+            "type": "integer"
+          },
+          "context_revision": {
+            "minimum": 1,
+            "title": "Context Revision",
+            "type": "integer"
+          },
+          "message_id": {
+            "title": "Message Id",
+            "type": "string"
+          },
+          "message_type": {
+            "const": "tool_proposal",
+            "title": "Message Type",
+            "type": "string"
+          },
+          "protocol_version": {
+            "const": "2",
+            "title": "Protocol Version",
+            "type": "string"
+          },
+          "tool_name": {
+            "title": "Tool Name",
+            "type": "string"
+          },
+          "turn_id": {
+            "pattern": "^turn_.+",
+            "title": "Turn Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "protocol_version",
+          "message_type",
+          "message_id",
+          "turn_id",
+          "context_revision",
+          "call_ordinal",
+          "tool_name",
+          "arguments"
+        ],
+        "title": "ToolProposal",
+        "type": "object"
+      },
+      "WaitingProposal": {
+        "additionalProperties": false,
+        "properties": {
+          "context_revision": {
+            "minimum": 1,
+            "title": "Context Revision",
+            "type": "integer"
+          },
+          "message_id": {
+            "title": "Message Id",
+            "type": "string"
+          },
+          "message_type": {
+            "const": "waiting_proposal",
+            "title": "Message Type",
+            "type": "string"
+          },
+          "prompt": {
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Prompt",
+            "type": "string"
+          },
+          "protocol_version": {
+            "const": "2",
+            "title": "Protocol Version",
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "user_input",
+              "user_confirmation",
+              "external_resolution"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "turn_id": {
+            "pattern": "^turn_.+",
+            "title": "Turn Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "protocol_version",
+          "message_type",
+          "message_id",
+          "turn_id",
+          "context_revision",
+          "reason",
+          "prompt"
+        ],
+        "title": "WaitingProposal",
+        "type": "object"
+      }
+    },
+    "discriminator": {
+      "mapping": {
+        "completion_proposal": "#/$defs/CompletionProposal",
+        "context_request": "#/$defs/ContextRequest",
+        "evaluation_proposal": "#/$defs/EvaluationProposal",
+        "lifecycle_event": "#/$defs/LifecycleEvent",
+        "model_invocation_proposal": "#/$defs/ModelInvocationProposal",
+        "plan_proposal": "#/$defs/PlanProposal",
+        "response_delta": "#/$defs/ResponseDelta",
+        "tool_proposal": "#/$defs/ToolProposal",
+        "waiting_proposal": "#/$defs/WaitingProposal"
+      },
+      "propertyName": "message_type"
+    },
+    "oneOf": [
+      {
+        "$ref": "#/$defs/ResponseDelta"
+      },
+      {
+        "$ref": "#/$defs/PlanProposal"
+      },
+      {
+        "$ref": "#/$defs/ToolProposal"
+      },
+      {
+        "$ref": "#/$defs/ContextRequest"
+      },
+      {
+        "$ref": "#/$defs/EvaluationProposal"
+      },
+      {
+        "$ref": "#/$defs/WaitingProposal"
+      },
+      {
+        "$ref": "#/$defs/CompletionProposal"
+      },
+      {
+        "$ref": "#/$defs/ModelInvocationProposal"
+      },
+      {
+        "$ref": "#/$defs/LifecycleEvent"
+      }
+    ]
+  }
+}

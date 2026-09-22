@@ -1,0 +1,102 @@
+{
+  "schema_version": "stata-research-agent.evaluation-scenario/v1",
+  "scenario_id": "agent.replication.jel-did-table2-simple-did",
+  "revision": 1,
+  "title": "Official JEL DiD package rebuilds analysis data and reproduces Table 2 inputs",
+  "suite": "regression",
+  "split": "development",
+  "level": "subsystem",
+  "subsystem_mode": "extrinsic",
+  "subsystems": ["stata_execution", "result_provenance", "document_export"],
+  "tags": ["public-paper", "replication", "difference-in-differences", "data-construction", "esttab"],
+  "interaction_mode": "autonomous",
+  "initial_user_message": "Rebuild the analysis data from the supplied public package and reproduce the simple two-by-two DiD estimates with a traceable RTF table.",
+  "fixtures": [
+    {
+      "fixture_id": "jel-did-raw-csv",
+      "role": "package_raw_csv",
+      "locator": "verification/replication-benchmarks/jel-did-practitioners-guide/source/frozen-package/JEL-DiD-50f4f183783d2344f85bc4f39bcbcc1b7eba6466/data/county_mortality_data.csv",
+      "media_type": "text/csv",
+      "sha256": "06beff83aac89236ab851316394574eba973ec762e54a3e98f830ecbb692684f"
+    },
+    {
+      "fixture_id": "jel-did-make-data-do",
+      "role": "package_make_data_do",
+      "locator": "verification/replication-benchmarks/jel-did-practitioners-guide/source/frozen-package/JEL-DiD-50f4f183783d2344f85bc4f39bcbcc1b7eba6466/scripts/Stata/0_stata_Make_data.do",
+      "media_type": "text/plain",
+      "sha256": "2151df48ee3dd38c70b3b4f6e934ea5df0a9c08d5c795f34363f78f7f44b77c2"
+    },
+    {
+      "fixture_id": "jel-did-table-do",
+      "role": "package_table_do",
+      "locator": "verification/replication-benchmarks/jel-did-practitioners-guide/source/frozen-package/JEL-DiD-50f4f183783d2344f85bc4f39bcbcc1b7eba6466/scripts/Stata/2_stata_2x2.do",
+      "media_type": "text/plain",
+      "sha256": "79e8f2da5d2fe1878a9e89b477911b5b0bd6fe6ccee9f3b67a84a61c11995676"
+    },
+    {
+      "fixture_id": "jel-did-reference-tex",
+      "role": "package_reference_tex",
+      "locator": "verification/replication-benchmarks/jel-did-practitioners-guide/source/frozen-package/JEL-DiD-50f4f183783d2344f85bc4f39bcbcc1b7eba6466/tables/table2_stata.tex",
+      "media_type": "text/plain",
+      "sha256": "b1cd0a4e67b0c3bdf1525c5fdae6c5b563e8b39eab93742cb3de7e11ee84ef69"
+    },
+    {
+      "fixture_id": "jel-did-harness",
+      "role": "replication_harness",
+      "locator": "verification/replication-benchmarks/jel-did-practitioners-guide/harness/table2-simple-did.do",
+      "media_type": "text/plain",
+      "sha256": "7c08b7a2f943e8589dbaa9ce295af21098fd8def9ff3c4cb4549795205b5dd70"
+    },
+    {
+      "fixture_id": "jel-did-reference",
+      "role": "replication_reference",
+      "locator": "verification/replication-benchmarks/jel-did-practitioners-guide/reference/table2-simple-did.json",
+      "media_type": "application/json",
+      "sha256": "4b1aa0321fedcc2e1b90cb6aa86b91cf313ba7b7a8edb201c3a1ef4f79fa4705"
+    }
+  ],
+  "interaction": [],
+  "faults": [],
+  "required_outcomes": [
+    "replication.source_integrity_verified",
+    "replication.stata_execution_succeeded",
+    "replication.numeric_oracle_matched",
+    "replication.required_artifacts_created"
+  ],
+  "forbidden_outcomes": ["replication.stata_execution_failed"],
+  "permitted_freedom": [
+    "The Agent may choose how to inspect intermediate data, but the frozen author construction code must remain attributable.",
+    "The evaluation grades the generated data identity, numeric outcomes, and RTF validity rather than requiring a particular reasoning narrative."
+  ],
+  "graders": [
+    {
+      "grader_id": "core.observation_contract",
+      "kind": "invariant",
+      "role": "hard_gate",
+      "revision": "observation-contract/v1",
+      "required": true,
+      "config": {}
+    },
+    {
+      "grader_id": "replication.package_numeric_and_artifact_oracle",
+      "kind": "reproducibility",
+      "role": "hard_gate",
+      "revision": "replication-package-oracle/v1",
+      "required": true,
+      "config": {"harness_sha256": "7c08b7a2f943e8589dbaa9ce295af21098fd8def9ff3c4cb4549795205b5dd70"}
+    }
+  ],
+  "trial_policy": {
+    "trials": 1,
+    "reliability_k": 1,
+    "max_steps": 4,
+    "max_tool_calls": 2,
+    "max_provider_attempts": 1,
+    "max_wall_clock_seconds": 240
+  },
+  "reference": {
+    "status": "verified",
+    "locator": "verification/replication-benchmarks/jel-did-practitioners-guide/reference/table2-simple-did.json",
+    "sha256": "4b1aa0321fedcc2e1b90cb6aa86b91cf313ba7b7a8edb201c3a1ef4f79fa4705"
+  }
+}

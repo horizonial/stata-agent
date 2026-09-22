@@ -1,0 +1,74 @@
+{
+  "schema_version": "stata-research-agent.evaluation-scenario/v1",
+  "scenario_id": "agent.context.compiler-boundaries",
+  "revision": 1,
+  "title": "Context compilation preserves mandatory research state and fails closed",
+  "suite": "regression",
+  "split": "development",
+  "level": "subsystem",
+  "subsystem_mode": "intrinsic",
+  "subsystems": ["context_compiler"],
+  "tags": ["budget", "deduplication", "privacy", "provenance"],
+  "interaction_mode": "autonomous",
+  "initial_user_message": "Keep price in levels and compile the next model context.",
+  "fixtures": [
+    {
+      "fixture_id": "context-compiler-core-v1",
+      "role": "context_gold_dataset",
+      "locator": "verification/context-compiler-gold.v1.json",
+      "media_type": "application/json",
+      "sha256": "5298ba9fafbc8222687f85a8935e0febdda26918f5e4a2dbe31eb108934a0e01"
+    }
+  ],
+  "interaction": [],
+  "faults": [],
+  "required_outcomes": [
+    "context.user_message_preserved",
+    "context.research_constraint_preserved",
+    "context.newest_duplicate_selected",
+    "context.local_only_excluded_remote",
+    "context.decisions_cover_sources",
+    "context.privacy_fail_closed",
+    "context.mandatory_budget_fail_closed",
+    "context.report_persisted"
+  ],
+  "forbidden_outcomes": [
+    "context.local_only_transmitted",
+    "context.stale_duplicate_selected",
+    "context.silent_mandatory_drop"
+  ],
+  "permitted_freedom": [
+    "Optional long context may be summarized or excluded according to the frozen budget."
+  ],
+  "graders": [
+    {
+      "grader_id": "core.observation_contract",
+      "kind": "invariant",
+      "role": "hard_gate",
+      "revision": "observation-contract/v1",
+      "required": true,
+      "config": {}
+    },
+    {
+      "grader_id": "context.compiler_report",
+      "kind": "outcome",
+      "role": "quality",
+      "revision": "context-compiler-report/v1",
+      "required": true,
+      "config": {"required_check_count": 7}
+    }
+  ],
+  "trial_policy": {
+    "trials": 3,
+    "reliability_k": 3,
+    "max_steps": 4,
+    "max_tool_calls": 1,
+    "max_provider_attempts": 1,
+    "max_wall_clock_seconds": 30
+  },
+  "reference": {
+    "status": "verified",
+    "locator": "verification/context-compiler-gold.v1.json",
+    "sha256": "5298ba9fafbc8222687f85a8935e0febdda26918f5e4a2dbe31eb108934a0e01"
+  }
+}

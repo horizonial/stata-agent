@@ -19,13 +19,35 @@
 **/*.sqlite3
 **/*.sqlite3-wal
 **/*.sqlite3-shm
-app/.ui.db
-app/.ui_demo.sqlite3
-app/workspaces.json
-app/memory.json
-app/rag_cache.json
-app/runs/
-app/samples/ideas/ui/workspaces.json
+**/*.db
+**/*.db-wal
+**/*.db-shm
+/blobs/
+/control/
+/work/
+/.e2e-runtime/
+/.e2e-session-runtime/
+/.real-product-e2e/
+/.stress-runs/
+/.skill-validation/
+/.visual-audit/
+/.source-browser-smoke/
+/.packaged-browser-smoke*/
+/.installed-mcp-smoke/
+/.candidate-rehearsal-*/
+/.candidate-stage/
+/.installer-stage/
+/.pytest-*/
+/.tmp*/
+/.ui-*/
+
+# Local migration sources and planning material retained outside the public tree
+/agent-next/
+/product-rebuild/
+/.local-legacy-backup-*/
+/RESUME_PROJECTS.md
+/samples/
+/tmp/
 
 # Generated architecture/search caches
 .belief_map.sexp
@@ -33,3 +55,15 @@ app/samples/ideas/ui/workspaces.json
 
 # Generated report scratch space
 build/
+!build/
+build/*
+!build/stata-mcp.lock.json
+!build/vendor/
+build/vendor/*
+!build/vendor/stata_mcp-2.0.0-py3-none-any.whl
+/web/node_modules/
+/web/dist/
+/web/test-results/
+/verification/runs/
+/verification/corpora/
+/verification/replication-benchmarks/

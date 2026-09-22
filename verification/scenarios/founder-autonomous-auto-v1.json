@@ -1,0 +1,46 @@
+{
+  "schema_version": "stata-research-agent.founder-acceptance/v1",
+  "scenario_id": "founder.autonomous.auto",
+  "version": 1,
+  "journey": "autonomous",
+  "title": "Idea and auto.dta to a source-linked Word draft",
+  "idea": "Use auto data to estimate price on mpg and weight and deliver a source-linked Word draft.",
+  "fixture": {
+    "fixture_id": "stata18.auto.dta",
+    "media_type": "application/x-stata-dta",
+    "sha256": "e3aeda1c52ed97ba062221f719f35a2d519b8e6380db780fcbd1634318fced17"
+  },
+  "research_slots": {
+    "data": "analysis.primary",
+    "result": "baseline.primary"
+  },
+  "required_observations": [
+    "fixture.identity_match",
+    "turn.succeeded",
+    "plan.adopted",
+    "data.current",
+    "stata.plan_match",
+    "result.qualified_stata",
+    "result.current",
+    "word.delivery_pass",
+    "word.numeric_coverage_complete",
+    "goal.coverage_satisfied"
+  ],
+  "forbidden_observations": [
+    "plan.deviation",
+    "non_stata_formal_result",
+    "unqualified_current_result",
+    "word.delivery_gap"
+  ],
+  "applicability": {
+    "decisions": ["D-207", "D-221", "D-222", "D-223", "D-233"],
+    "required_capabilities": [
+      "stata.regress.qualified-result",
+      "stata.esttab.evidence-table",
+      "word.source-linked-delivery"
+    ],
+    "support_profile": "windows11-x64-stata18-mp-x64",
+    "release_gate": "G7"
+  },
+  "exact_candidate_required": true
+}

@@ -1,0 +1,207 @@
+{
+  "schema_version": "rag-real-questions/v1",
+  "fixed_no_answer": "未在当前知识库中找到足够证据，无法回答。",
+  "cases": [
+    {
+      "case_id": "single-twfe-staggered-risk",
+      "mode": "single_hop",
+      "question": "我的政策在不同地区分批实施，直接跑双向固定效应会把哪些比较混在一起，为什么系数可能难解释？",
+      "retrieval_query": "two way fixed effects staggered treatment timing weighted average two by two comparisons",
+      "corpus_role": "literature_evidence",
+      "expected_sources": ["literature/01-goodman-bacon-treatment-timing.pdf"],
+      "expected_markers": ["weighted average"],
+      "claims": [{"claim_id": "twfe_risk", "support_markers": ["weighted average"]}],
+      "k": 8,
+      "generation": true
+    },
+    {
+      "case_id": "single-group-time-att",
+      "mode": "single_hop",
+      "question": "如果处理发生时间不同，我想按首次处理组和时期估计效应，并允许协变量，应考虑哪类估计量？",
+      "retrieval_query": "group time average treatment effects multiple periods covariates doubly robust",
+      "corpus_role": "literature_evidence",
+      "expected_sources": ["literature/02-callaway-santanna-multiple-periods.pdf"],
+      "expected_markers": ["doubly robust"],
+      "claims": [{"claim_id": "group_time", "support_markers": ["doubly robust", "doubly-robust"]}],
+      "k": 8,
+      "generation": true
+    },
+    {
+      "case_id": "single-event-study-contamination",
+      "mode": "single_hop",
+      "question": "事件研究里处理效应随组别和相对时间变化时，lead 和 lag 系数会受到什么污染？",
+      "retrieval_query": "event study lead lag coefficients contaminated heterogeneous treatment effects",
+      "corpus_role": "literature_evidence",
+      "expected_sources": ["literature/03-sun-abraham-event-studies.pdf"],
+      "expected_markers": ["contaminated"],
+      "claims": [{"claim_id": "contamination", "support_markers": ["contaminated", "contamination"]}],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-imputation-estimator",
+      "mode": "single_hop",
+      "question": "能否先用未处理观测拟合反事实，再把处理后残差聚合成事件研究效应？这种方法的依据是什么？",
+      "retrieval_query": "robust efficient imputation estimator untreated observations event study heterogeneous treatment effects",
+      "corpus_role": "literature_evidence",
+      "expected_sources": ["literature/04-borusyak-jaravel-spiess-event-study.pdf"],
+      "expected_markers": ["imputation"],
+      "claims": [{"claim_id": "imputation", "support_markers": ["imputation"]}],
+      "k": 8,
+      "generation": true
+    },
+    {
+      "case_id": "single-pretrend-selection",
+      "mode": "single_hop",
+      "question": "只在处理前趋势检验不显著时才继续报告 DID，会不会让后续估计或置信区间产生选择问题？",
+      "retrieval_query": "conditioning after passing pre-trends test bias inference confidence intervals",
+      "corpus_role": "literature_evidence",
+      "expected_sources": ["literature/06-roth-pretrends.pdf"],
+      "expected_markers": ["pre-trends"],
+      "claims": [{"claim_id": "pretrend_selection", "support_markers": ["pre-trends"]}],
+      "k": 8,
+      "generation": true
+    },
+    {
+      "case_id": "single-honest-sensitivity",
+      "mode": "single_hop",
+      "question": "平行趋势并非精确成立时，怎样对允许一定偏离的处理效应做敏感性分析和稳健推断？",
+      "retrieval_query": "sensitivity analysis violations parallel trends robust inference restrictions",
+      "corpus_role": "literature_evidence",
+      "expected_sources": ["literature/07-rambachan-roth-parallel-trends.pdf"],
+      "expected_markers": ["sensitivity analysis"],
+      "claims": [{"claim_id": "sensitivity", "support_markers": ["sensitivity analysis"]}],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-continuous-dose",
+      "mode": "single_hop",
+      "question": "处理强度是连续剂量而不是二元变量时，DID 的参数应如何解释，TWFE 系数还能代表什么？",
+      "retrieval_query": "continuous treatment dose difference in differences TWFE interpretation",
+      "corpus_role": "literature_evidence",
+      "expected_sources": ["literature/09-callaway-goodman-bacon-santanna-continuous.pdf"],
+      "expected_markers": ["continuous treatment"],
+      "claims": [{"claim_id": "continuous_dose", "support_markers": ["continuous treatment"]}],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-stata-robust-se",
+      "mode": "single_hop",
+      "question": "Stata 的 regress 如何请求异方差稳健标准误？",
+      "retrieval_query": "regress robust standard errors vce robust",
+      "corpus_role": "stata_help",
+      "expected_sources": ["stata-help/base/r/regress.sthlp"],
+      "expected_markers": ["vce(robust)"],
+      "claims": [{"claim_id": "stata_robust", "support_markers": ["vce(robust)"]}],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-style-method-section",
+      "mode": "single_hop",
+      "question": "为方法章节找一段先给组织框架、再解释实证实践差异的写作示例。",
+      "retrieval_query": "organizing framework empirical practice covariates weights",
+      "corpus_role": "style_exemplar",
+      "expected_sources": ["style-references/10-baker-et-al-practitioners-guide.pdf"],
+      "expected_markers": ["organizing framework"],
+      "claims": [{"claim_id": "style_example", "support_markers": ["organizing framework"]}],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "multi-twfe-to-group-time",
+      "mode": "multi_hop",
+      "question": "先判断错位处理下 TWFE 为什么可能有问题，再给出能按处理组和时期识别效应的替代路线。",
+      "corpus_role": "literature_evidence",
+      "hops": [
+        "错位处理时点下 TWFE 如何分解，权重有什么问题？",
+        "哪些 group-time ATT 或 doubly robust 方法可以替代？"
+      ],
+      "expected_sources": [
+        "literature/01-goodman-bacon-treatment-timing.pdf",
+        "literature/02-callaway-santanna-multiple-periods.pdf"
+      ],
+      "evidence_groups": [["weighted average"], ["doubly robust", "doubly-robust"]],
+      "claims": [
+        {"claim_id": "twfe_problem", "support_markers": ["weighted average"]},
+        {"claim_id": "group_time_alternative", "support_markers": ["doubly robust", "doubly-robust"]}
+      ],
+      "k": 6,
+      "generation": true
+    },
+    {
+      "case_id": "multi-event-study-alternatives",
+      "mode": "multi_hop",
+      "question": "传统动态事件研究在异质效应下有什么问题？再比较交互加权与插补思路各自解决什么。",
+      "corpus_role": "literature_evidence",
+      "hops": [
+        "异质处理效应为什么会污染 event-study lead lag 系数？",
+        "Sun Abraham interaction-weighted cohort relative period estimator 如何避免污染？",
+        "Borusyak Jaravel Spiess imputation estimator 如何利用 untreated observations？"
+      ],
+      "expected_sources": [
+        "literature/03-sun-abraham-event-studies.pdf",
+        "literature/04-borusyak-jaravel-spiess-event-study.pdf"
+      ],
+      "evidence_groups": [
+        ["contaminated", "contamination"],
+        ["interaction-weighted"],
+        ["imputation"]
+      ],
+      "claims": [
+        {"claim_id": "event_contamination", "support_markers": ["contaminated", "contamination"]},
+        {"claim_id": "interaction_weighted", "support_markers": ["interaction-weighted"]},
+        {"claim_id": "imputation_alternative", "support_markers": ["imputation"]}
+      ],
+      "k": 6,
+      "generation": true
+    },
+    {
+      "case_id": "multi-diagnostics-to-sensitivity",
+      "mode": "multi_hop",
+      "question": "先解释为什么通过 pre-trend 检验后再报告会有问题，再给出允许趋势偏离的稳健分析方案。",
+      "corpus_role": "literature_evidence",
+      "hops": [
+        "conditioning on passing a pre-trends test 有什么推断风险？",
+        "允许平行趋势有限偏离时如何做 sensitivity analysis？"
+      ],
+      "expected_sources": [
+        "literature/06-roth-pretrends.pdf",
+        "literature/07-rambachan-roth-parallel-trends.pdf"
+      ],
+      "evidence_groups": [["pre-trends"], ["sensitivity analysis"]],
+      "claims": [
+        {"claim_id": "pretrend_risk", "support_markers": ["pre-trends"]},
+        {"claim_id": "sensitivity_route", "support_markers": ["sensitivity analysis"]}
+      ],
+      "k": 6,
+      "generation": true
+    },
+    {
+      "case_id": "no-answer-rdd-bandwidth",
+      "mode": "no_answer",
+      "question": "回归不连续设计中，MSE 最优带宽和偏差校正置信区间具体应该怎样计算？",
+      "corpus_role": "literature_evidence",
+      "k": 6,
+      "generation": true
+    },
+    {
+      "case_id": "no-answer-weak-iv",
+      "mode": "no_answer",
+      "question": "弱工具变量下 Anderson-Rubin 检验和 CLR 区间如何构造，分别有什么覆盖性质？",
+      "corpus_role": "literature_evidence",
+      "k": 6,
+      "generation": true
+    },
+    {
+      "case_id": "no-answer-dynamic-panel-gmm",
+      "mode": "no_answer",
+      "question": "系统 GMM 中 instrument proliferation 怎么诊断，collapse 选项如何影响 Hansen 检验？",
+      "corpus_role": "literature_evidence",
+      "k": 6,
+      "generation": true
+    }
+  ]
+}

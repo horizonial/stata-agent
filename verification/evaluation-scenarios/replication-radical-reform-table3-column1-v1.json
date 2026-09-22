@@ -1,0 +1,110 @@
+{
+  "schema_version": "stata-research-agent.evaluation-scenario/v1",
+  "scenario_id": "agent.replication.radical-reform-table3-column1",
+  "revision": 1,
+  "title": "Official AER replication code reproduces Radical Reform Table 3 Column 1",
+  "suite": "regression",
+  "split": "development",
+  "level": "subsystem",
+  "subsystem_mode": "extrinsic",
+  "subsystems": [
+    "stata_execution",
+    "result_provenance",
+    "document_export"
+  ],
+  "tags": [
+    "public-paper",
+    "replication",
+    "panel-fixed-effects",
+    "clustered-standard-errors",
+    "esttab",
+    "rtf"
+  ],
+  "interaction_mode": "autonomous",
+  "initial_user_message": "Reproduce Table 3, Column 1 from the supplied official replication package and produce a traceable RTF table.",
+  "fixtures": [
+    {
+      "fixture_id": "radical-reform-original-do",
+      "role": "replication_do",
+      "locator": "verification/replication-benchmarks/radical-reform-aer-2011/source/20100816_replication.do",
+      "media_type": "text/plain",
+      "sha256": "ace3126d67c0c03461280cfa270aa3b8a062cd5e80be6c627664cc2f3281563c"
+    },
+    {
+      "fixture_id": "radical-reform-main-data",
+      "role": "replication_main_data",
+      "locator": "verification/replication-benchmarks/radical-reform-aer-2011/source/20100816_replication_dataset.dta",
+      "media_type": "application/x-stata-dta",
+      "sha256": "8923a8d52dc6894afc646b8e7ea0a0742d7d0c0eea5a12193d3a43c07a178fa3"
+    },
+    {
+      "fixture_id": "radical-reform-table5-data",
+      "role": "replication_table5_data",
+      "locator": "verification/replication-benchmarks/radical-reform-aer-2011/source/20100816_replication_dataset_t5.dta",
+      "media_type": "application/x-stata-dta",
+      "sha256": "d296e5f667d0d91b46ccc6419f2661da25e8f33cc01828cb700dd7fd03248caa"
+    },
+    {
+      "fixture_id": "radical-reform-table3-harness",
+      "role": "replication_harness",
+      "locator": "verification/replication-benchmarks/radical-reform-aer-2011/harness/table3-column1.do",
+      "media_type": "text/plain",
+      "sha256": "0a33bc245185aac5f5ac14ef4e7cd76458722ab39cb3d0a66526cb60bf3fe30f"
+    },
+    {
+      "fixture_id": "radical-reform-table3-reference",
+      "role": "replication_reference",
+      "locator": "verification/replication-benchmarks/radical-reform-aer-2011/reference/table3-column1.json",
+      "media_type": "application/json",
+      "sha256": "6ce6f222433cb6748fa237bf3c0eed59f5b94fd542893be3cf372e3be3405cfb"
+    }
+  ],
+  "interaction": [],
+  "faults": [],
+  "required_outcomes": [
+    "replication.source_integrity_verified",
+    "replication.stata_execution_succeeded",
+    "replication.numeric_oracle_matched",
+    "replication.esttab_rtf_created"
+  ],
+  "forbidden_outcomes": [
+    "replication.stata_execution_failed"
+  ],
+  "permitted_freedom": [
+    "The Stata executable and operating-system patch level may differ when version 9.2 compatibility preserves the numerical oracle.",
+    "RTF byte identity is not required; the table must contain the oracle coefficient values and have valid RTF structure."
+  ],
+  "graders": [
+    {
+      "grader_id": "core.observation_contract",
+      "kind": "invariant",
+      "role": "hard_gate",
+      "revision": "observation-contract/v1",
+      "required": true,
+      "config": {}
+    },
+    {
+      "grader_id": "replication.numeric_and_rtf_oracle",
+      "kind": "reproducibility",
+      "role": "hard_gate",
+      "revision": "replication-oracle/v1",
+      "required": true,
+      "config": {
+        "harness_sha256": "0a33bc245185aac5f5ac14ef4e7cd76458722ab39cb3d0a66526cb60bf3fe30f"
+      }
+    }
+  ],
+  "trial_policy": {
+    "trials": 1,
+    "reliability_k": 1,
+    "max_steps": 4,
+    "max_tool_calls": 2,
+    "max_provider_attempts": 1,
+    "max_wall_clock_seconds": 120
+  },
+  "reference": {
+    "status": "verified",
+    "locator": "verification/replication-benchmarks/radical-reform-aer-2011/reference/table3-column1.json",
+    "sha256": "6ce6f222433cb6748fa237bf3c0eed59f5b94fd542893be3cf372e3be3405cfb"
+  }
+}

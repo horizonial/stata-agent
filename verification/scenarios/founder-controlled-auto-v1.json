@@ -1,0 +1,43 @@
+{
+  "schema_version": "stata-research-agent.founder-acceptance/v1",
+  "scenario_id": "founder.controlled.auto",
+  "version": 1,
+  "journey": "controlled",
+  "title": "Discuss, pause, branch, continue, and trace a research result",
+  "idea": "Inspect the completed auto.dta research, answer a decision point, pause safely, continue in a new Turn, branch the research direction, and trace a table number.",
+  "fixture": {
+    "fixture_id": "stata18.auto.dta",
+    "media_type": "application/x-stata-dta",
+    "sha256": "e3aeda1c52ed97ba062221f719f35a2d519b8e6380db780fcbd1634318fced17"
+  },
+  "research_slots": {
+    "data": "analysis.primary",
+    "result": "baseline.primary"
+  },
+  "required_observations": [
+    "fixture.identity_match",
+    "control.waiting_answered",
+    "control.pause_completed",
+    "control.continuation_created",
+    "path.branch_created",
+    "path.branch_snapshot_preserved",
+    "lineage.numeric_reverse_lookup"
+  ],
+  "forbidden_observations": [
+    "predecessor.resumed",
+    "branch.missing_parent",
+    "lineage.untraceable"
+  ],
+  "applicability": {
+    "decisions": ["D-201", "D-202", "D-205", "D-213", "D-222", "D-233"],
+    "required_capabilities": [
+      "turn.waiting-answer",
+      "turn.safe-pause-continuation",
+      "research-path.branch",
+      "evidence.numeric-lineage"
+    ],
+    "support_profile": "windows11-x64-stata18-mp-x64",
+    "release_gate": "G7"
+  },
+  "exact_candidate_required": true
+}

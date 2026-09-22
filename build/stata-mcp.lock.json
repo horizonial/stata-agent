@@ -3,8 +3,8 @@
   "name": "stata-mcp",
   "version": "2.0.0",
   "artifact_path": "build/vendor/stata_mcp-2.0.0-py3-none-any.whl",
-  "artifact_sha256": "ddaeff7e3e1b5fa5aaa773e6df28a863406767cd57af8f67048c4a896839be82",
-  "source_base_revision": "725a103be7a07165bbe5b4a2bc9260aca0c4bd8a",
+  "artifact_sha256": "439b6d0383fe753ca352e77d2bcc60222635d7f7d9546b6898cd6866f3d3819b",
+  "source_base_revision": "c2222713d456645775a76e6121fa445c88f362e9",
   "runtime_module": "stata_mcp.server",
   "executor_capability_schema": "stata.executor-capabilities/v1alpha1",
   "execution_receipt_schema": "stata-mcp.execution-receipt/v1"

@@ -42,6 +42,7 @@ class DiagnosticEventCandidate:
     operation_id: str | None = None
     attempt_id: str | None = None
     duration_ms: float | None = None
+    parent_span_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +70,7 @@ class DiagnosticEvent:
     operation_id: str | None
     attempt_id: str | None
     duration_ms: float | None
+    parent_span_id: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -97,6 +99,7 @@ class DiagnosticEvent:
                 "operation_id": self.operation_id,
                 "attempt_id": self.attempt_id,
                 "duration_ms": self.duration_ms,
+                "parent_span_id": self.parent_span_id,
             }.items()
             if value is not None
         }
@@ -192,6 +195,18 @@ def default_diagnostic_registry() -> DiagnosticSchemaRegistry:
                 "recovery.lifecycle",
                 "1.0",
                 {"classification": safe, "report_ref": local},
+            ),
+            DiagnosticEventDefinition(
+                "agent.span",
+                "1.0",
+                {
+                    "span_name": safe,
+                    "span_kind": safe,
+                    "status_code": safe,
+                    "domain_ref_type": safe,
+                    "domain_ref_id": local,
+                    "error_type": safe,
+                },
             ),
         )
     )

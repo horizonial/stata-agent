@@ -109,9 +109,11 @@ def test_mineru_cli_adapter_uses_full_document_json_contract(tmp_path: Path) -> 
         str(source.resolve()),
         "--tier",
         "basic",
-        "--pages",
-        "all",
-        "--wait",
+            "--pages",
+            "all",
+            "--limit",
+            "4000000",
+            "--wait",
         "321",
         "--json",
     ]
@@ -200,6 +202,29 @@ def test_adaptive_pdf_parser_enriches_only_diagnostic_pages(tmp_path: Path) -> N
         if finding.selected_parser == "mineru-cli"
     )
     assert selected == (2,)
+
+
+def test_pdf_policy_escalates_ciphered_glyph_text_layers() -> None:
+    ciphered = (
+        "uq L1BEII1q WBEB CP!COIFQOQCP CffO IF QOQi JJOJ E PJJOJ "
+        "LffflffJQ2CPOOJ Bfl21IJQ22 CJJ00J Bfl21J22 S111ffIC2 "
+    ) * 12
+    normal = (
+        "The corporate investment model shows that firms use cash flow and capital "
+        "when financial constraints affect their financing decisions. "
+    ) * 12
+
+    plan = PdfPageEscalationPolicy(max_page_ratio=1.0).plan(
+        (
+            ExtractedKnowledgePage(1, ciphered),
+            ExtractedKnowledgePage(2, normal),
+        )
+    )
+
+    assert 1 in plan.selected_pages
+    assert 2 not in plan.selected_pages
+    finding = next(item for item in plan.diagnostics if item.page_number == 1)
+    assert "corrupt_text_extraction" in finding.reason_codes
 
 
 def test_adaptive_pdf_parser_keeps_fast_parse_when_mineru_fails(tmp_path: Path) -> None:

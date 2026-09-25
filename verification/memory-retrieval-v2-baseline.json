@@ -1,0 +1,38 @@
+{
+  "schema_version": "stata-research-agent.memory-retrieval-baseline/v2",
+  "baseline_id": "memory-retrieval-v2-20260924",
+  "scenario_id": "agent.memory.retrieval",
+  "scenario_revision": 2,
+  "scenario_sha256": "3cf023ee931ff2c3bc564d2bf743a14752313d0a80c54f7d315a5d11b5c62064",
+  "fixture_id": "memory-retrieval-core-v2",
+  "fixture_sha256": "3abe329f64b6406199e3de308d3376269bea681f18ccdcedc50ab85d3c95f20f",
+  "execution": {
+    "requested_trials": 3,
+    "completed_trials": 3,
+    "passed_trials": 3,
+    "pass_at_1": 1.0,
+    "pass_power_k": 1.0,
+    "infrastructure_errors": 0
+  },
+  "metrics": {
+    "recall_at_1": 0.9,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0,
+    "mean_reciprocal_rank": 1.0,
+    "irrelevant_silence_rate": 1.0,
+    "supersession_forwarding_accuracy": 1.0,
+    "cross_path_precision": 1.0,
+    "exact_open_accuracy": 1.0,
+    "tampered_open_rejection_rate": 1.0,
+    "hybrid_semantic_recall": 1.0,
+    "lexical_semantic_recall": 0.0,
+    "hybrid_semantic_gain": 1.0,
+    "source_neighbor_recall": 1.0,
+    "mean_search_latency_ms": 0.47155555555555556
+  },
+  "notes": [
+    "Recall@1 is 0.9 because the shared-source multi-hop case contains two relevant Memory items and only one can occupy rank one.",
+    "Latency is diagnostic for this local deterministic run and is not a release threshold.",
+    "This baseline evaluates the Memory subsystem; it does not claim that a model used a recalled item in hidden reasoning."
+  ]
+}

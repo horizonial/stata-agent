@@ -450,8 +450,137 @@ class SqliteOperationalEvaluationQuery:
             """,
             turn_id,
         )
+        memory_search_requests = self._scalar(
+            """
+            SELECT COUNT(*) FROM tool_calls AS call
+            JOIN assistant_outputs AS output USING (assistant_output_id)
+            JOIN model_invocations AS invocation USING (model_invocation_id)
+            JOIN steps AS step USING (step_id)
+            WHERE step.turn_id = ? AND call.requested_tool_name = 'memory.search'
+            """,
+            turn_id,
+        )
+        memory_search_successes = self._scalar(
+            """
+            SELECT COUNT(*) FROM tool_calls AS call
+            JOIN canonical_tool_results AS result USING (tool_call_id)
+            JOIN assistant_outputs AS output USING (assistant_output_id)
+            JOIN model_invocations AS invocation USING (model_invocation_id)
+            JOIN steps AS step USING (step_id)
+            WHERE step.turn_id = ? AND call.requested_tool_name = 'memory.search'
+              AND result.result_kind = 'success'
+            """,
+            turn_id,
+        )
+        memory_search_candidates = self._scalar(
+            """
+            SELECT COALESCE(SUM(json_array_length(
+                       json_extract(result.structured_payload_json, '$.hits')
+                   )), 0)
+            FROM tool_calls AS call
+            JOIN canonical_tool_results AS result USING (tool_call_id)
+            JOIN assistant_outputs AS output USING (assistant_output_id)
+            JOIN model_invocations AS invocation USING (model_invocation_id)
+            JOIN steps AS step USING (step_id)
+            WHERE step.turn_id = ? AND call.requested_tool_name = 'memory.search'
+              AND result.result_kind = 'success'
+              AND json_type(result.structured_payload_json, '$.hits') = 'array'
+            """,
+            turn_id,
+        )
+        memory_open_requests = self._scalar(
+            """
+            SELECT COUNT(*) FROM tool_calls AS call
+            JOIN assistant_outputs AS output USING (assistant_output_id)
+            JOIN model_invocations AS invocation USING (model_invocation_id)
+            JOIN steps AS step USING (step_id)
+            WHERE step.turn_id = ? AND call.requested_tool_name = 'memory.open'
+            """,
+            turn_id,
+        )
+        memory_open_successes = self._scalar(
+            """
+            SELECT COUNT(*) FROM tool_calls AS call
+            JOIN canonical_tool_results AS result USING (tool_call_id)
+            JOIN assistant_outputs AS output USING (assistant_output_id)
+            JOIN model_invocations AS invocation USING (model_invocation_id)
+            JOIN steps AS step USING (step_id)
+            WHERE step.turn_id = ? AND call.requested_tool_name = 'memory.open'
+              AND result.result_kind = 'success'
+            """,
+            turn_id,
+        )
+        exact_memory_uses = self._scalar(
+            """
+            SELECT COUNT(*) FROM memory_context_uses AS use
+            JOIN context_items AS item USING (context_item_id)
+            JOIN context_manifests AS manifest USING (context_manifest_id)
+            JOIN steps AS step USING (step_id)
+            WHERE step.turn_id = ? AND use.usage_kind = 'exact'
+            """,
+            turn_id,
+        )
         metrics.extend(
             (
+                _count(
+                    "l1.memory.search_request_count",
+                    "L1",
+                    "memory",
+                    memory_search_requests,
+                    explanation="Explicit Project Memory search requests in this Turn.",
+                    sources=("tool_calls",),
+                ),
+                _ratio(
+                    "l1.memory.search_success_rate",
+                    "L1",
+                    "memory",
+                    memory_search_successes,
+                    memory_search_requests,
+                    explanation="Successful explicit Memory searches per search request.",
+                    sources=("tool_calls", "canonical_tool_results"),
+                ),
+                _count(
+                    "l1.memory.search_candidate_count",
+                    "L1",
+                    "memory",
+                    memory_search_candidates,
+                    explanation="Total candidate Memory hits returned by successful searches.",
+                    sources=("canonical_tool_results",),
+                ),
+                _count(
+                    "l1.memory.open_request_count",
+                    "L1",
+                    "memory",
+                    memory_open_requests,
+                    explanation="Exact Memory revision open requests in this Turn.",
+                    sources=("tool_calls",),
+                ),
+                _ratio(
+                    "l1.memory.open_success_rate",
+                    "L1",
+                    "memory",
+                    memory_open_successes,
+                    memory_open_requests,
+                    explanation="Successful exact Memory opens per open request.",
+                    sources=("tool_calls", "canonical_tool_results"),
+                ),
+                _count(
+                    "l1.memory.context_use_count",
+                    "L1",
+                    "memory",
+                    memory_uses,
+                    explanation="Memory revisions included in model Context during this Turn.",
+                    sources=("memory_context_uses",),
+                ),
+                _ratio(
+                    "l1.memory.exact_context_use_rate",
+                    "L1",
+                    "memory",
+                    exact_memory_uses,
+                    memory_uses,
+                    explanation="Memory Context uses carrying exact revision content.",
+                    sources=("memory_context_uses",),
+                ),
                 _ratio(
                     "l1.memory.source_link_rate",
                     "L1",

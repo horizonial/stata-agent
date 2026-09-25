@@ -2,19 +2,17 @@
 
 from __future__ import annotations
 
-import re
 import sqlite3
 from collections.abc import Iterable, Mapping
 
+from stata_research_agent.application.dense_retrieval import EmbeddingGateway
 from stata_research_agent.application.ports.identity import IdentityGenerator
 
 from .filesystem_memory import FilesystemMemoryStore
-
-_TOKEN = re.compile(r"[\w\u3400-\u9fff]+", re.UNICODE)
-
-
-def _tokens(value: str) -> set[str]:
-    return {token.casefold() for token in _TOKEN.findall(value) if len(token) > 1}
+from .memory_recommendation_query import (
+    RankedMemoryCandidate,
+    SqliteMemoryRecommendationQuery,
+)
 
 
 class SqliteMemoryRecallRepository:
@@ -23,10 +21,12 @@ class SqliteMemoryRecallRepository:
         connection: sqlite3.Connection,
         files: FilesystemMemoryStore,
         identities: IdentityGenerator,
+        embedding_gateway: EmbeddingGateway | None = None,
     ) -> None:
         self._connection = connection
         self._files = files
         self._identities = identities
+        self._embedding_gateway = embedding_gateway
 
     def reconcile_external_edits(self) -> None:
         self._files.reconcile_external_edits(self._connection, self._identities)
@@ -42,20 +42,45 @@ class SqliteMemoryRecallRepository:
             raise ValueError("query must not be empty")
         limit = max(1, min(int(str(arguments.get("limit", 8))), 24))
         include_archived = bool(arguments.get("include_archived", False))
-        query_tokens = _tokens(query)
-        rows = self._rows(research_path_id, include_archived=include_archived)
-        ranked: list[tuple[int, int, sqlite3.Row]] = []
-        for row in rows:
-            overlap = len(query_tokens.intersection(_tokens(f"{row['title']} {row['content']}")))
-            if overlap == 0:
-                continue
-            scope_boost = 1 if str(row["scope_kind"]) == "research_path" else 0
-            ranked.append((overlap, scope_boost, row))
-        ranked.sort(
-            key=lambda item: (item[0], item[1], int(item[2]["created_revision"])),
-            reverse=True,
+        retrieval_mode = str(arguments.get("retrieval_mode", "hybrid"))
+        if retrieval_mode not in {"lexical", "hybrid"}:
+            raise ValueError("retrieval_mode must be lexical or hybrid")
+        ranked = SqliteMemoryRecommendationQuery(self._connection).search(
+            query,
+            research_path_id=research_path_id,
+            limit=limit,
+            include_archived=include_archived,
+            semantic_scorer=(
+                self._semantic_scores
+                if retrieval_mode == "hybrid" and self._embedding_gateway is not None
+                else None
+            ),
         )
-        return [self._payload(row, include_content=False) for _, _, row in ranked[:limit]]
+        return [self._payload(hit.row, include_content=False, ranked=hit) for hit in ranked]
+
+    def _semantic_scores(
+        self,
+        query: str,
+        documents: tuple[tuple[str, str], ...],
+    ) -> Mapping[str, float]:
+        gateway = self._embedding_gateway
+        if gateway is None or not documents:
+            return {}
+        query_vector = gateway.embed_query(query)
+        document_vectors = gateway.embed_documents(tuple(content for _, content in documents))
+        if len(document_vectors) != len(documents):
+            raise ValueError("Memory embedding response count does not match candidates")
+        dimension = gateway.profile.dimension
+        if len(query_vector) != dimension or any(
+            len(vector) != dimension for vector in document_vectors
+        ):
+            raise ValueError("Memory embedding dimension does not match the active profile")
+        return {
+            memory_item_id: sum(
+                left * right for left, right in zip(query_vector, vector, strict=True)
+            )
+            for (memory_item_id, _), vector in zip(documents, document_vectors, strict=True)
+        }
 
     def open(
         self,
@@ -95,10 +120,10 @@ class SqliteMemoryRecallRepository:
             SELECT item.memory_item_id, item.scope_kind, item.scope_object_id,
                    item.memory_kind, state.current_revision_id AS memory_revision_id,
                    state.lifecycle, revision.title, revision.content,
-                   revision.origin_kind, revision.created_revision,
+                   revision.content_sha256, revision.origin_kind, revision.created_revision,
                    retention.access_tier, retention.pinned,
                    retention.superseded_by_memory_item_id,
-                   payload.relative_path
+                   payload.relative_path, payload.payload_sha256, payload.size_bytes
             FROM memory_items AS item
             JOIN memory_current_states AS state USING (memory_item_id)
             JOIN memory_revisions AS revision
@@ -119,9 +144,28 @@ class SqliteMemoryRecallRepository:
             (int(include_archived), int(include_archived), workspace_id, research_path_id),
         ).fetchall()
 
-    @staticmethod
-    def _payload(row: sqlite3.Row, *, include_content: bool) -> dict[str, object]:
+    def _payload(
+        self,
+        row: sqlite3.Row,
+        *,
+        include_content: bool,
+        ranked: RankedMemoryCandidate | None = None,
+    ) -> dict[str, object]:
         content = str(row["content"])
+        if include_content:
+            relative_path = row["relative_path"]
+            if relative_path is None:
+                raise ValueError("Memory revision has no managed filesystem payload")
+            file_title, content = self._files.read_revision_content(
+                str(relative_path),
+                expected_memory_item_id=str(row["memory_item_id"]),
+                expected_memory_revision_id=str(row["memory_revision_id"]),
+                expected_content_sha256=str(row["content_sha256"]),
+                expected_payload_sha256=str(row["payload_sha256"]),
+                expected_size_bytes=int(row["size_bytes"]),
+            )
+            if file_title != str(row["title"]):
+                raise ValueError("Memory revision file title does not match the ledger")
         return {
             "memory_item_id": str(row["memory_item_id"]),
             "memory_revision_id": str(row["memory_revision_id"]),
@@ -132,8 +176,25 @@ class SqliteMemoryRecallRepository:
             "title": str(row["title"]),
             "content": content if include_content else None,
             "excerpt": content[:280],
+            "excerpt_kind": "exact_prefix",
             "access_tier": str(row["access_tier"]),
             "pinned": bool(row["pinned"]),
             "origin_kind": str(row["origin_kind"]),
             "memory_file": row["relative_path"],
+            "superseded_by_memory_item_id": row["superseded_by_memory_item_id"],
+            "retrieval_score": None if ranked is None else round(ranked.score, 6),
+            "retrieval_reasons": [] if ranked is None else list(ranked.reasons),
+            "sources": (
+                []
+                if ranked is None
+                else [
+                    {
+                        "object_type": str(source["source_object_type"]),
+                        "object_id": str(source["source_object_id"]),
+                        "object_revision": str(source["source_object_revision"]),
+                        "role": str(source["source_role"]),
+                    }
+                    for source in ranked.source_rows
+                ]
+            ),
         }

@@ -1,13 +1,15 @@
-"""Deterministic, provenance-preserving compilation of model context.
+"""Deterministic, provenance-preserving compilation of exact model context.
 
 The compiler decides what a model may see for one Step.  It does not own research
 facts: every item points back to an authoritative source and every omission or
-compression is recorded as a build decision on the Step Context Manifest.
+budget exclusion is recorded on the Step Context Manifest.  It deliberately does not
+create summaries or other lossy replacements: excluded content remains externally
+addressable through its authoritative source identity.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Protocol
 
 from stata_research_agent.domain.identifiers import TurnId
@@ -54,20 +56,18 @@ class CompiledStepContext:
 
 
 class ContextCompiler:
-    """Select context under a fixed budget without hiding important omissions."""
+    """Select exact Context Items under a per-Step budget."""
 
     def __init__(
         self,
         authority: ContextAuthorityReader,
         *,
-        input_token_budget: int = 96_000,
-        summary_token_target: int = 1_000,
+        input_token_budget: int | None = None,
     ) -> None:
-        if input_token_budget < 1 or summary_token_target < 64:
+        if input_token_budget is not None and input_token_budget < 1:
             raise ValueError("invalid Context Compiler budget")
         self._authority = authority
         self._budget = input_token_budget
-        self._summary_target = summary_token_target
 
     def compile(
         self,
@@ -76,7 +76,11 @@ class ContextCompiler:
         static_items: tuple[ContextItemCandidate, ...] = (),
         transient_items: tuple[ContextItemCandidate, ...] = (),
         remote_provider: bool = True,
+        input_token_budget: int | None = None,
     ) -> CompiledStepContext:
+        budget = input_token_budget if input_token_budget is not None else self._budget
+        if budget is None or budget < 1:
+            raise ValueError("a positive per-Step Context Item budget is required")
         candidates = [*self._authority.collect(turn_id)]
         candidates.extend(self._wrap_static(item) for item in static_items)
         candidates.extend(self._wrap_transient(item) for item in transient_items)
@@ -116,7 +120,7 @@ class ContextCompiler:
                 continue
 
             group_tokens = sum(self._estimate_tokens(source.item.content) for source in sources)
-            if used + group_tokens <= self._budget:
+            if used + group_tokens <= budget:
                 included.extend((ordinal, source.item) for ordinal, source in group)
                 used += group_tokens
                 decisions.extend(
@@ -130,23 +134,14 @@ class ContextCompiler:
                     "mandatory P0 context exceeds the configured model-input budget"
                 )
 
-            summarized_group = self._summarize_group(group, self._budget - used)
-            if summarized_group:
-                for ordinal, source, item in summarized_group:
-                    included.append((ordinal, item))
-                    used += self._estimate_tokens(item.content)
-                    decisions.append(
-                        self._decision(
-                            source,
-                            "summarized",
-                            "token_budget",
-                            {"replacement_item_kind": item.item_kind},
-                        )
-                    )
-                continue
-
             decisions.extend(
-                self._decision(source, "excluded", "token_budget") for source in sources
+                self._decision(
+                    source,
+                    "excluded",
+                    "token_budget_external_source_retained",
+                    {"lossy_replacement_created": False},
+                )
+                for source in sources
             )
 
         # Model semantics use a stable order independent from selection traversal.
@@ -156,29 +151,6 @@ class ContextCompiler:
             tuple(decisions),
             used,
         )
-
-    def _summarize_group(
-        self,
-        group: list[tuple[int, ContextSourceCandidate]],
-        remaining_tokens: int,
-    ) -> list[tuple[int, ContextSourceCandidate, ContextItemCandidate]]:
-        if remaining_tokens < 64 or not all(source.summarizable for _, source in group):
-            return []
-        per_item = max(64, min(self._summary_target, remaining_tokens // len(group)))
-        result: list[tuple[int, ContextSourceCandidate, ContextItemCandidate]] = []
-        for ordinal, source in group:
-            summary = self._extractive_summary(source.item.content, per_item)
-            item = replace(
-                source.item,
-                item_kind="context_summary",
-                source_revision=f"{source.item.source_revision}:summary-v1",
-                content=summary,
-            )
-            if self._estimate_tokens(item.content) > remaining_tokens:
-                return []
-            remaining_tokens -= self._estimate_tokens(item.content)
-            result.append((ordinal, source, item))
-        return result
 
     @staticmethod
     def _wrap_static(item: ContextItemCandidate) -> ContextSourceCandidate:
@@ -248,19 +220,6 @@ class ContextCompiler:
     @staticmethod
     def _estimate_tokens(content: str) -> int:
         return max(1, (len(content.encode("utf-8")) + 3) // 4 + 12)
-
-    @staticmethod
-    def _extractive_summary(content: str, token_target: int) -> str:
-        byte_target = max(192, token_target * 4)
-        encoded = content.encode("utf-8")
-        if len(encoded) <= byte_target:
-            return content
-        marker = b"\n...[deterministic context compression; original remains authoritative]...\n"
-        allowance = max(64, byte_target - len(marker))
-        head = encoded[: allowance * 2 // 3].decode("utf-8", errors="ignore")
-        tail = encoded[-allowance // 3 :].decode("utf-8", errors="ignore")
-        return head + marker.decode("utf-8") + tail
-
 
 class EmptyContextAuthorityReader:
     def collect(self, turn_id: TurnId) -> tuple[ContextSourceCandidate, ...]:

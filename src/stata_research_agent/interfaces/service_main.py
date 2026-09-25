@@ -8,19 +8,34 @@ import json
 import os
 import sys
 import webbrowser
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import uvicorn
 
 from stata_research_agent import __version__
+from stata_research_agent.application.diagnostic_service import DiagnosticService
+from stata_research_agent.application.diagnostic_tracing import DiagnosticTracer
+from stata_research_agent.application.diagnostics import (
+    DiagnosticEventCandidate,
+    default_diagnostic_registry,
+)
 from stata_research_agent.application.model_configuration import (
     WorkspaceModelConfigurationService,
 )
 from stata_research_agent.application.provider_credentials import ProviderCredentialService
+from stata_research_agent.application.sensitive_output import SensitiveOutputGate
 from stata_research_agent.application.streaming import EphemeralModelDeltaHub
+from stata_research_agent.domain.identifiers import WorkspaceId
 from stata_research_agent.interfaces.api import WorkspaceHost, create_app
+from stata_research_agent.interfaces.cross_encoder_reranker import (
+    AdaptiveFusionEvidenceReranker,
+    AdaptiveRerankPolicy,
+    CrossEncoderEvidenceReranker,
+)
+from stata_research_agent.interfaces.diagnostic_bundle_builder import DiagnosticBundleBuilder
+from stata_research_agent.interfaces.filesystem_diagnostics import FilesystemDiagnosticSink
 from stata_research_agent.interfaces.literature_catalog import MineruCliParser
 from stata_research_agent.interfaces.loopback_launcher import LoopbackLauncherClient
 from stata_research_agent.interfaces.memory_maintenance_runner import (
@@ -39,6 +54,7 @@ from stata_research_agent.interfaces.windows_runtime_control import (
 )
 from stata_research_agent.interfaces.windows_sandbox_executor import WindowsSandboxExecutor
 from stata_research_agent.interfaces.workspace_skills import FilesystemMainSkillCatalog
+from stata_research_agent.persistence.diagnostic_projection import WorkspaceDiagnosticProjection
 from stata_research_agent.persistence.global_credentials import (
     GlobalCredentialDatabase,
     SqliteProviderCredentialRepository,
@@ -66,6 +82,10 @@ class ServiceLayout:
     embedding_model: str | None = None
     embedding_revision: str = "614241f622f53c4eeff9890bdc4f31cfecc418b3"
     embedding_cache: Path | None = None
+    reranker_model: str | None = None
+    reranker_revision: str | None = None
+    reranker_cache: Path | None = None
+    reranker_device: str = "cpu"
     mineru_executable: Path | None = None
     mineru_version: str | None = None
 
@@ -113,14 +133,20 @@ def default_service_layout() -> ServiceLayout:
         default_mcp,
         powershell,
         os.environ.get("SRA_EMBEDDING_MODEL"),
-        os.environ.get(
-            "SRA_EMBEDDING_REVISION", "614241f622f53c4eeff9890bdc4f31cfecc418b3"
-        ),
+        os.environ.get("SRA_EMBEDDING_REVISION", "614241f622f53c4eeff9890bdc4f31cfecc418b3"),
         (
             None
             if not os.environ.get("SRA_EMBEDDING_CACHE")
             else Path(str(os.environ["SRA_EMBEDDING_CACHE"]))
         ),
+        os.environ.get("SRA_RERANKER_MODEL"),
+        os.environ.get("SRA_RERANKER_REVISION"),
+        (
+            None
+            if not os.environ.get("SRA_RERANKER_CACHE")
+            else Path(str(os.environ["SRA_RERANKER_CACHE"]))
+        ),
+        os.environ.get("SRA_RERANKER_DEVICE", "cpu"),
         (
             None
             if not os.environ.get("SRA_MINERU_EXECUTABLE")
@@ -132,7 +158,11 @@ def default_service_layout() -> ServiceLayout:
 
 def _knowledge_adapters(
     layout: ServiceLayout,
-) -> tuple[SentenceTransformerEmbeddingGateway | None, MineruCliParser | None]:
+) -> tuple[
+    SentenceTransformerEmbeddingGateway | None,
+    MineruCliParser | None,
+    AdaptiveFusionEvidenceReranker | None,
+]:
     embedding = None
     if layout.embedding_model is not None:
         embedding = SentenceTransformerEmbeddingGateway(
@@ -145,7 +175,28 @@ def _knowledge_adapters(
         if layout.mineru_version is None:
             raise ServiceStartupError("configured MinerU requires a pinned version")
         mineru = MineruCliParser(layout.mineru_executable, version=layout.mineru_version)
-    return embedding, mineru
+    reranker = None
+    if layout.reranker_model is not None:
+        if layout.reranker_revision is None:
+            raise ServiceStartupError("configured reranker requires a pinned revision")
+        reranker_cache = layout.reranker_cache or layout.embedding_cache
+        if reranker_cache is None:
+            raise ServiceStartupError("configured reranker requires a model cache directory")
+        neural_reranker = CrossEncoderEvidenceReranker(
+            model_name=layout.reranker_model,
+            model_revision=layout.reranker_revision,
+            cache_folder=str(reranker_cache),
+            device=layout.reranker_device,
+            batch_size=32 if layout.reranker_device.startswith("cuda") else 8,
+            max_length=512,
+            top_n=32,
+            lazy_load=True,
+        )
+        reranker = AdaptiveFusionEvidenceReranker(
+            neural_reranker,
+            policy=AdaptiveRerankPolicy(minimum_rank_disagreement=6),
+        )
+    return embedding, mineru, reranker
 
 
 def release_probe(layout: ServiceLayout) -> dict[str, object]:
@@ -204,6 +255,48 @@ async def serve(layout: ServiceLayout, *, open_browser: bool, log_level: str) ->
             return
         raise ServiceStartupError("an existing service owns the runtime lock") from None
     with secured:
+        diagnostic_gate = SensitiveOutputGate()
+        try:
+            diagnostic_sink: FilesystemDiagnosticSink | None = FilesystemDiagnosticSink(
+                layout.runtime_directory.parent / "control" / "diagnostics"
+            )
+        except OSError:
+            diagnostic_sink = None
+        raw_build_id = os.environ.get("SRA_BUILD_ID", f"build-{__version__}")
+        build_id = (
+            "".join(
+                character if character.isalnum() or character in "._-" else "_"
+                for character in raw_build_id
+            )[:128]
+            or "build-unknown"
+        )
+        diagnostic_service: DiagnosticService | None = None
+        tracer: DiagnosticTracer | None = None
+        if diagnostic_sink is not None:
+            try:
+                diagnostic_sink.enforce_retention()
+            except OSError:
+                pass
+            diagnostic_service = DiagnosticService(
+                diagnostic_sink,
+                default_diagnostic_registry(),
+                diagnostic_gate,
+                release_id=__version__,
+                build_id=build_id,
+                instance_id=secured.discovery.instance_id,
+            )
+            tracer = DiagnosticTracer(diagnostic_service)
+            diagnostic_service.record(
+                DiagnosticEventCandidate(
+                    "process.lifecycle",
+                    9,
+                    "INFO",
+                    "PROCESS_STARTED",
+                    "service_main",
+                    "main_service",
+                    {"state_code": "started", "generation": 1},
+                )
+            )
         credential_connection = GlobalCredentialDatabase(
             layout.runtime_directory.parent / "control" / "provider-credentials.sqlite3"
         ).open()
@@ -250,7 +343,9 @@ async def serve(layout: ServiceLayout, *, open_browser: bool, log_level: str) ->
                     )
 
             model_delta_hub = EphemeralModelDeltaHub()
-            embedding_gateway, literature_pdf_parser = _knowledge_adapters(layout)
+            embedding_gateway, literature_pdf_parser, evidence_reranker = (
+                _knowledge_adapters(layout)
+            )
             turn_runner = ProductionTurnRunner(
                 host,
                 pool,
@@ -261,7 +356,10 @@ async def serve(layout: ServiceLayout, *, open_browser: bool, log_level: str) ->
                 sandbox_factory=sandbox_factory,
                 model_delta_hub=model_delta_hub,
                 embedding_gateway=embedding_gateway,
+                evidence_reranker=evidence_reranker,
                 literature_pdf_parser=literature_pdf_parser,
+                diagnostics=diagnostic_service,
+                tracer=tracer,
             )
             supervisor = WorkspaceTurnSupervisor(
                 host,
@@ -272,6 +370,34 @@ async def serve(layout: ServiceLayout, *, open_browser: bool, log_level: str) ->
                     provider_credentials,
                 ),
             )
+
+            diagnostic_bundle_factory: (
+                Callable[[WorkspaceId | None], DiagnosticBundleBuilder] | None
+            ) = None
+            if diagnostic_sink is not None:
+
+                def build_diagnostic_bundle(
+                    workspace_id: WorkspaceId | None,
+                ) -> DiagnosticBundleBuilder:
+                    projection = (
+                        None
+                        if workspace_id is None
+                        else WorkspaceDiagnosticProjection(host.database(workspace_id))
+                    )
+                    return DiagnosticBundleBuilder(
+                        diagnostic_sink,
+                        diagnostic_gate,
+                        layout.runtime_directory.parent / "control" / "bundle-staging",
+                        system_profile={
+                            "release_id": __version__,
+                            "build_id": build_id,
+                            "supported_profile": True,
+                        },
+                        workspace_projection=projection,
+                    )
+
+                diagnostic_bundle_factory = build_diagnostic_bundle
+
             app = create_app(
                 host,
                 static_directory=layout.static_directory,
@@ -281,6 +407,7 @@ async def serve(layout: ServiceLayout, *, open_browser: bool, log_level: str) ->
                 model_configuration=model_configuration,
                 model_delta_hub=model_delta_hub,
                 provider_pricing=provider_pricing,
+                diagnostic_bundle_factory=diagnostic_bundle_factory,
             )
             config = uvicorn.Config(
                 app,
@@ -302,6 +429,18 @@ async def serve(layout: ServiceLayout, *, open_browser: bool, log_level: str) ->
                     await asyncio.gather(browser_task, return_exceptions=True)
                 await supervisor.close()
                 await pool.close()
+                if diagnostic_service is not None:
+                    diagnostic_service.record(
+                        DiagnosticEventCandidate(
+                            "process.lifecycle",
+                            9,
+                            "INFO",
+                            "PROCESS_STOPPED",
+                            "service_main",
+                            "main_service",
+                            {"state_code": "stopped", "generation": 1},
+                        )
+                    )
         finally:
             credential_connection.close()
 
@@ -320,6 +459,10 @@ def _parser(defaults: ServiceLayout) -> argparse.ArgumentParser:
     parser.add_argument("--embedding-model", default=defaults.embedding_model)
     parser.add_argument("--embedding-revision", default=defaults.embedding_revision)
     parser.add_argument("--embedding-cache", type=Path, default=defaults.embedding_cache)
+    parser.add_argument("--reranker-model", default=defaults.reranker_model)
+    parser.add_argument("--reranker-revision", default=defaults.reranker_revision)
+    parser.add_argument("--reranker-cache", type=Path, default=defaults.reranker_cache)
+    parser.add_argument("--reranker-device", default=defaults.reranker_device)
     parser.add_argument("--mineru-executable", type=Path, default=defaults.mineru_executable)
     parser.add_argument("--mineru-version", default=defaults.mineru_version)
     parser.add_argument("--no-browser", action="store_true")
@@ -337,20 +480,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(__version__)
             return 0
         layout = ServiceLayout(
-            arguments.workspace_root,
-            arguments.runtime_directory,
-            arguments.static_directory,
-            arguments.skills_directory,
-            arguments.mcp_executor,
-            arguments.stata_home,
-            arguments.sandbox_wxc,
-            arguments.sandbox_python,
-            arguments.sandbox_powershell,
-            arguments.embedding_model,
-            arguments.embedding_revision,
-            arguments.embedding_cache,
-            arguments.mineru_executable,
-            arguments.mineru_version,
+            workspace_root=arguments.workspace_root,
+            runtime_directory=arguments.runtime_directory,
+            static_directory=arguments.static_directory,
+            skills_directory=arguments.skills_directory,
+            mcp_executor=arguments.mcp_executor,
+            stata_home=arguments.stata_home,
+            sandbox_wxc=arguments.sandbox_wxc,
+            sandbox_python=arguments.sandbox_python,
+            sandbox_powershell=arguments.sandbox_powershell,
+            embedding_model=arguments.embedding_model,
+            embedding_revision=arguments.embedding_revision,
+            embedding_cache=arguments.embedding_cache,
+            reranker_model=arguments.reranker_model,
+            reranker_revision=arguments.reranker_revision,
+            reranker_cache=arguments.reranker_cache,
+            reranker_device=arguments.reranker_device,
+            mineru_executable=arguments.mineru_executable,
+            mineru_version=arguments.mineru_version,
         )
         if arguments.probe:
             print(json.dumps(release_probe(layout), sort_keys=True))

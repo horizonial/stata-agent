@@ -114,6 +114,36 @@ def test_optional_mineru_adapter_requires_explicit_version(tmp_path: Path) -> No
     pinned = replace(
         candidate, mineru_executable=executable, mineru_version="4.x-test"
     )
-    embedding, mineru = service_main._knowledge_adapters(pinned)
+    embedding, mineru, reranker = service_main._knowledge_adapters(pinned)
     assert embedding is None
     assert mineru is not None and mineru.tier == "basic"
+    assert reranker is None
+
+
+def test_optional_reranker_requires_pinned_revision_and_cache(tmp_path: Path) -> None:
+    candidate = layout(tmp_path)
+    without_revision = replace(
+        candidate,
+        reranker_model="example/reranker",
+        reranker_cache=tmp_path / "models",
+    )
+    with pytest.raises(ServiceStartupError, match="pinned revision"):
+        service_main._knowledge_adapters(without_revision)
+
+    without_cache = replace(
+        candidate,
+        reranker_model="example/reranker",
+        reranker_revision="revision-1",
+    )
+    with pytest.raises(ServiceStartupError, match="model cache directory"):
+        service_main._knowledge_adapters(without_cache)
+
+    configured = replace(
+        without_cache,
+        reranker_cache=tmp_path / "models",
+        reranker_device="cuda",
+    )
+    embedding, mineru, reranker = service_main._knowledge_adapters(configured)
+    assert embedding is None
+    assert mineru is None
+    assert reranker is not None

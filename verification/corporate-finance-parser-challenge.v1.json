@@ -1,0 +1,40 @@
+{
+  "schema_version": "corporate-finance-parser-challenge/v1",
+  "cases": [
+    {
+      "paper_id": "kaplan-zingales-1995",
+      "filename": "12-do-financing-constraints-explain-why-investment-is-correla.pdf",
+      "required_markers": [
+        "investment-cash flow",
+        "financially constrained"
+      ]
+    },
+    {
+      "paper_id": "opler-pinkowitz-stulz-williamson-1997",
+      "filename": "18-the-determinants-and-implications-of-corporate-cash-holdin.pdf",
+      "required_markers": [
+        "growth opportunities",
+        "riskier cash flows",
+        "operating losses"
+      ]
+    },
+    {
+      "paper_id": "ikenberry-lakonishok-vermaelen-1994",
+      "filename": "24-market-underreaction-to-open-market-share-repurchases.pdf",
+      "required_markers": [
+        "open market repurchases",
+        "undervalued",
+        "long-run performance"
+      ]
+    },
+    {
+      "paper_id": "zingales-1997",
+      "filename": "26-corporate-governance.pdf",
+      "required_markers": [
+        "incomplete contracts",
+        "corporate governance",
+        "specific investments"
+      ]
+    }
+  ]
+}

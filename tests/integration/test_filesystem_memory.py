@@ -6,12 +6,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from stata_research_agent.application.control import CreateWorkspaceCommand, SubmitMessageCommand
+from stata_research_agent.application.dense_retrieval import EmbeddingProfile
 from stata_research_agent.application.memory import (
     CreateMemoryCommand,
     MemoryKind,
     MemoryOriginKind,
     MemorySource,
     MemorySourceRole,
+    SupersedeMemoryCommand,
 )
 from stata_research_agent.application.memory_service import MemoryService
 from stata_research_agent.application.turn_driver import ToolExecutionRequest
@@ -38,6 +40,21 @@ class _MemoryBrokerBridge:
 
     def complete(self, _command):
         return SimpleNamespace(status="succeeded")
+
+
+class _SemanticMemoryGateway:
+    @property
+    def profile(self) -> EmbeddingProfile:
+        return EmbeddingProfile("memory-test-v1", "fixture", "semantic-memory", 2)
+
+    def embed_documents(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        return tuple(
+            (1.0, 0.0) if "instrumental variable" in text.casefold() else (0.0, 1.0)
+            for text in texts
+        )
+
+    def embed_query(self, text: str) -> tuple[float, ...]:
+        return (1.0, 0.0) if "endogeneity" in text.casefold() else (0.0, 1.0)
 
 
 def test_filesystem_memory_preserves_revisions_and_imports_external_edit(
@@ -188,5 +205,130 @@ def test_progressive_recall_searches_then_opens_exact_revision(tmp_path: Path) -
         open_payload = json.loads(opened.context_text)
         assert open_payload["hits"][0]["memory_revision_id"] == memory.memory_revision_id.value
         assert open_payload["hits"][0]["content"] == "Always report clustered standard errors."
+    finally:
+        connection.close()
+
+
+def test_memory_search_forwards_obsolete_match_to_current_successor(tmp_path: Path) -> None:
+    workspace_id = WorkspaceId("ws_recommendation_memory")
+    database = WorkspaceDatabase(tmp_path / "workspace", workspace_id)
+    database.create()
+    connection = database.open(writable=True)
+    identities = UuidIdentityGenerator()
+    try:
+        control = WorkspaceControlService(SqliteControlStore(connection), identities)
+        control.create_workspace(
+            CreateWorkspaceCommand(CommandId("cmd_rec_workspace"), workspace_id)
+        )
+        message = control.submit_message(
+            SubmitMessageCommand(CommandId("cmd_rec_message"), "Use a one-percent tail rule.")
+        )
+        service = MemoryService(SqliteMemoryRepository(connection), identities)
+        source = (
+            MemorySource(
+                "message",
+                message.message_id.value,
+                str(message.commit_revision.value),
+                MemorySourceRole.USER_STATEMENT,
+            ),
+        )
+        old = service.create(
+            CreateMemoryCommand(
+                CommandId("cmd_rec_old"),
+                MemoryKind.RESEARCH_DECISION,
+                "Tail treatment",
+                "Winsorize both tails at one percent.",
+                MemoryOriginKind.EXPLICIT_USER,
+                source,
+            )
+        )
+        successor = service.create(
+            CreateMemoryCommand(
+                CommandId("cmd_rec_new"),
+                MemoryKind.RESEARCH_DECISION,
+                "Current tail treatment",
+                "Keep the original observations and report sensitivity checks separately.",
+                MemoryOriginKind.EXPLICIT_USER,
+                source,
+            )
+        )
+        service.supersede(
+            SupersedeMemoryCommand(
+                CommandId("cmd_rec_supersede"),
+                old.memory_item_id,
+                successor.memory_item_id,
+                1,
+                "The user replaced the earlier treatment rule.",
+            )
+        )
+        files = FilesystemMemoryStore(database.root)
+        files.synchronize(connection)
+        hits = SqliteMemoryRecallRepository(connection, files, identities).search(
+            {"query": "one percent winsorize"},
+            research_path_id=message.research_path_id.value,
+        )
+
+        assert hits
+        assert hits[0]["memory_item_id"] == successor.memory_item_id.value
+        assert "superseded_match_forwarded" in hits[0]["retrieval_reasons"]
+        assert all(hit["memory_item_id"] != old.memory_item_id.value for hit in hits)
+    finally:
+        connection.close()
+
+
+def test_hybrid_memory_search_recalls_semantic_match_without_lexical_overlap(
+    tmp_path: Path,
+) -> None:
+    workspace_id = WorkspaceId("ws_semantic_memory")
+    database = WorkspaceDatabase(tmp_path / "workspace", workspace_id)
+    database.create()
+    connection = database.open(writable=True)
+    identities = UuidIdentityGenerator()
+    try:
+        control = WorkspaceControlService(SqliteControlStore(connection), identities)
+        control.create_workspace(
+            CreateWorkspaceCommand(CommandId("cmd_semantic_workspace"), workspace_id)
+        )
+        message = control.submit_message(
+            SubmitMessageCommand(CommandId("cmd_semantic_message"), "Keep this design choice.")
+        )
+        memory = MemoryService(SqliteMemoryRepository(connection), identities).create(
+            CreateMemoryCommand(
+                CommandId("cmd_semantic_memory"),
+                MemoryKind.REFERENCE_POINTER,
+                "Identification strategy",
+                "Use an instrumental variable specification for the primary estimate.",
+                MemoryOriginKind.EXPLICIT_USER,
+                (
+                    MemorySource(
+                        "message",
+                        message.message_id.value,
+                        str(message.commit_revision.value),
+                        MemorySourceRole.USER_STATEMENT,
+                    ),
+                ),
+            )
+        )
+        files = FilesystemMemoryStore(database.root)
+        files.synchronize(connection)
+        recall = SqliteMemoryRecallRepository(
+            connection,
+            files,
+            identities,
+            embedding_gateway=_SemanticMemoryGateway(),
+        )
+
+        lexical = recall.search(
+            {"query": "endogeneity concern", "retrieval_mode": "lexical"},
+            research_path_id=message.research_path_id.value,
+        )
+        hybrid = recall.search(
+            {"query": "endogeneity concern", "retrieval_mode": "hybrid"},
+            research_path_id=message.research_path_id.value,
+        )
+
+        assert lexical == []
+        assert hybrid[0]["memory_item_id"] == memory.memory_item_id.value
+        assert "semantic_similarity" in hybrid[0]["retrieval_reasons"]
     finally:
         connection.close()

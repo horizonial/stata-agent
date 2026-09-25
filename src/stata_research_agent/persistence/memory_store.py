@@ -1174,7 +1174,8 @@ class SqliteMemoryRepository:
         for scope_kind, scope_object_id in scopes:
             rows = connection.execute(
                 """
-                SELECT item.memory_kind, revision.title, revision.content
+                SELECT item.memory_item_id, item.memory_kind,
+                       state.current_revision_id, revision.title
                 FROM memory_items AS item
                 JOIN memory_current_states AS state USING (memory_item_id)
                 JOIN memory_retention_states AS retention USING (memory_item_id)
@@ -1196,9 +1197,14 @@ class SqliteMemoryRepository:
                 """,
                 (scope_kind, scope_object_id),
             ).fetchall()
-            lines = ["Project Memory index (navigation only; not Evidence or current truth):"]
+            lines = [
+                "Project Memory reference catalog (identities only; open exact files for content):"
+            ]
             for row in rows:
-                line = f"- [{row['memory_kind']}] {row['title']}: {row['content']}"
+                line = (
+                    f"- [{row['memory_kind']}] {row['title']} "
+                    f"({row['memory_item_id']} @ {row['current_revision_id']})"
+                )
                 if len("\n".join([*lines, line]).encode("utf-8")) > 10_240:
                     break
                 lines.append(line)

@@ -760,6 +760,25 @@ def generate_typescript(openapi: dict[str, Any]) -> str:
                 "",
             ]
         )
+    if (
+        "/api/v1/workspaces/{workspace_id}/turns/{turn_id}/model-deltas"
+        in openapi["paths"]
+    ):
+        lines.extend(
+            [
+                "export function modelDeltaEventStreamUrl(",
+                "  baseUrl: string, workspaceId: string, turnId: string,",
+                "): string {",
+                "  const workspace = encodeURIComponent(workspaceId);",
+                "  const turn = encodeURIComponent(turnId);",
+                (
+                    "  return `${baseUrl}/api/v1/workspaces/${workspace}/turns/"
+                    "${turn}/model-deltas`;"
+                ),
+                "}",
+                "",
+            ]
+        )
     if "/api/v1/workspaces/{workspace_id}/lineage" in openapi["paths"]:
         lines.extend(
             [

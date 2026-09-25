@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -30,12 +31,23 @@ class SentenceTransformerEmbeddingGateway:
         *,
         model_name: str = "intfloat/multilingual-e5-small",
         model_revision: str = "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+        query_prefix: str = "query: ",
+        document_prefix: str = "passage: ",
+        profile_family: str = "e5-prefix-v1",
+        trust_remote_code: bool = False,
         cache_folder: Path | None = None,
         device: str = "cpu",
         batch_size: int = 16,
+        max_sequence_length: int | None = None,
         model: SentenceTransformerModel | None = None,
     ) -> None:
-        if not model_name.strip() or not model_revision.strip() or batch_size < 1:
+        if (
+            not model_name.strip()
+            or not model_revision.strip()
+            or not profile_family.strip()
+            or batch_size < 1
+            or (max_sequence_length is not None and max_sequence_length < 32)
+        ):
             raise ValueError("embedding model configuration is invalid")
         if model is None:
             try:
@@ -53,16 +65,32 @@ class SentenceTransformerEmbeddingGateway:
                     revision=model_revision,
                     cache_folder=None if cache_folder is None else str(cache_folder),
                     device=device,
-                    trust_remote_code=False,
+                    trust_remote_code=trust_remote_code,
                 ),
             )
-        dimension = model.get_embedding_dimension()
+        if max_sequence_length is not None:
+            setattr(model, "max_seq_length", max_sequence_length)
+        # sentence-transformers exposes ``get_sentence_embedding_dimension``.
+        # Keep the older narrow test-double method as a compatibility fallback.
+        dimension_reader = getattr(model, "get_sentence_embedding_dimension", None)
+        dimension = (
+            dimension_reader()
+            if callable(dimension_reader)
+            else model.get_embedding_dimension()
+        )
         if dimension is None or dimension < 1:
             raise ValueError("embedding model did not expose a valid dimension")
         self._model = model
         self._batch_size = batch_size
+        self._query_prefix = query_prefix
+        self._document_prefix = document_prefix
         self._profile = EmbeddingProfile(
-            f"{model_name}@{model_revision}:e5-prefix-v1",
+            f"{model_name}@{model_revision}:{profile_family}"
+            + (
+                ""
+                if max_sequence_length is None
+                else f":max-{max_sequence_length}"
+            ),
             "local_sentence_transformers",
             model_name,
             dimension,
@@ -75,12 +103,12 @@ class SentenceTransformerEmbeddingGateway:
     def embed_documents(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
         if not texts or any(not text.strip() for text in texts):
             raise ValueError("document embeddings require non-empty texts")
-        return self._encode([f"passage: {text}" for text in texts])
+        return self._encode([f"{self._document_prefix}{text}" for text in texts])
 
     def embed_query(self, text: str) -> tuple[float, ...]:
         if not text.strip():
             raise ValueError("query embedding requires non-empty text")
-        return self._encode([f"query: {text}"])[0]
+        return self._encode([f"{self._query_prefix}{text}"])[0]
 
     def _encode(self, texts: list[str]) -> tuple[tuple[float, ...], ...]:
         encoded = self._model.encode(
@@ -91,4 +119,14 @@ class SentenceTransformerEmbeddingGateway:
             normalize_embeddings=True,
         )
         rows = encoded.tolist()
-        return tuple(tuple(float(value) for value in row) for row in rows)
+        normalized_rows: list[tuple[float, ...]] = []
+        for row in rows:
+            values = tuple(float(value) for value in row)
+            norm = math.sqrt(sum(value * value for value in values))
+            if not math.isfinite(norm) or norm == 0:
+                raise ValueError("embedding model returned an invalid vector")
+            # Some fp16 decoder-style models remain outside the authority layer's
+            # strict 1e-3 norm tolerance after library-side normalization. Re-normalize
+            # the serialized float values so every backend satisfies the same contract.
+            normalized_rows.append(tuple(value / norm for value in values))
+        return tuple(normalized_rows)

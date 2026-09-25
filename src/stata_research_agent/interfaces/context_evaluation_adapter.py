@@ -108,7 +108,6 @@ class ContextCompilerEvaluationAdapter:
             compiled = ContextCompiler(
                 _FixedContextAuthority(candidates),
                 input_token_budget=220,
-                summary_token_target=64,
             ).compile(
                 turn_id,
                 static_items=(
@@ -141,6 +140,10 @@ class ContextCompilerEvaluationAdapter:
                 "decisions_cover_sources": len(decisions) == 6,
                 "privacy_fail_closed": self._privacy_fails_closed(turn_id),
                 "mandatory_budget_fail_closed": self._budget_fails_closed(turn_id),
+                "no_lossy_context_replacement": all(
+                    decision.decision_kind != "summarized"
+                    for decision in compiled.decisions
+                ),
             }
             observations = {
                 f"context.{name}" for name, passed in checks.items() if passed

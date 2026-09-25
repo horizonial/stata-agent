@@ -1,0 +1,119 @@
+{
+  "schema_version": "stata-research-agent/rag-bakeoff-spec/v1",
+  "experiment_id": "rag-corporate-finance-bakeoff-v1",
+  "kind": "exploratory",
+  "external_root": "D:/stata-agent-rag-lab",
+  "corpus": {
+    "domain": "corporate finance",
+    "paper_count": 30,
+    "source_policy": "publicly downloadable author, institution, repository, or working-paper copies only",
+    "payload_root": "D:/stata-agent-rag-lab/corpora/corporate-finance-v1"
+  },
+  "invariants": [
+    "Every variant uses the same immutable PDF corpus and reviewed question set.",
+    "Raw run outputs are immutable and live outside the repository on D drive.",
+    "Repository reports contain metrics and provenance, not the PDF payloads or model weights.",
+    "A candidate is not adopted from retrieval quality alone; latency, memory, disk, licensing, and Windows packaging are recorded.",
+    "No run overwrites a completed run directory."
+  ],
+  "phases": [
+    {
+      "phase": "baseline",
+      "parser": "pypdf",
+      "embedding": "intfloat/multilingual-e5-small",
+      "reranker": "deterministic-evidence-reranker/v1",
+      "vector_backend": "sqlite-flat-cosine"
+    },
+    {
+      "phase": "embedding_bakeoff",
+      "candidates": [
+        "BAAI/bge-m3",
+        "Alibaba-NLP/gte-multilingual-base",
+        "Qwen/Qwen3-Embedding-0.6B"
+      ]
+    },
+    {
+      "phase": "reranker_bakeoff",
+      "candidates": [
+        "BAAI/bge-reranker-v2-m3",
+        "Alibaba-NLP/gte-multilingual-reranker-base",
+        "Qwen/Qwen3-Reranker-0.6B"
+      ]
+    },
+    {
+      "phase": "fusion_and_scheduling_bakeoff",
+      "first_stage": "multilingual-E5-small hybrid retrieval",
+      "neural_model": "BAAI/bge-reranker-v2-m3",
+      "candidate_depth": 32,
+      "variants": [
+        {
+          "name": "deterministic_baseline",
+          "neural_trigger": "never"
+        },
+        {
+          "name": "always_on_fusion",
+          "neural_trigger": "always",
+          "weights": {
+            "neural_rank_and_score": 0.55,
+            "deterministic_relevance": 0.25,
+            "first_stage_rank": 0.2
+          }
+        },
+        {
+          "name": "adaptive_fusion",
+          "neural_trigger": "versioned ambiguity and complexity policy",
+          "weights": {
+            "neural_rank_and_score": 0.55,
+            "deterministic_relevance": 0.25,
+            "first_stage_rank": 0.2
+          }
+        }
+      ],
+      "frozen_scheduler": {
+        "maximum_normalized_top_margin": 0.12,
+        "maximum_deterministic_confidence": 0.52,
+        "maximum_abstention_confidence": 0.18,
+        "minimum_rank_disagreement": 6,
+        "minimum_complex_query_tokens": 7
+      },
+      "robustness_contract": [
+        "A neural failure falls back to deterministic ranking for the same query.",
+        "Unscored candidates retain deterministic eligibility rather than disappearing.",
+        "No-answer delivery is controlled by a separate evidence-sufficiency gate."
+      ]
+    },
+    {
+      "phase": "vector_backend_bakeoff",
+      "candidates": [
+        "sqlite-flat-cosine",
+        "sqlite-vec"
+      ]
+    },
+    {
+      "phase": "parser_challenge_set",
+      "candidates": [
+        "pypdf",
+        "docling",
+        "selective-mineru"
+      ],
+      "scope": "representative pages containing tables, equations, multi-column layout, and footnotes"
+    }
+  ],
+  "metrics": [
+    "Hit@k",
+    "Recall@k",
+    "Precision@k",
+    "MRR",
+    "multi-hop evidence-group coverage",
+    "no-answer accuracy",
+    "citation support accuracy",
+    "index build time",
+    "p50/p95 query latency",
+    "neural rerank trigger rate",
+    "useful and harmful top-result change rate",
+    "neural failure fallback rate",
+    "no-answer accuracy and false-abstention rate",
+    "peak RAM/VRAM",
+    "model and index disk size"
+  ]
+}

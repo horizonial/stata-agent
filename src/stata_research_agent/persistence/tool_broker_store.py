@@ -14,10 +14,13 @@ from stata_research_agent.application.tool_broker import (
     ExecutorExceptionOutcome,
     PreparedToolCall,
     RecordExecutorExceptionCommand,
+    RecordToolAdmissionBlockedCommand,
     RegisteredToolContract,
     RegisterToolContractCommand,
     ResourceClaimTemplate,
     ScheduledToolCall,
+    ToolAdmissionBlockedError,
+    ToolAdmissionBlockedOutcome,
     ToolAdmissionIdentity,
     ToolAdmissionOutcome,
     ToolContractDefinition,
@@ -511,11 +514,19 @@ class SqliteToolBrokerRepository:
                 (command.tool_call_id.value,),
             ).fetchone()
             if row is None:
-                raise ValueError("Tool Call is missing or its Dispatch Plan was superseded")
+                raise ToolAdmissionBlockedError(
+                    "call_missing_or_plan_superseded",
+                    "Tool Call is missing or its Dispatch Plan was superseded",
+                )
             if str(row["turn_status"]) != "running":
-                raise ValueError("WAITING/PAUSED/non-running Turn blocks new Tool Admission")
+                raise ToolAdmissionBlockedError(
+                    "turn_not_running",
+                    "WAITING/PAUSED/non-running Turn blocks new Tool Admission",
+                )
             if str(row["proposal_status"]) != "scheduled":
-                raise ValueError("Tool Call is not scheduled for Admission")
+                raise ToolAdmissionBlockedError(
+                    "call_not_scheduled", "Tool Call is not scheduled for Admission"
+                )
             if (
                 connection.execute(
                     """
@@ -526,24 +537,45 @@ class SqliteToolBrokerRepository:
                 ).fetchone()
                 is not None
             ):
-                raise ValueError("user pause intent blocks new Tool Admission")
+                raise ToolAdmissionBlockedError(
+                    "pause_intent_active", "user pause intent blocks new Tool Admission"
+                )
             if int(row["turn_revision"]) != command.expected_turn_revision:
-                raise ValueError("Turn revision changed before JIT Admission")
+                raise ToolAdmissionBlockedError(
+                    "turn_revision_changed", "Turn revision changed before JIT Admission"
+                )
             if str(row["execution_owner"]) == "provider_managed":
-                raise ValueError("provider-managed Tool cannot use local Operation Admission")
+                raise ToolAdmissionBlockedError(
+                    "provider_managed_tool",
+                    "provider-managed Tool cannot use local Operation Admission",
+                )
             if str(row["effect_class"]) not in command.allowed_effect_classes:
-                raise ValueError("current permission policy denies this Tool effect class")
+                raise ToolAdmissionBlockedError(
+                    "effect_class_denied",
+                    "current permission policy denies this Tool effect class",
+                )
             if str(row["confirmation_policy"]) != "never":
-                raise ValueError("Tool Call requires a confirmation decision before Admission")
+                raise ToolAdmissionBlockedError(
+                    "confirmation_required",
+                    "Tool Call requires a confirmation decision before Admission",
+                )
             if int(row["normalization_required"]) == 1 and str(row["effect_class"]) not in {
                 "pure_read",
                 "external_read",
             }:
-                raise ValueError("intake-only Completion Contract blocks side effects")
+                raise ToolAdmissionBlockedError(
+                    "intake_contract_blocks_side_effect",
+                    "intake-only Completion Contract blocks side effects",
+                )
             if str(row["dependency_snapshot_sha256"]) != current_dependency_snapshot_sha256:
-                raise ValueError("Dispatch Plan dependencies changed before Admission")
+                raise ToolAdmissionBlockedError(
+                    "dependency_snapshot_changed",
+                    "Dispatch Plan dependencies changed before Admission",
+                )
             if int(row["used_tool_admissions"]) >= int(row["max_tool_admissions"]):
-                raise ValueError("Turn Tool Admission budget is exhausted")
+                raise ToolAdmissionBlockedError(
+                    "tool_budget_exhausted", "Turn Tool Admission budget is exhausted"
+                )
             repeated_failures = int(
                 connection.execute(
                     """
@@ -574,8 +606,9 @@ class SqliteToolBrokerRepository:
                 ).fetchone()[0]
             )
             if repeated_failures >= int(row["max_same_failure_fingerprint"]):
-                raise ValueError(
-                    "Tool no-progress guard blocks another identical failed call"
+                raise ToolAdmissionBlockedError(
+                    "same_failure_limit_reached",
+                    "Tool no-progress guard blocks another identical failed call",
                 )
             repeated_empty_successes = 0
             if str(row["requested_tool_name"]) == "stata.execute":
@@ -615,8 +648,9 @@ class SqliteToolBrokerRepository:
                     ).fetchone()[0]
                 )
             if repeated_empty_successes >= int(row["max_same_failure_fingerprint"]):
-                raise ValueError(
-                    "Tool no-progress guard blocks another identical empty-success Stata call"
+                raise ToolAdmissionBlockedError(
+                    "empty_success_limit_reached",
+                    "Tool no-progress guard blocks another identical empty-success Stata call",
                 )
             claims = connection.execute(
                 """
@@ -633,7 +667,10 @@ class SqliteToolBrokerRepository:
             current_dependencies = json.loads(current_dependency_snapshot_json)
             resource_identities = current_dependencies.get("resource_identities", {})
             if not isinstance(resource_identities, dict):
-                raise ValueError("dependency snapshot lacks resource identities")
+                raise ToolAdmissionBlockedError(
+                    "resource_identities_missing",
+                    "dependency snapshot lacks resource identities",
+                )
             for claim in claims:
                 expected_identity = str(claim["identity_revision"])
                 if (
@@ -641,7 +678,10 @@ class SqliteToolBrokerRepository:
                     and str(resource_identities.get(str(claim["resource_key"]), ""))
                     != expected_identity
                 ):
-                    raise ValueError("resource identity changed before Admission")
+                    raise ToolAdmissionBlockedError(
+                        "resource_identity_changed",
+                        "resource identity changed before Admission",
+                    )
                 conflicts = connection.execute(
                     """
                     SELECT 1 FROM tool_resource_leases
@@ -652,7 +692,9 @@ class SqliteToolBrokerRepository:
                     (str(claim["resource_key"]), str(claim["access_mode"])),
                 ).fetchone()
                 if conflicts is not None:
-                    raise ValueError("required Tool resource is currently leased")
+                    raise ToolAdmissionBlockedError(
+                        "resource_conflict", "required Tool resource is currently leased"
+                    )
             claims_canonical = canonical_json(
                 {
                     "claims": [
@@ -784,6 +826,80 @@ class SqliteToolBrokerRepository:
             type(identity.operation_id)(str(response["operation_id"])),
             ToolCallId(str(response["tool_call_id"])),
             str(response["status"]),
+            receipt.commit_revision,
+            receipt.replayed,
+        )
+
+    def record_admission_blocked(
+        self, command: RecordToolAdmissionBlockedCommand
+    ) -> ToolAdmissionBlockedOutcome:
+        request = {
+            "turn_id": command.turn_id.value,
+            "tool_call_id": command.tool_call_id.value,
+            "reason_code": command.reason_code,
+        }
+
+        def mutate(connection: sqlite3.Connection, revision: WorkspaceRevision) -> MutationPayload:
+            row = connection.execute(
+                """
+                SELECT call.proposal_status
+                FROM tool_calls AS call
+                JOIN assistant_outputs AS output USING (assistant_output_id)
+                JOIN model_invocations AS invocation USING (model_invocation_id)
+                JOIN steps AS step USING (step_id)
+                WHERE call.tool_call_id = ? AND step.turn_id = ?
+                """,
+                (command.tool_call_id.value, command.turn_id.value),
+            ).fetchone()
+            if row is None:
+                raise ValueError("admission block targets another Turn or missing Tool Call")
+            if str(row["proposal_status"]) != "scheduled":
+                raise ValueError("only a scheduled Tool Call can record an admission block")
+            status_ordinal = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(MAX(status_ordinal), 0) + 1
+                    FROM tool_call_status_history WHERE tool_call_id = ?
+                    """,
+                    (command.tool_call_id.value,),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                """
+                INSERT INTO tool_call_status_history
+                VALUES (?, ?, 'scheduled', ?, ?)
+                """,
+                (
+                    command.tool_call_id.value,
+                    status_ordinal,
+                    command.reason_code,
+                    revision.value,
+                ),
+            )
+            response = dict(request)
+            return MutationPayload(
+                response,
+                (
+                    JournalDraft(
+                        "tool.admission_blocked",
+                        "tool_call",
+                        command.tool_call_id.value,
+                        response,
+                    ),
+                ),
+                (OutboxDraft("tool.admission_blocked", response),),
+            )
+
+        receipt = self._commits.commit_mutation(
+            command_id=command.command_id,
+            command_type="tool.admission_blocked.record",
+            request=request,
+            mutation=mutate,
+        )
+        response = receipt.response
+        return ToolAdmissionBlockedOutcome(
+            ToolCallId(str(response["tool_call_id"])),
+            str(response["reason_code"]),
             receipt.commit_revision,
             receipt.replayed,
         )

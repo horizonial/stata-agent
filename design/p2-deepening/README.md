@@ -3,13 +3,17 @@
 状态：`implemented and covered by release verification`
 日期：2026-09-21
 
-本目录包含五份轻量设计稿，用于在编码前对齐产品行为、技术边界、成功指标和明确不做的事项：
+本目录包含九份设计稿，用于对齐产品行为、技术边界、成功指标和明确不做的事项：
 
 1. [RAG Ingestion v2](01-rag-ingestion-v2.md)
 2. [Adaptive Research Plan](02-adaptive-research-plan.md)
 3. [Product Evaluation Loop](03-product-evaluation-loop.md)
 4. [Runtime Usage & Cost](04-runtime-usage-cost.md)
 5. [Query Planning and Evidence Reranking](05-query-rewrite-rerank.md)
+6. [Fault Investigation and Observability](06-fault-investigation-observability.md)
+7. [External Memory and Context](07-external-memory-context.md)
+8. [RAG Technology Selection Review](08-rag-technology-selection-review.md)
+9. [RAG Runtime Architecture](09-rag-runtime-architecture.md)
 
 ## 共同原则
 

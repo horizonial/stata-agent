@@ -4,7 +4,9 @@ from stata_research_agent.application.knowledge_retrieval import RetrievalMode
 from stata_research_agent.application.retrieval_pipeline import (
     DeterministicEvidenceReranker,
     DeterministicQueryPlanner,
+    EvidenceSufficiencyGate,
     QueryVariantKind,
+    RerankAssessment,
     RerankCandidate,
     select_diverse_evidence,
 )
@@ -82,3 +84,25 @@ def test_evidence_selector_prefers_source_diversity_before_backfill() -> None:
 
     assert len(selected) == 3
     assert "node_4" in {item.node_id for item in selected}
+
+
+def test_evidence_sufficiency_gate_rejects_weak_retrieval() -> None:
+    decision = EvidenceSufficiencyGate().assess(
+        (RerankAssessment("weak-node", 0.15, "background", ("retrieval_prior",)),)
+    )
+
+    assert decision.status == "insufficient_evidence"
+    assert decision.answer_allowed is False
+
+
+def test_evidence_sufficiency_gate_allows_supported_retrieval() -> None:
+    decision = EvidenceSufficiencyGate().assess(
+        (
+            RerankAssessment(
+                "supported-node", 0.72, "direct_support", ("exact_phrase",)
+            ),
+        )
+    )
+
+    assert decision.status == "supported"
+    assert decision.answer_allowed is True

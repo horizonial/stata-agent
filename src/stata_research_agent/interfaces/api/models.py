@@ -654,6 +654,109 @@ class JournalEntryPageResponse(PublicModel):
     newer_matching_entries_available: bool
 
 
+class InvestigationFindingResponse(PublicModel):
+    layer: Literal[
+        "control",
+        "context",
+        "provider",
+        "tool_selection",
+        "tool_admission",
+        "tool_execution",
+        "stata_execution",
+        "evaluation",
+        "recovery",
+    ]
+    code: str
+    severity: Literal["info", "warn", "error"]
+    summary: str
+    object_type: str
+    object_id: str
+    next_query: str
+
+
+class TurnInvestigationData(PublicModel):
+    turn_id: str
+    turn_status: str
+    turn_revision: int = Field(ge=1)
+    last_journal_event_type: str | None
+    last_workspace_revision: int | None = Field(default=None, ge=1)
+    findings: tuple[InvestigationFindingResponse, ...]
+    tool_call_ids: tuple[str, ...]
+    investigation_note: str
+
+
+class TurnInvestigationResponse(PublicModel):
+    schema_version: Literal["1"] = "1"
+    workspace_id: str
+    authoritative_revision: int = Field(ge=0)
+    generated_at: datetime
+    data: TurnInvestigationData
+    resource_refs: tuple[ResourceRef, ...]
+
+
+class ToolStatusObservationResponse(PublicModel):
+    status_ordinal: int = Field(ge=1)
+    proposal_status: str
+    reason_code: str
+    commit_revision: int = Field(ge=1)
+
+
+class ToolOperationTraceResponse(PublicModel):
+    operation_id: str
+    operation_kind: str
+    status: str
+    created_revision: int = Field(ge=1)
+    terminal_revision: int | None = Field(default=None, ge=1)
+    attempts: tuple[dict[str, object], ...]
+
+
+class ToolDecisionTraceData(PublicModel):
+    turn_id: str
+    step_id: str
+    step_ordinal: int = Field(ge=1)
+    context_manifest_id: str
+    model_invocation_id: str
+    model_invocation_status: str
+    provider_attempt_id: str
+    assistant_output_id: str
+    assistant_public_text: str | None
+    tool_call_id: str
+    call_ordinal: int = Field(ge=1)
+    requested_tool_name: str
+    provider_tool_call_id: str | None
+    proposal_status: str
+    raw_arguments_text: str
+    canonical_arguments: dict[str, object] | None
+    normalization_diff: dict[str, object] | None
+    tool_contract_id: str | None
+    tool_version: str | None
+    operation_kind: str | None
+    effect_class: str | None
+    execution_owner: str | None
+    dispatch_plan_id: str | None
+    execution_batch_ordinal: int | None = Field(default=None, ge=1)
+    admission_id: str | None
+    admission_policy_revision: str | None
+    status_history: tuple[ToolStatusObservationResponse, ...]
+    operations: tuple[ToolOperationTraceResponse, ...]
+    result_kind: str | None
+    result_summary: str | None
+    result_payload: object | None
+    artifact_references: tuple[str, ...]
+    evaluation_findings: tuple[dict[str, object], ...]
+    journal_references: tuple[dict[str, object], ...]
+    structural_diagnosis: str
+
+
+class ToolDecisionTraceResponse(PublicModel):
+    schema_version: Literal["1"] = "1"
+    workspace_id: str
+    authoritative_revision: int = Field(ge=0)
+    generated_at: datetime
+    data: ToolDecisionTraceData
+    resource_refs: tuple[ResourceRef, ...]
+
+
 class DurableNotificationResponse(PublicModel):
     event_class: Literal["durable"] = "durable"
     schema_version: Literal["1"] = "1"

@@ -68,7 +68,9 @@ def test_literature_index_prefetch_and_revision_replacement(tmp_path: Path) -> N
         assert hits[0].relative_path == "literature/identification-notes.md"
         assert "Parallel trends" in hits[0].content
 
-        compiled = ContextCompiler(SqliteContextAuthorityReader(connection)).compile(turn.turn_id)
+        compiled = ContextCompiler(SqliteContextAuthorityReader(connection)).compile(
+            turn.turn_id, input_token_budget=96_000
+        )
         kinds = {item.item_kind for item in compiled.items}
         assert {"retrieval_intent_hint", "knowledge_catalog", "knowledge_node"} <= kinds
         chunk = next(item for item in compiled.items if item.item_kind == "knowledge_node")

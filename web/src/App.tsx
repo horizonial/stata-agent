@@ -105,27 +105,26 @@ function ConversationView({
   const activeTurn = snapshot.data.execution.turns.find(
     (turn) => turn.turn_id === snapshot.data.execution.active_write_turn_id,
   );
+  const conversationActiveTurn = activeTurn?.conversation_id === conversationId
+    && activeTurn.status === "running"
+    && snapshot.data.open_waiting_request === null
+    ? activeTurn
+    : undefined;
   return (
     <div className="conversation-view">
       <ConversationDetailView
         workspaceId={snapshot.workspace_id}
         conversationId={conversationId}
         queryRevision={snapshot.authoritative_revision}
+        {...(conversationActiveTurn === undefined
+          ? {}
+          : { activeTurnId: conversationActiveTurn.turn_id })}
       />
       {snapshot.data.open_waiting_request !== null && (
         <article className="waiting-card">
           <div className="eyebrow">等待你的决定</div>
           <h2>{snapshot.data.open_waiting_request.prompt}</h2>
           <p>回答后同一 Turn 将以新的 revision 继续；Waiting 期间仍持有 Workspace 写执行 lane。</p>
-        </article>
-      )}
-      {activeTurn !== undefined && snapshot.data.open_waiting_request === null && (
-        <article className="activity-card">
-          <span className="pulse" />
-          <div>
-            <strong>Agent {activeTurn.status}</strong>
-            <p>Turn {activeTurn.turn_id} · revision {activeTurn.turn_revision}</p>
-          </div>
         </article>
       )}
     </div>

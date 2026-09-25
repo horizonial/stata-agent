@@ -261,11 +261,11 @@
 - ✅ `guide-169` [08-工程化实践/Q10] Streaming 会影响计费或日志吗？
 - ✅ `guide-185` [08-工程化实践/Q26] 小型团队没有 LangSmith，最小可观测方案是什么？
 
-## 🟡 `observability-telemetry` — partial
+## ✅ `observability-telemetry` — verified
 
-证据：`src/stata_research_agent/application/diagnostics.py`、`src/stata_research_agent/interfaces/filesystem_diagnostics.py`
+证据：`src/stata_research_agent/application/diagnostic_tracing.py`、`src/stata_research_agent/interfaces/filesystem_diagnostics.py`、`src/stata_research_agent/interfaces/production_turn_runner.py`、`tests/unit/test_diagnostic_tracing.py`
 
-- 🟡 `guide-177` [08-工程化实践/Q18] OpenTelemetry 在 Agent 里一般打哪些 Span？
+- ✅ `guide-177` [08-工程化实践/Q18] OpenTelemetry 在 Agent 里一般打哪些 Span？
 
 ## 🟡 `streaming-performance` — partial
 

@@ -242,9 +242,15 @@ class _AdmissionFeedbackGateway:
 
 
 class _AdmissionRejectingBroker(_ExceptionBroker):
+    def __init__(self) -> None:
+        self.blocked = None
+
     def admit(self, command) -> ToolAdmissionOutcome:
         del command
         raise ValueError("Tool no-progress guard blocks an identical empty-success call")
+
+    def record_admission_blocked(self, command):
+        self.blocked = command
 
 
 def test_parallel_safe_batch_completes_before_serial_write_barrier() -> None:
@@ -356,9 +362,10 @@ def test_executor_validation_error_is_recorded_and_returned_as_actionable_contex
 
 def test_admission_rejection_returns_feedback_to_model_instead_of_aborting_turn() -> None:
     gateway = _AdmissionFeedbackGateway()
+    broker = _AdmissionRejectingBroker()
     driver = AgentTurnDriver(
         gateway,  # type: ignore[arg-type]
-        _AdmissionRejectingBroker(),  # type: ignore[arg-type]
+        broker,  # type: ignore[arg-type]
         object(),  # type: ignore[arg-type]
         _BarrierExecutor(),
         UuidIdentityGenerator(),
@@ -401,3 +408,5 @@ def test_admission_rejection_returns_feedback_to_model_instead_of_aborting_turn(
     assert outcome.status == "failed"
     assert outcome.tool_executions == 0
     assert gateway.calls == 2
+    assert broker.blocked is not None
+    assert broker.blocked.reason_code == "admission_validation_error"

@@ -38,7 +38,11 @@ from stata_research_agent.interfaces.knowledge_runtime import (
     StataHelpIndexService,
     WorkspaceKnowledgeIndexService,
 )
-from stata_research_agent.interfaces.literature_catalog import discover_stata_help_roots
+from stata_research_agent.interfaces.literature_catalog import (
+    MineruCliParser,
+    PdfPageEscalationPolicy,
+    discover_stata_help_roots,
+)
 from stata_research_agent.interfaces.sentence_transformer_embedding import (
     SentenceTransformerEmbeddingGateway,
 )
@@ -131,6 +135,9 @@ def main() -> int:
         default=Path("verification/corpora/did-methods-v1"),
     )
     parser.add_argument("--workspace-id", default="ws_real_rag_benchmark_v1")
+    parser.add_argument("--mineru-executable", type=Path)
+    parser.add_argument("--mineru-version", default="4.0.4")
+    parser.add_argument("--mineru-minimum-score", type=int, default=3)
     parser.add_argument("--enable-dense", action="store_true")
     parser.add_argument(
         "--embedding-cache",
@@ -153,7 +160,29 @@ def main() -> int:
             CreateWorkspaceCommand(CommandId("cmd_real_rag_benchmark_workspace"), workspace_id)
         )
         repository = SqliteKnowledgeRepository(connection)
-        WorkspaceKnowledgeIndexService(repository, database.root, identities).synchronize()
+        mineru = (
+            None
+            if arguments.mineru_executable is None
+            else MineruCliParser(
+                arguments.mineru_executable,
+                version=arguments.mineru_version,
+                tier="basic",
+                timeout_seconds=3600,
+            )
+        )
+        WorkspaceKnowledgeIndexService(
+            repository,
+            database.root,
+            identities,
+            pdf_parser=mineru,
+            pdf_enrichment_policy=(
+                None
+                if mineru is None
+                else PdfPageEscalationPolicy(
+                    minimum_score=arguments.mineru_minimum_score
+                )
+            ),
+        ).synchronize()
         help_roots = discover_stata_help_roots()
         help_service = StataHelpIndexService(repository, help_roots, identities)
         help_queries = (

@@ -364,20 +364,16 @@ class StdioStataRuntime:
                         f"Artifact staging output already exists: {output.output_slot}"
                     )
                 target.parent.mkdir(parents=True, exist_ok=True)
-            execution_prefix = execution_root.relative_to(self._working_directory)
             arguments["artifact_outputs"] = [
                 {
                     "output_slot": output.output_slot,
                     "relative_staging_path": (
-                        execution_prefix
-                        / (
-                            Path(".stata-agent")
-                            / "staging"
-                            / operation_attempt_id
-                            / output.relative_staging_path
-                            if operation_attempt_id is not None
-                            else Path(output.relative_staging_path)
-                        )
+                        Path(".stata-agent")
+                        / "staging"
+                        / operation_attempt_id
+                        / output.relative_staging_path
+                        if operation_attempt_id is not None
+                        else Path(output.relative_staging_path)
                     ).as_posix(),
                     "artifact_kind": output.artifact_kind,
                     "media_type": output.media_type,

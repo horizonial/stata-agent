@@ -170,6 +170,38 @@ class ImmediateCompletionModel:
         )
 
 
+class AdmissionBlockedThenPartialModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def send(self, *, endpoint: str, request_json: str, credential: str) -> ProviderResponse:
+        del endpoint, credential
+        self.calls += 1
+        if self.calls == 1:
+            return ProviderResponse(
+                {
+                    "text": "I will inspect the data with Stata.",
+                    "tool_calls": [
+                        {
+                            "name": "stata.run",
+                            "arguments": {"session_id": "scope-main", "code": "describe"},
+                        }
+                    ],
+                }
+            )
+        assert "effect_class_denied" in request_json
+        return ProviderResponse(
+            {
+                "text": "The proposed Stata call was not authorized in this Turn.",
+                "tool_calls": [],
+                "completion": {
+                    "disposition": "partial",
+                    "summary": "No Stata execution was authorized.",
+                },
+            }
+        )
+
+
 class MutableClock:
     def __init__(self) -> None:
         self.now = 0.0
@@ -473,6 +505,102 @@ def test_turn_deadline_blocks_new_tool_admission_after_model_returns(tmp_path: P
         assert outcome.tool_executions == 0
         assert connection.execute("SELECT count(*) FROM operations").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM tool_dispatch_plans").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_admission_block_is_durable_and_reaches_next_model_step(tmp_path: Path) -> None:
+    workspace_id = WorkspaceId("ws_agent_admission_block")
+    database = WorkspaceDatabase(tmp_path / "admission-block", workspace_id)
+    database.create()
+    connection = database.open(writable=True)
+    identities = UuidIdentityGenerator()
+    control = WorkspaceControlService(SqliteControlStore(connection), identities)
+    initialized = control.create_workspace(
+        CreateWorkspaceCommand(CommandId("cmd_block_workspace"), workspace_id)
+    )
+    turn = control.submit_message(
+        SubmitMessageCommand(CommandId("cmd_block_turn"), "Inspect auto data")
+    )
+    broker = ToolBrokerService(SqliteToolBrokerRepository(connection), identities)
+    broker.register_contract(
+        RegisterToolContractCommand(
+            CommandId("cmd_block_register_stata"), turn.turn_id, stata_contract()
+        )
+    )
+    driver = AgentTurnDriver(
+        ModelGatewayService(
+            SqliteModelGatewayRepository(connection),
+            identities,
+            Credential(),
+            AdmissionBlockedThenPartialModel(),
+        ),
+        broker,
+        RuntimeEvaluationService(SqliteEvaluationRepository(connection), identities),
+        MustNotExecute(),
+        identities,
+        PYTHON,
+    )
+    outcome = asyncio.run(
+        driver.run(
+            TurnDriverConfig(
+                turn.turn_id,
+                1,
+                workspace_id.value,
+                initialized.main_scope_id.value,
+                initialized.main_path_id.value,
+                TurnDriverModelConfig(
+                    "system-v1",
+                    "You are a traceable Stata research agent.",
+                    "research-main",
+                    "skill-v1",
+                    "Use only authorized tools.",
+                    "catalog-v1",
+                    (
+                        {
+                            "name": "stata.run",
+                            "input_schema": stata_contract().input_schema,
+                        },
+                    ),
+                    "permission-v1",
+                    {},
+                    "model-policy-v1",
+                    "test-provider",
+                    "test",
+                    "test-model",
+                    "https://provider.invalid/responses",
+                    "credential://test",
+                    {},
+                ),
+                (),
+                {"resource_identities": {"stata-session:scope-main": "scope-main"}},
+                (),
+                {},
+                3,
+            )
+        )
+    )
+    try:
+        assert outcome.status == "budget_exhausted"
+        assert outcome.executed_steps >= 2
+        assert outcome.tool_executions == 0
+        assert connection.execute("SELECT count(*) FROM operations").fetchone()[0] == 0
+        blocked = connection.execute(
+            """
+            SELECT proposal_status, reason_code
+            FROM tool_call_status_history
+            ORDER BY status_ordinal DESC LIMIT 1
+            """
+        ).fetchone()
+        assert tuple(blocked) == ("scheduled", "effect_class_denied")
+        journal = connection.execute(
+            """
+            SELECT event_type, json_extract(payload_json, '$.reason_code')
+            FROM journal_entries
+            WHERE event_type = 'tool.admission_blocked'
+            """
+        ).fetchone()
+        assert tuple(journal) == ("tool.admission_blocked", "effect_class_denied")
     finally:
         connection.close()
 

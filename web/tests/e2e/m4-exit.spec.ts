@@ -245,3 +245,48 @@ test("durable cursor gap forces a full authoritative browser resync", async ({ p
   await expect.poll(() => bootstrapCount).toBeGreaterThanOrEqual(2);
   expect(rejectedHead).toBeTruthy();
 });
+
+test("active Turn renders replayed model text as safe live Markdown", async ({ page, request }) => {
+  const workspaceId = `ws_stream_${Date.now()}`;
+  await createWorkspace(request, workspaceId);
+  const chunks = [
+    '{"text":"## Streaming reply\\n\\n- first',
+    '\\n- second\\n\\n<script>window.__streamXss=1</script>","tool_calls":[]}',
+  ];
+  await page.route("**/model-deltas", async (route) => {
+    const url = new URL(route.request().url());
+    const segments = url.pathname.split("/");
+    const workspaceIndex = segments.indexOf("workspaces");
+    const turnIndex = segments.indexOf("turns");
+    const turnId = segments[turnIndex + 1] ?? "turn_unknown";
+    const body = chunks.map((content, index) => {
+      const sequence = index + 1;
+      const payload = JSON.stringify({
+        schema_version: "model-response-delta/v1",
+        authoritative: false,
+        workspace_id: segments[workspaceIndex + 1],
+        turn_id: turnId,
+        provider_attempt_id: "pa_browser_stream",
+        sequence,
+        channel: "provider_content",
+        content,
+      });
+      return `id: pa_browser_stream:${sequence}\nevent: model_delta\ndata: ${payload}\n\n`;
+    }).join("");
+    await route.fulfill({ status: 200, contentType: "text/event-stream", body });
+  });
+
+  await page.goto(`/?workspace=${workspaceId}`);
+  await expect(page.locator(".workspace-header .eyebrow")).toHaveText(workspaceId);
+  await submitInstruction(page, "你好，请用 Markdown 回答");
+
+  const live = page.locator(".streaming-message");
+  await expect(live).toBeVisible();
+  await expect(live.getByRole("heading", { name: "Streaming reply" })).toBeVisible();
+  await expect(live.locator("li")).toHaveText(["first", "second"]);
+  await expect(live).not.toContainText("tool_calls");
+  await expect(live.locator("script")).toHaveCount(0);
+  expect(await page.evaluate(() => (window as unknown as Record<string, unknown>).__streamXss)).toBeUndefined();
+  await page.waitForTimeout(1_200);
+  await expect(live.locator("li")).toHaveText(["first", "second"]);
+});

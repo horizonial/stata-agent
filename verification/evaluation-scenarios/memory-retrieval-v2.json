@@ -1,0 +1,97 @@
+{
+  "schema_version": "stata-research-agent.evaluation-scenario/v1",
+  "scenario_id": "agent.memory.retrieval",
+  "revision": 2,
+  "title": "Project Memory recommendation, temporal correction, and exact recall",
+  "suite": "regression",
+  "split": "development",
+  "level": "subsystem",
+  "subsystem_mode": "intrinsic",
+  "subsystems": ["memory", "context", "retrieval"],
+  "tags": ["hybrid-retrieval", "supersession", "path-isolation", "exact-open", "abstention"],
+  "interaction_mode": "autonomous",
+  "initial_user_message": "Evaluate long-horizon Project Memory retrieval without replacing exact history with summaries.",
+  "fixtures": [
+    {
+      "fixture_id": "memory-retrieval-core-v2",
+      "role": "hidden_gold_dataset",
+      "locator": "verification/memory-retrieval-gold.v2.json",
+      "media_type": "application/json",
+      "sha256": "3abe329f64b6406199e3de308d3376269bea681f18ccdcedc50ab85d3c95f20f"
+    }
+  ],
+  "interaction": [
+    {
+      "event_id": "evaluate-search",
+      "event_kind": "evaluation_instruction",
+      "content": "Run lexical and hybrid retrieval cases against exact current Memory revisions."
+    },
+    {
+      "event_id": "verify-open",
+      "event_kind": "evaluation_instruction",
+      "content": "Open every expected hit from its immutable revision file and verify its identity and content."
+    }
+  ],
+  "faults": [],
+  "required_outcomes": [
+    "memory.retrieval.recall_complete",
+    "memory.retrieval.irrelevant_silent",
+    "memory.retrieval.supersession_forwarded",
+    "memory.retrieval.cross_path_isolated",
+    "memory.retrieval.exact_open_verified",
+    "memory.retrieval.tampered_open_rejected",
+    "memory.retrieval.hybrid_semantic_gain",
+    "memory.retrieval.source_neighbor_expanded"
+  ],
+  "forbidden_outcomes": [
+    "memory.retrieval.stale_returned",
+    "memory.retrieval.cross_path_leak",
+    "memory.retrieval.fabricated_hit",
+    "memory.retrieval.tampered_open_accepted"
+  ],
+  "permitted_freedom": [
+    "Non-relevant candidate ordering may vary when all hard retrieval and isolation outcomes remain satisfied.",
+    "Retrieval scores may change across ranking-policy revisions; stable identities and case metrics are authoritative."
+  ],
+  "graders": [
+    {
+      "grader_id": "core.observation_contract",
+      "kind": "invariant",
+      "role": "hard_gate",
+      "revision": "observation-contract/v1",
+      "required": true,
+      "config": {}
+    },
+    {
+      "grader_id": "memory.retrieval_quality",
+      "kind": "outcome",
+      "role": "quality",
+      "revision": "memory-retrieval/v2",
+      "required": true,
+      "config": {
+        "minimum_recall_at_k": 1.0,
+        "minimum_mrr": 1.0,
+        "minimum_irrelevant_silence_rate": 1.0,
+        "minimum_supersession_forwarding_accuracy": 1.0,
+        "minimum_cross_path_precision": 1.0,
+        "minimum_exact_open_accuracy": 1.0,
+        "minimum_hybrid_semantic_recall": 1.0,
+        "minimum_source_neighbor_recall": 1.0,
+        "minimum_tampered_open_rejection_rate": 1.0
+      }
+    }
+  ],
+  "trial_policy": {
+    "trials": 3,
+    "reliability_k": 3,
+    "max_steps": 16,
+    "max_tool_calls": 24,
+    "max_provider_attempts": 1,
+    "max_wall_clock_seconds": 120
+  },
+  "reference": {
+    "status": "verified",
+    "locator": "verification/memory-retrieval-gold.v2.json",
+    "sha256": "3abe329f64b6406199e3de308d3376269bea681f18ccdcedc50ab85d3c95f20f"
+  }
+}

@@ -177,6 +177,39 @@ class FilesystemMemoryStore:
     def current_relative_path(self, row: sqlite3.Row) -> str:
         return self._current_path(row).relative_to(self._workspace_root).as_posix()
 
+    def read_revision_content(
+        self,
+        relative_path: str,
+        *,
+        expected_memory_item_id: str,
+        expected_memory_revision_id: str,
+        expected_content_sha256: str,
+        expected_payload_sha256: str,
+        expected_size_bytes: int,
+    ) -> tuple[str, str]:
+        """Read an exact immutable revision payload through the managed filesystem."""
+
+        path = self._contained(self._workspace_root / relative_path)
+        try:
+            payload = path.read_bytes()
+            text = payload.decode("utf-8")
+        except (OSError, UnicodeError):
+            raise ValueError("Memory revision file is missing, corrupt, or unreadable") from None
+        if len(payload) != expected_size_bytes or _sha256_bytes(payload) != expected_payload_sha256:
+            raise ValueError("Memory revision file payload does not match the ledger")
+        parsed = self._parse_text(text)
+        if parsed is None:
+            raise ValueError("Memory revision file is missing, corrupt, or unreadable")
+        memory_item_id, memory_revision_id, title, content = parsed
+        if (
+            memory_item_id != expected_memory_item_id
+            or memory_revision_id != expected_memory_revision_id
+        ):
+            raise ValueError("Memory revision file identity does not match the ledger")
+        if hashlib.sha256(content.encode("utf-8")).hexdigest() != expected_content_sha256:
+            raise ValueError("Memory revision content does not match the ledger")
+        return title, content
+
     def _revision_path(self, revision_id: str) -> Path:
         if not revision_id.startswith("memoryrev_") or any(
             char in revision_id for char in ("/", "\\", ".")
@@ -236,6 +269,10 @@ class FilesystemMemoryStore:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             return None
+        return FilesystemMemoryStore._parse_text(text)
+
+    @staticmethod
+    def _parse_text(text: str) -> tuple[str, str, str, str] | None:
         if not text.startswith("---\n") or "\n---\n" not in text[4:]:
             return None
         metadata_text, body = text[4:].split("\n---\n", 1)
@@ -322,22 +359,9 @@ class FilesystemMemoryStore:
         self._atomic_write(
             self.root / "MEMORY.md", ("\n".join(index_lines).rstrip() + "\n").encode("utf-8")
         )
-        summary_lines = [
-            "# Memory Summary",
-            "",
-            "Navigation only; not Evidence or current Research State.",
-            "",
-        ]
-        for row in (item for item in active if str(item["access_tier"]) == "hot"):
-            line = f"- [{row['memory_kind']}] {row['title']}: {row['content']}"
-            candidate = "\n".join([*summary_lines, line]).encode("utf-8")
-            if len(candidate) > 4096:
-                break
-            summary_lines.append(line)
-        self._atomic_write(
-            self.root / "memory_summary.md",
-            ("\n".join(summary_lines).rstrip() + "\n").encode("utf-8"),
-        )
+        # No lossy Memory summary is generated. MEMORY.md is a reference-only catalog;
+        # exact immutable revision files remain the sole filesystem payloads consumed by
+        # memory.open and Context materialization.
 
     @staticmethod
     def _atomic_write(path: Path, payload: bytes) -> None:

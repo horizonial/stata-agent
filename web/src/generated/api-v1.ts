@@ -273,6 +273,16 @@ export type HTTPValidationError = {
   readonly "detail"?: ReadonlyArray<ValidationError>;
 };
 
+export type InvestigationFindingResponse = {
+  readonly "code": string;
+  readonly "layer": "control" | "context" | "provider" | "tool_selection" | "tool_admission" | "tool_execution" | "stata_execution" | "evaluation" | "recovery";
+  readonly "next_query": string;
+  readonly "object_id": string;
+  readonly "object_type": string;
+  readonly "severity": "info" | "warn" | "error";
+  readonly "summary": string;
+};
+
 export type JournalEntryPageResponse = {
   readonly "as_of_workspace_revision": number;
   readonly "authoritative_revision": number;
@@ -916,6 +926,62 @@ export type SkillVersionResponse = {
   readonly "version_label": string;
 };
 
+export type ToolDecisionTraceData = {
+  readonly "admission_id": string | null;
+  readonly "admission_policy_revision": string | null;
+  readonly "artifact_references": ReadonlyArray<string>;
+  readonly "assistant_output_id": string;
+  readonly "assistant_public_text": string | null;
+  readonly "call_ordinal": number;
+  readonly "canonical_arguments": Readonly<Record<string, unknown>> | null;
+  readonly "context_manifest_id": string;
+  readonly "dispatch_plan_id": string | null;
+  readonly "effect_class": string | null;
+  readonly "evaluation_findings": ReadonlyArray<Readonly<Record<string, unknown>>>;
+  readonly "execution_batch_ordinal"?: number | null;
+  readonly "execution_owner": string | null;
+  readonly "journal_references": ReadonlyArray<Readonly<Record<string, unknown>>>;
+  readonly "model_invocation_id": string;
+  readonly "model_invocation_status": string;
+  readonly "normalization_diff": Readonly<Record<string, unknown>> | null;
+  readonly "operation_kind": string | null;
+  readonly "operations": ReadonlyArray<ToolOperationTraceResponse>;
+  readonly "proposal_status": string;
+  readonly "provider_attempt_id": string;
+  readonly "provider_tool_call_id": string | null;
+  readonly "raw_arguments_text": string;
+  readonly "requested_tool_name": string;
+  readonly "result_kind": string | null;
+  readonly "result_payload": unknown | null;
+  readonly "result_summary": string | null;
+  readonly "status_history": ReadonlyArray<ToolStatusObservationResponse>;
+  readonly "step_id": string;
+  readonly "step_ordinal": number;
+  readonly "structural_diagnosis": string;
+  readonly "tool_call_id": string;
+  readonly "tool_contract_id": string | null;
+  readonly "tool_version": string | null;
+  readonly "turn_id": string;
+};
+
+export type ToolDecisionTraceResponse = {
+  readonly "authoritative_revision": number;
+  readonly "data": ToolDecisionTraceData;
+  readonly "generated_at": string;
+  readonly "resource_refs": ReadonlyArray<ResourceRef>;
+  readonly "schema_version"?: "1";
+  readonly "workspace_id": string;
+};
+
+export type ToolOperationTraceResponse = {
+  readonly "attempts": ReadonlyArray<Readonly<Record<string, unknown>>>;
+  readonly "created_revision": number;
+  readonly "operation_id": string;
+  readonly "operation_kind": string;
+  readonly "status": string;
+  readonly "terminal_revision"?: number | null;
+};
+
 export type ToolOperationUsageResponse = {
   readonly "attempt_count": number;
   readonly "observed_duration_seconds"?: number | null;
@@ -924,6 +990,33 @@ export type ToolOperationUsageResponse = {
   readonly "status": string;
   readonly "tool_call_id"?: string | null;
   readonly "tool_name"?: string | null;
+};
+
+export type ToolStatusObservationResponse = {
+  readonly "commit_revision": number;
+  readonly "proposal_status": string;
+  readonly "reason_code": string;
+  readonly "status_ordinal": number;
+};
+
+export type TurnInvestigationData = {
+  readonly "findings": ReadonlyArray<InvestigationFindingResponse>;
+  readonly "investigation_note": string;
+  readonly "last_journal_event_type": string | null;
+  readonly "last_workspace_revision"?: number | null;
+  readonly "tool_call_ids": ReadonlyArray<string>;
+  readonly "turn_id": string;
+  readonly "turn_revision": number;
+  readonly "turn_status": string;
+};
+
+export type TurnInvestigationResponse = {
+  readonly "authoritative_revision": number;
+  readonly "data": TurnInvestigationData;
+  readonly "generated_at": string;
+  readonly "resource_refs": ReadonlyArray<ResourceRef>;
+  readonly "schema_version"?: "1";
+  readonly "workspace_id": string;
 };
 
 export type TurnOperationalEvaluationData = {
@@ -1301,8 +1394,10 @@ export const API_V1_PATHS = [
   "/api/v1/workspaces/{workspace_id}/skills/{skill_name}/rollback",
   "/api/v1/workspaces/{workspace_id}/stream-head",
   "/api/v1/workspaces/{workspace_id}/turns/{turn_id}/evaluation",
+  "/api/v1/workspaces/{workspace_id}/turns/{turn_id}/investigation",
   "/api/v1/workspaces/{workspace_id}/turns/{turn_id}/model-deltas",
   "/api/v1/workspaces/{workspace_id}/turns/{turn_id}/outcome-feedback",
+  "/api/v1/workspaces/{workspace_id}/turns/{turn_id}/tool-decisions/{tool_call_id}",
   "/api/v1/workspaces/{workspace_id}/turns/{turn_id}/usage",
 ] as const;
 
@@ -1679,6 +1774,14 @@ export function workspaceEventStreamUrl(
   const workspace = encodeURIComponent(workspaceId);
   const query = new URLSearchParams({ after });
   return `${baseUrl}/api/v1/workspaces/${workspace}/events?${query.toString()}`;
+}
+
+export function modelDeltaEventStreamUrl(
+  baseUrl: string, workspaceId: string, turnId: string,
+): string {
+  const workspace = encodeURIComponent(workspaceId);
+  const turn = encodeURIComponent(turnId);
+  return `${baseUrl}/api/v1/workspaces/${workspace}/turns/${turn}/model-deltas`;
 }
 
 export async function getEvidenceLineage(

@@ -70,6 +70,19 @@ def test_workspace_stream_is_notification_plus_query_not_a_fact_reducer() -> Non
         assert forbidden not in shell
 
 
+def test_live_model_stream_uses_generated_url_and_remains_non_authoritative() -> None:
+    sources = browser_authored_sources()
+    stream = sources["browser/model-delta-stream.ts"]
+    generated = (WEB_SOURCE / "generated" / "api-v1.ts").read_text(encoding="utf-8")
+    assert "modelDeltaEventStreamUrl" in generated
+    assert "modelDeltaEventStreamUrl" in stream
+    assert "ReconnectingApiEventStream" in stream
+    assert 'event.event !== "model_delta"' in stream
+    assert "authoritative !== false" in stream
+    for forbidden in ("fetch(", "/api/v1/", "new EventSource", "dangerouslySetInnerHTML"):
+        assert forbidden not in stream
+
+
 def test_browser_session_is_exchanged_once_and_kept_only_in_generated_module_memory() -> None:
     sources = browser_authored_sources()
     session = sources["browser/session.ts"]

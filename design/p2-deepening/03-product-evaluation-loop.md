@@ -320,7 +320,7 @@ Word/Table Claim
 - 无足够证据时的 abstention；
 - Stata Help 检索是否真实帮助修复执行；
 - 文献检索是否进入方案建议但不越过用户判断；
-- 长对话压缩后用户决定、Research State 和修正后的 Memory 是否仍正确；
+- 长对话跨窗口后，外部原始记录、用户决定、Research State 和修正后的 Memory 是否仍正确；
 - 被纠正或过期的 Memory 不得重新激活为当前事实。
 
 ### 6.7 Efficiency and Reliability
@@ -727,7 +727,7 @@ Operational Evaluation 主链已经完成第一条可运行纵切：
 - Project Memory intrinsic adapter；
 - canonical RAG intrinsic adapter，覆盖单跳、真实两跳 Retrieval Session、corpus-role
   isolation、固定 no-answer abstention 和报告防篡改；
-- Context Compiler intrinsic adapter，覆盖去重、优先级、预算、压缩决策、remote/local
+- Context Compiler intrinsic adapter，覆盖去重、优先级、动态预算、外部原文装载、remote/local
   privacy boundary 和 mandatory fail-closed；
 - 当前冻结的三子系统 Experiment 共运行 9 个隔离 Trial。
 - 真实公开论文复现集已建立三层合同：certified execution baseline、Agent

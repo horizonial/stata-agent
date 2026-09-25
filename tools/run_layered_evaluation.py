@@ -29,6 +29,10 @@ from stata_research_agent.interfaces.memory_evaluation_adapter import (
     MemoryCorrectionEvaluationAdapter,
     MemoryIntrinsicQualityGrader,
 )
+from stata_research_agent.interfaces.memory_retrieval_evaluation_adapter import (
+    MemoryRetrievalEvaluationAdapter,
+    MemoryRetrievalQualityGrader,
+)
 from stata_research_agent.interfaces.product_evaluation_runner import (
     FilesystemEvaluationRunStore,
     ProductEvaluationTrialRunner,
@@ -45,6 +49,7 @@ from stata_research_agent.interfaces.trajectory_evaluation_adapter import (
 ROOT = Path(__file__).resolve().parents[1]
 SCENARIOS = (
     ROOT / "verification/evaluation-scenarios/memory-correction-v1.json",
+    ROOT / "verification/evaluation-scenarios/memory-retrieval-v2.json",
     ROOT / "verification/evaluation-scenarios/rag-corpus-isolation-v1.json",
     ROOT / "verification/evaluation-scenarios/context-compiler-v1.json",
     ROOT / "verification/evaluation-scenarios/turn-loop-stop-guard-success-v1.json",
@@ -80,27 +85,67 @@ def _case_metrics(experiment_root: Path, scenario_id: str) -> dict[str, Any]:
 
 
 def _l1_report(experiment_root: Path) -> dict[str, Any]:
-    memory = _trial_reports(experiment_root, "memory-report.json")
+    memory_correction = _trial_reports(experiment_root, "memory-report.json")
+    memory_retrieval = _trial_reports(experiment_root, "memory-retrieval-report.json")
     rag = _trial_reports(experiment_root, "rag-report.json")
     context = _trial_reports(experiment_root, "context-report.json")
     evaluated = {
         "memory": {
             "status": "partial",
             "evaluated_case_status": "pass",
-            "coverage_note": "one intrinsic correction case; no extrinsic ablation yet",
-            "trials": len(memory),
-            "pass_at_1": _case_metrics(experiment_root, "agent.memory.correction")["pass_at_1"],
-            "pass_power_k": _case_metrics(experiment_root, "agent.memory.correction")[
-                "pass_power_k"
-            ],
-            "metrics": {
-                key: _mean([float(item["metrics"][key]) for item in memory])
-                for key in (
-                    "activation_precision",
-                    "source_accuracy",
-                    "stale_suppression_rate",
-                    "false_active_memory_count",
-                )
+            "coverage_note": (
+                "intrinsic correction plus recommendation retrieval, exact-open, temporal, "
+                "scope-isolation, semantic and abstention cases; no extrinsic agent ablation yet"
+            ),
+            "trials": len(memory_correction) + len(memory_retrieval),
+            "correction": {
+                "pass_at_1": _case_metrics(experiment_root, "agent.memory.correction")[
+                    "pass_at_1"
+                ],
+                "pass_power_k": _case_metrics(
+                    experiment_root, "agent.memory.correction"
+                )["pass_power_k"],
+                "metrics": {
+                    key: _mean(
+                        [float(item["metrics"][key]) for item in memory_correction]
+                    )
+                    for key in (
+                        "activation_precision",
+                        "source_accuracy",
+                        "stale_suppression_rate",
+                        "false_active_memory_count",
+                    )
+                },
+            },
+            "retrieval": {
+                "pass_at_1": _case_metrics(experiment_root, "agent.memory.retrieval")[
+                    "pass_at_1"
+                ],
+                "pass_power_k": _case_metrics(
+                    experiment_root, "agent.memory.retrieval"
+                )["pass_power_k"],
+                "metrics": {
+                    key: _mean(
+                        [float(item["metrics"][key]) for item in memory_retrieval]
+                    )
+                    for key in (
+                        "recall_at_k",
+                        "recall_at_1",
+                        "recall_at_3",
+                        "recall_at_5",
+                        "mean_reciprocal_rank",
+                        "irrelevant_silence_rate",
+                        "supersession_forwarding_accuracy",
+                        "cross_path_precision",
+                        "exact_open_accuracy",
+                        "hybrid_semantic_recall",
+                        "lexical_semantic_recall",
+                        "hybrid_semantic_gain",
+                        "source_neighbor_recall",
+                        "tampered_open_rejection_rate",
+                        "mean_search_latency_ms",
+                    )
+                },
             },
         },
         "rag": {
@@ -296,6 +341,7 @@ def main() -> int:
             (
                 ObservationContractGrader(),
                 MemoryIntrinsicQualityGrader(),
+                MemoryRetrievalQualityGrader(),
                 RagRetrievalReportGrader(),
                 ContextCompilerReportGrader(),
                 TurnLoopTrajectoryGrader(),
@@ -303,6 +349,7 @@ def main() -> int:
         ),
         (
             MemoryCorrectionEvaluationAdapter(),
+            MemoryRetrievalEvaluationAdapter(),
             RagIntrinsicEvaluationAdapter(ROOT),
             ContextCompilerEvaluationAdapter(ROOT),
             TurnLoopTrajectoryEvaluationAdapter(ROOT, python),

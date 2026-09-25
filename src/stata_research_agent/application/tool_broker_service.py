@@ -32,15 +32,18 @@ from .tool_broker import (
     ExecutorExceptionOutcome,
     PreparedToolCall,
     RecordExecutorExceptionCommand,
+    RecordToolAdmissionBlockedCommand,
     RegisteredToolContract,
     RegisterToolContractCommand,
     ResolvedResourceClaim,
+    ToolAdmissionBlockedOutcome,
     ToolAdmissionIdentity,
     ToolAdmissionOutcome,
     ToolContractDefinition,
 )
 
 _TOOL_NAME = re.compile(r"^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+$")
+_REASON_CODE = re.compile(r"^[a-z][a-z0-9_]{2,127}$")
 
 
 def _canonical_json(value: Mapping[str, Any]) -> str:
@@ -201,6 +204,13 @@ class ToolBrokerService:
         if not command.error_kind.strip():
             raise ValueError("executor exception kind is required")
         return self._repository.record_executor_exception(command)
+
+    def record_admission_blocked(
+        self, command: RecordToolAdmissionBlockedCommand
+    ) -> ToolAdmissionBlockedOutcome:
+        if _REASON_CODE.fullmatch(command.reason_code) is None:
+            raise ValueError("admission reason code must be a stable lowercase token")
+        return self._repository.record_admission_blocked(command)
 
     @staticmethod
     def _contract_json(definition: ToolContractDefinition) -> str:

@@ -1,0 +1,828 @@
+{
+  "schema_version": "rag-real-questions/v1",
+  "fixed_no_answer": "未在当前知识库中找到足够证据，无法回答。",
+  "cases": [
+    {
+      "case_id": "single-01-fazzari-hubbard-petersen-1987",
+      "mode": "single_hop",
+      "question": "融资约束为什么会使企业投资对内部现金流更加敏感？",
+      "retrieval_query": "financing constraints internal finance investment cash flow sensitivity",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/01-financing-constraints-and-corporate-investment.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_1",
+          "support_markers": [
+            "Financing"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-02-almeida-campello-2006",
+      "mode": "single_hop",
+      "question": "资产可抵押性怎样放大受融资约束企业的投资能力？",
+      "retrieval_query": "financial constraints asset tangibility credit multiplier corporate investment",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/02-financial-constraints-asset-tangibility-and-corporate-inve.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_2",
+          "support_markers": [
+            "Financial"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-03-almeida-campello-weisbach-2006",
+      "mode": "single_hop",
+      "question": "未来融资并不顺畅时，企业为什么会偏向回收期更短、更安全、更易抵押的项目？",
+      "retrieval_query": "future financing constraints short payback safer liquid pledgeable investments",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/03-corporate-financial-and-investment-policies-when-future-fi.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_3",
+          "support_markers": [
+            "Corporate"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-04-rauh-sufi-2008",
+      "mode": "single_hop",
+      "question": "为什么分析资本结构时不能只看债务总量，还要拆解银行贷款、债券和其他债务工具？",
+      "retrieval_query": "capital structure debt structure bank debt bonds composition",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/04-capital-structure-and-debt-structure.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_4",
+          "support_markers": [
+            "Capital"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-05-faulkender-petersen-2003",
+      "mode": "single_hop",
+      "question": "企业是否能进入公开债券市场，会怎样影响杠杆率？",
+      "retrieval_query": "source of capital public debt market access leverage capital structure",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/05-does-the-source-of-capital-affect-capital-structure.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_5",
+          "support_markers": [
+            "Does"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-06-chen-2010",
+      "mode": "single_hop",
+      "question": "宏观经济状态怎样同时影响信用利差与最优资本结构？",
+      "retrieval_query": "macroeconomic conditions credit spreads capital structure business cycle",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/06-macroeconomic-conditions-and-the-puzzles-of-credit-spreads.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_6",
+          "support_markers": [
+            "Macroeconomic"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-07-longstaff-strebulaev-2014",
+      "mode": "single_hop",
+      "question": "从长期历史看，公司税变化如何影响杠杆选择？",
+      "retrieval_query": "corporate taxes capital structure long-term historical perspective leverage",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/07-corporate-taxes-and-capital-structure-a-long-term-historic.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_7",
+          "support_markers": [
+            "Corporate"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-08-greenwood-hanson-stein-2008",
+      "mode": "single_hop",
+      "question": "企业债务期限是否会填补政府债务期限供给留下的缺口？",
+      "retrieval_query": "gap filling corporate debt maturity government debt supply",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/08-a-gap-filling-theory-of-corporate-debt-maturity-choice.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_8",
+          "support_markers": [
+            "A"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-09-diamond-he-2012",
+      "mode": "single_hop",
+      "question": "短债和长债在缓解或加剧债务悬置问题上有什么差异？",
+      "retrieval_query": "long and short debt maturity debt overhang investment",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/09-a-theory-of-debt-maturity-the-long-and-short-of-debt-overh.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_9",
+          "support_markers": [
+            "A"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-10-he-milbradt-2016",
+      "mode": "single_hop",
+      "question": "债务到期选择与二级市场流动性之间如何形成动态反馈？",
+      "retrieval_query": "dynamic debt maturity secondary market liquidity rollover",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/10-dynamic-debt-maturity.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_10",
+          "support_markers": [
+            "Dynamic"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-11-chen-xu-yang-2012",
+      "mode": "single_hop",
+      "question": "系统性风险如何影响债务期限和信用利差期限结构？",
+      "retrieval_query": "systematic risk debt maturity term structure credit spreads",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/11-systematic-risk-debt-maturity-and-the-term-structure-of-cr.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_11",
+          "support_markers": [
+            "Systematic"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-12-kaplan-zingales-1995",
+      "mode": "single_hop",
+      "question": "投资—现金流敏感性为什么不一定意味着企业受到更强融资约束？",
+      "retrieval_query": "investment cash flow sensitivity measure financing constraints Kaplan Zingales",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/12-do-financing-constraints-explain-why-investment-is-correla.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_12",
+          "support_markers": [
+            "Do"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-13-gomes-yaron-zhang-2002",
+      "mode": "single_hop",
+      "question": "融资约束进入投资型资产定价模型后，对预期收益横截面有何影响？",
+      "retrieval_query": "asset pricing implications firms financing constraints external finance premium",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/13-asset-pricing-implications-of-firms-financing-constraints.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_13",
+          "support_markers": [
+            "Asset"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-14-baker-stein-wurgler-2002",
+      "mode": "single_hop",
+      "question": "依赖股权融资的企业为什么更可能根据股票价格调整投资？",
+      "retrieval_query": "stock prices investment equity-dependent firms market timing",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/14-when-does-the-market-matter-stock-prices-and-the-investmen.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_14",
+          "support_markers": [
+            "When"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-15-cloyne-ferreira-froemel-surico-2018",
+      "mode": "single_hop",
+      "question": "货币政策收紧为什么对年轻且不分红企业的投资冲击更大？",
+      "retrieval_query": "monetary policy corporate finance investment young non-dividend firms",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/15-monetary-policy-corporate-finance-and-investment.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_15",
+          "support_markers": [
+            "Monetary"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-16-bolton-chen-wang-2011",
+      "mode": "single_hop",
+      "question": "市场择时、投资和风险管理应如何在动态融资决策中联合考虑？",
+      "retrieval_query": "market timing investment risk management dynamic corporate finance",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/16-market-timing-investment-and-risk-management.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_16",
+          "support_markers": [
+            "Market"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-17-bates-kahle-stulz-2006",
+      "mode": "single_hop",
+      "question": "美国企业现金比率为何长期上升，研发密集度和无形资产起了什么作用？",
+      "retrieval_query": "why US firms hold more cash cash ratio research development intangible assets",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/17-why-do-u-s-firms-hold-so-much-more-cash-than-they-used-to.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_17",
+          "support_markers": [
+            "Why"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-18-opler-pinkowitz-stulz-williamson-1997",
+      "mode": "single_hop",
+      "question": "增长机会、现金流风险和资本市场可及性如何决定企业现金持有？",
+      "retrieval_query": "determinants corporate cash holdings growth opportunities risky cash flows capital markets",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/18-the-determinants-and-implications-of-corporate-cash-holdin.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_18",
+          "support_markers": [
+            "The"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-19-begenau-palazzo-2017",
+      "mode": "single_hop",
+      "question": "上市企业样本构成变化如何解释总体现金持有的上升？",
+      "retrieval_query": "firm selection corporate cash holdings entrants R&D profitability growth",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/19-firm-selection-and-corporate-cash-holdings.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_19",
+          "support_markers": [
+            "Firm"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-20-erel-jang-minton-weisbach-2017",
+      "mode": "single_hop",
+      "question": "现金储备如何改变企业并购对宏观经济状况的敏感度？",
+      "retrieval_query": "corporate liquidity acquisitions macroeconomic conditions cash holdings",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/20-corporate-liquidity-acquisitions-and-macroeconomic-conditi.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_20",
+          "support_markers": [
+            "Corporate"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-21-brav-graham-harvey-michaely-2003",
+      "mode": "single_hop",
+      "question": "管理者如何在分红稳定性与股票回购灵活性之间权衡？",
+      "retrieval_query": "payout policy reluctant cut dividends flexible share repurchases managers",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/21-payout-policy-in-the-21st-century.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_21",
+          "support_markers": [
+            "Payout"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-22-blouin-raedy-shackelford-2010",
+      "mode": "single_hop",
+      "question": "股息税和资本利得税变化如何影响股利、回购与投资者持股？",
+      "retrieval_query": "dividends share repurchases tax clienteles shareholder tax reduction",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/22-dividends-share-repurchases-and-tax-clienteles.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_22",
+          "support_markers": [
+            "Dividends,"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-23-baker-wurgler-2012",
+      "mode": "single_hop",
+      "question": "把历史股息当作参照点，如何解释管理者不愿削减股息？",
+      "retrieval_query": "dividends reference points behavioral signaling loss aversion managers",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/23-dividends-as-reference-points-a-behavioral-signaling-appro.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_23",
+          "support_markers": [
+            "Dividends"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-24-ikenberry-lakonishok-vermaelen-1994",
+      "mode": "single_hop",
+      "question": "公开市场股票回购后，市场是否会低估长期信息？",
+      "retrieval_query": "market underreaction open market share repurchases long-run returns",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/24-market-underreaction-to-open-market-share-repurchases.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_24",
+          "support_markers": [
+            "Market"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-25-ye-zheng-li-2020",
+      "mode": "single_hop",
+      "question": "回购价格上限和市场微观结构改革怎样影响企业回购？",
+      "retrieval_query": "price ceiling market structure reforms payout policies share repurchases",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/25-price-ceiling-market-structure-and-payout-policies.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_25",
+          "support_markers": [
+            "Price"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-26-zingales-1997",
+      "mode": "single_hop",
+      "question": "不完全契约视角下，公司治理到底在分配什么权利？",
+      "retrieval_query": "corporate governance incomplete contracts control rights firm",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/26-corporate-governance.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_26",
+          "support_markers": [
+            "Corporate"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-27-morck-wolfenzon-yeung-2004",
+      "mode": "single_hop",
+      "question": "家族控制与经济固守如何影响资本配置和经济增长？",
+      "retrieval_query": "corporate governance economic entrenchment family control growth",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/27-corporate-governance-economic-entrenchment-and-growth.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_27",
+          "support_markers": [
+            "Corporate"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-28-kaplan-2012",
+      "mode": "single_hop",
+      "question": "CEO 薪酬增长和激励强度应如何区分规模效应与治理问题？",
+      "retrieval_query": "executive compensation corporate governance CEO pay incentives United States",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/28-executive-compensation-and-corporate-governance-in-the-u-s.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_28",
+          "support_markers": [
+            "Executive"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-29-jenter-lewellen-2011",
+      "mode": "single_hop",
+      "question": "CEO 年龄、职业期限和私人收益偏好会怎样影响并购概率？",
+      "retrieval_query": "CEO preferences acquisitions age career concerns private benefits",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/29-ceo-preferences-and-acquisitions.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_29",
+          "support_markers": [
+            "CEO"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "single-30-hale-2011",
+      "mode": "single_hop",
+      "question": "长期银行关系在商业周期和金融危机中如何改变融资可得性？",
+      "retrieval_query": "bank relationships business cycles financial crises lending",
+      "corpus_role": "literature_evidence",
+      "expected_sources": [
+        "literature/30-bank-relationships-business-cycles-and-financial-crises.pdf"
+      ],
+      "expected_markers": [],
+      "claims": [
+        {
+          "claim_id": "claim_30",
+          "support_markers": [
+            "Bank"
+          ]
+        }
+      ],
+      "k": 8,
+      "generation": false
+    },
+    {
+      "case_id": "multi-financing-friction-collateral",
+      "mode": "multi_hop",
+      "question": "融资约束为何会造成投资对内部资金的依赖，资产可抵押性又如何进一步放大或缓解这种约束？",
+      "corpus_role": "literature_evidence",
+      "hops": [
+        "financing hierarchy internal finance excess sensitivity investment",
+        "asset tangibility credit multiplier constrained firms investment"
+      ],
+      "expected_sources": [
+        "literature/01-financing-constraints-and-corporate-investment.pdf",
+        "literature/02-financial-constraints-asset-tangibility-and-corporate-inve.pdf"
+      ],
+      "evidence_groups": [
+        [
+          "financing hierarchy"
+        ],
+        [
+          "asset tangibility"
+        ]
+      ],
+      "claims": [],
+      "k": 6,
+      "generation": false
+    },
+    {
+      "case_id": "multi-debt-maturity-supply-overhang",
+      "mode": "multi_hop",
+      "question": "结合债务供给缺口与债务悬置，解释企业为什么会选择不同的债务期限。",
+      "corpus_role": "literature_evidence",
+      "hops": [
+        "gap filling corporate debt maturity government supply",
+        "long short debt maturity debt overhang"
+      ],
+      "expected_sources": [
+        "literature/08-a-gap-filling-theory-of-corporate-debt-maturity-choice.pdf",
+        "literature/09-a-theory-of-debt-maturity-the-long-and-short-of-debt-overh.pdf"
+      ],
+      "evidence_groups": [
+        [
+          "gap filling",
+          "gap-filling"
+        ],
+        [
+          "debt overhang"
+        ]
+      ],
+      "claims": [],
+      "k": 6,
+      "generation": false
+    },
+    {
+      "case_id": "multi-cash-trend-acquisition-cycle",
+      "mode": "multi_hop",
+      "question": "先解释美国企业现金比率为何上升，再说明现金储备如何改变并购对宏观周期的敏感性。",
+      "corpus_role": "literature_evidence",
+      "hops": [
+        "US firms rising cash ratio R&D risk cash holdings",
+        "cash holdings acquisitions macroeconomic conditions"
+      ],
+      "expected_sources": [
+        "literature/17-why-do-u-s-firms-hold-so-much-more-cash-than-they-used-to.pdf",
+        "literature/20-corporate-liquidity-acquisitions-and-macroeconomic-conditi.pdf"
+      ],
+      "evidence_groups": [
+        [
+          "cash ratio"
+        ],
+        [
+          "macroeconomic conditions"
+        ]
+      ],
+      "claims": [],
+      "k": 6,
+      "generation": false
+    },
+    {
+      "case_id": "multi-dividend-rigidity-reference-point",
+      "mode": "multi_hop",
+      "question": "管理者不愿削减股息这一事实，如何分别由企业调查证据和参照点理论解释？",
+      "corpus_role": "literature_evidence",
+      "hops": [
+        "managers reluctant to cut dividends payout survey repurchases",
+        "dividends reference point behavioral signaling"
+      ],
+      "expected_sources": [
+        "literature/21-payout-policy-in-the-21st-century.pdf",
+        "literature/23-dividends-as-reference-points-a-behavioral-signaling-appro.pdf"
+      ],
+      "evidence_groups": [
+        [
+          "reluctant to cut dividends"
+        ],
+        [
+          "reference point"
+        ]
+      ],
+      "claims": [],
+      "k": 6,
+      "generation": false
+    },
+    {
+      "case_id": "multi-governance-entrenchment-pay",
+      "mode": "multi_hop",
+      "question": "经济固守会怎样损害治理，CEO 薪酬证据又如何帮助区分市场规模与治理失灵？",
+      "corpus_role": "literature_evidence",
+      "hops": [
+        "corporate governance economic entrenchment control rights growth",
+        "executive compensation corporate governance CEO pay incentives"
+      ],
+      "expected_sources": [
+        "literature/27-corporate-governance-economic-entrenchment-and-growth.pdf",
+        "literature/28-executive-compensation-and-corporate-governance-in-the-u-s.pdf"
+      ],
+      "evidence_groups": [
+        [
+          "economic entrenchment"
+        ],
+        [
+          "executive compensation"
+        ]
+      ],
+      "claims": [],
+      "k": 6,
+      "generation": false
+    },
+    {
+      "case_id": "multi-ceo-liquidity-acquisitions",
+      "mode": "multi_hop",
+      "question": "企业并购既受 CEO 偏好影响，也受现金与宏观融资环境影响；两条机制分别是什么？",
+      "corpus_role": "literature_evidence",
+      "hops": [
+        "CEO preferences acquisitions private benefits career concerns",
+        "corporate liquidity acquisitions macroeconomic conditions"
+      ],
+      "expected_sources": [
+        "literature/29-ceo-preferences-and-acquisitions.pdf",
+        "literature/20-corporate-liquidity-acquisitions-and-macroeconomic-conditi.pdf"
+      ],
+      "evidence_groups": [
+        [
+          "private benefits"
+        ],
+        [
+          "macroeconomic conditions"
+        ]
+      ],
+      "claims": [],
+      "k": 6,
+      "generation": false
+    },
+    {
+      "case_id": "no-answer-audit-fees",
+      "mode": "no_answer",
+      "question": "公司审计费用如何受审计师轮换和内部控制缺陷共同影响？",
+      "corpus_role": "literature_evidence",
+      "k": 6,
+      "generation": false
+    },
+    {
+      "case_id": "no-answer-options-pricing",
+      "mode": "no_answer",
+      "question": "随机波动率模型下美式期权应采用哪种数值算法定价？",
+      "corpus_role": "literature_evidence",
+      "k": 6,
+      "generation": false
+    },
+    {
+      "case_id": "no-answer-consumer-credit-score",
+      "mode": "no_answer",
+      "question": "消费信贷评分模型的 AUC 和校准曲线应该如何构造？",
+      "corpus_role": "literature_evidence",
+      "k": 6,
+      "generation": false
+    },
+    {
+      "case_id": "no-answer-sovereign-default",
+      "mode": "no_answer",
+      "question": "主权债务违约模型中重新进入国际资本市场的概率如何识别？",
+      "corpus_role": "literature_evidence",
+      "k": 6,
+      "generation": false
+    },
+    {
+      "case_id": "no-answer-crypto-microstructure",
+      "mode": "no_answer",
+      "question": "去中心化交易所的自动做市商如何应对无常损失？",
+      "corpus_role": "literature_evidence",
+      "k": 6,
+      "generation": false
+    }
+  ]
+}
+

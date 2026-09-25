@@ -57,6 +57,10 @@ def test_real_turn_facts_produce_explainable_l1_l2_l3_metrics(tmp_path: Path) ->
     l3 = _metrics(turn, "L3")
     assert l1["l1.gateway.invocation_completion_rate"].value == 1.0
     assert l1["l1.tool.operation_without_admission_count"].value == 0.0
+    assert l1["l1.memory.search_request_count"].value == 0.0
+    assert l1["l1.memory.search_success_rate"].status == "not_applicable"
+    assert l1["l1.memory.open_success_rate"].status == "not_applicable"
+    assert l1["l1.memory.exact_context_use_rate"].status == "not_applicable"
     assert l2["l2.loop.step_completion_rate"].value == 1.0
     assert l2["l2.loop.success_contract_violation_count"].value == 0.0
     assert l3["l3.product.stata_result_provenance_rate"].status == "not_applicable"

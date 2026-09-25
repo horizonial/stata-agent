@@ -1,0 +1,140 @@
+{
+  "schema_version": "memory-retrieval-benchmark/v2",
+  "dataset_id": "memory-retrieval-core-v2",
+  "memories": [
+    {
+      "key": "iv_strategy",
+      "kind": "reference_pointer",
+      "title": "Identification strategy",
+      "content": "Use an instrumental variable specification for the primary estimate.",
+      "scope": "workspace",
+      "source_key": "iv-source"
+    },
+    {
+      "key": "cluster_rule",
+      "kind": "research_constraint",
+      "title": "Inference rule",
+      "content": "Always report standard errors clustered by manufacturer.",
+      "scope": "workspace",
+      "source_key": "cluster-source"
+    },
+    {
+      "key": "old_tail_rule",
+      "kind": "research_decision",
+      "title": "Old tail treatment",
+      "content": "Winsorize both tails at one percent.",
+      "scope": "workspace",
+      "source_key": "old-tail-source"
+    },
+    {
+      "key": "current_tail_rule",
+      "kind": "research_decision",
+      "title": "Current tail treatment",
+      "content": "Keep the original observations and report tail sensitivity checks separately.",
+      "scope": "workspace",
+      "source_key": "current-tail-source"
+    },
+    {
+      "key": "main_outcome",
+      "kind": "research_decision",
+      "title": "Main-path outcome",
+      "content": "Use price as the primary outcome on the main research path.",
+      "scope": "main_path",
+      "source_key": "main-outcome-source"
+    },
+    {
+      "key": "branch_outcome",
+      "kind": "research_decision",
+      "title": "Branch outcome",
+      "content": "Use weight as the primary outcome on the alternative research path.",
+      "scope": "branch_path",
+      "source_key": "branch-outcome-source"
+    },
+    {
+      "key": "sample_exclusion",
+      "kind": "research_decision",
+      "title": "Sample exclusion",
+      "content": "Exclude observations with missing repair records.",
+      "scope": "workspace",
+      "source_key": "sample-source"
+    },
+    {
+      "key": "sample_robustness",
+      "kind": "reference_pointer",
+      "title": "Sample robustness",
+      "content": "Report a complete-case sensitivity analysis in the appendix.",
+      "scope": "workspace",
+      "source_key": "sample-source"
+    },
+    {
+      "key": "style_note",
+      "kind": "user_preference",
+      "title": "Writing preference",
+      "content": "Prefer concise table notes in the final manuscript.",
+      "scope": "workspace",
+      "source_key": "style-source"
+    }
+  ],
+  "supersessions": [
+    {
+      "old_key": "old_tail_rule",
+      "successor_key": "current_tail_rule"
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "lexical-cluster-rule",
+      "query": "clustered standard errors by manufacturer",
+      "retrieval_mode": "lexical",
+      "research_path": "main_path",
+      "relevant_keys": ["cluster_rule"],
+      "forbidden_keys": [],
+      "k": 5
+    },
+    {
+      "case_id": "semantic-endogeneity",
+      "query": "How should we address the endogeneity concern?",
+      "retrieval_mode": "hybrid",
+      "research_path": "main_path",
+      "relevant_keys": ["iv_strategy"],
+      "forbidden_keys": [],
+      "k": 5
+    },
+    {
+      "case_id": "superseded-tail-rule",
+      "query": "one percent winsorize treatment",
+      "retrieval_mode": "lexical",
+      "research_path": "main_path",
+      "relevant_keys": ["current_tail_rule"],
+      "forbidden_keys": ["old_tail_rule"],
+      "k": 5
+    },
+    {
+      "case_id": "cross-path-isolation",
+      "query": "price primary outcome main research path",
+      "retrieval_mode": "lexical",
+      "research_path": "main_path",
+      "relevant_keys": ["main_outcome"],
+      "forbidden_keys": ["branch_outcome"],
+      "k": 5
+    },
+    {
+      "case_id": "shared-source-expansion",
+      "query": "missing repair records exclusion",
+      "retrieval_mode": "lexical",
+      "research_path": "main_path",
+      "relevant_keys": ["sample_exclusion", "sample_robustness"],
+      "forbidden_keys": [],
+      "k": 5
+    },
+    {
+      "case_id": "irrelevant-abstention",
+      "query": "Bayesian prior hyperparameter selection",
+      "retrieval_mode": "hybrid",
+      "research_path": "main_path",
+      "relevant_keys": [],
+      "forbidden_keys": ["style_note", "cluster_rule", "main_outcome"],
+      "k": 5
+    }
+  ]
+}

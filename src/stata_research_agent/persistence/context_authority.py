@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from collections.abc import Iterable
 from typing import Any
@@ -16,7 +15,9 @@ from stata_research_agent.application.knowledge_retrieval import (
 from stata_research_agent.application.model_gateway import ContextItemCandidate
 from stata_research_agent.domain.identifiers import TurnId
 
+from .filesystem_memory import FilesystemMemoryStore
 from .knowledge_store import SqliteKnowledgeRepository
+from .memory_recommendation_query import SqliteMemoryRecommendationQuery
 
 
 def _json(value: object) -> str:
@@ -115,8 +116,13 @@ def _loaded_skill_payload(payload: object) -> dict[str, object] | None:
 class SqliteContextAuthorityReader:
     """Read current authority without mutating it or manufacturing research facts."""
 
-    def __init__(self, connection: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        memory_files: FilesystemMemoryStore | None = None,
+    ) -> None:
         self._connection = connection
+        self._memory_files = memory_files
 
     def collect(self, turn_id: TurnId) -> tuple[ContextSourceCandidate, ...]:
         turn = self._connection.execute(
@@ -626,120 +632,33 @@ class SqliteContextAuthorityReader:
         if policy is None or not bool(policy["use_memory"]):
             return
 
-        workspace_id = str(
-            self._connection.execute(
-                "SELECT workspace_id FROM workspace_identity WHERE singleton_id = 1"
-            ).fetchone()[0]
-        )
-        for scope_kind, scope_object_id in (
-            ("workspace", workspace_id),
-            ("research_path", str(turn["research_path_id"])),
-        ):
-            summary = self._connection.execute(
-                """
-                SELECT summary_text, source_revision, projection_revision
-                FROM memory_summary_projections
-                WHERE scope_kind = ? AND scope_object_id = ?
-                """,
-                (scope_kind, scope_object_id),
-            ).fetchone()
-            if summary is not None:
-                yield ContextSourceCandidate(
-                    ContextItemCandidate(
-                        "project_memory_index",
-                        "memory_summary_projection",
-                        f"{scope_kind}:{scope_object_id}",
-                        f"{summary['source_revision']}:{summary['projection_revision']}",
-                        "remote_allowed",
-                        str(summary["summary_text"]),
-                        "recalled_context",
-                    ),
-                    1,
-                    "project_memory_navigation_index",
-                    summarizable=False,
-                    recency=int(summary["source_revision"]),
-                )
-
         trigger = self._connection.execute(
             "SELECT content FROM messages WHERE message_id = ?",
             (str(turn["triggering_message_id"]),),
         ).fetchone()
-        query_tokens = self._memory_tokens("" if trigger is None else str(trigger["content"]))
-        rows = self._connection.execute(
-            """
-            SELECT item.memory_item_id, item.scope_kind, item.scope_object_id,
-                   item.memory_kind, state.current_revision_id, state.pointer_revision,
-                   revision.title, revision.content, revision.origin_kind,
-                   revision.created_revision, retention.pinned,
-                   COALESCE(MAX(use.created_revision), 0) AS last_used_revision
-            FROM memory_items AS item
-            JOIN memory_current_states AS state USING (memory_item_id)
-            JOIN memory_retention_states AS retention USING (memory_item_id)
-            JOIN memory_revisions AS revision
-              ON revision.memory_revision_id = state.current_revision_id
-            LEFT JOIN memory_context_uses AS use USING (memory_item_id)
-            WHERE state.lifecycle = 'active'
-              AND retention.access_tier = 'hot'
-              AND retention.superseded_by_memory_item_id IS NULL
-              AND (
-                    (item.scope_kind = 'workspace' AND item.scope_object_id = ?)
-                    OR
-                    (item.scope_kind = 'research_path' AND item.scope_object_id = ?)
-                  )
-            GROUP BY item.memory_item_id
-            ORDER BY
-                CASE item.scope_kind WHEN 'research_path' THEN 0 ELSE 1 END,
-                CASE revision.origin_kind
-                    WHEN 'explicit_user' THEN 0
-                    WHEN 'confirmed' THEN 1
-                    ELSE 2
-                END,
-                last_used_revision DESC,
-                revision.created_revision DESC
-            LIMIT 64
-            """,
-            (workspace_id, str(turn["research_path_id"])),
-        ).fetchall()
-        scored_rows = [
-            (
-                len(
-                    query_tokens.intersection(
-                        self._memory_tokens(f"{row['title']} {row['content']}")
-                    )
-                ),
-                row,
-            )
-            for row in rows
-        ]
-        ranked_rows = [
-            row
-            for overlap, row in sorted(
-                (item for item in scored_rows if item[0] > 0 or bool(item[1]["pinned"])),
-                key=lambda row: (
-                    0 if bool(row[1]["pinned"]) else 1,
-                    -row[0],
-                    0 if str(row[1]["scope_kind"]) == "research_path" else 1,
-                    0
-                    if str(row[1]["memory_kind"])
-                    in {"research_decision", "research_constraint", "unresolved_question"}
-                    else 1,
-                    -max(
-                        int(row[1]["created_revision"]),
-                        int(row[1]["last_used_revision"]),
-                    ),
-                ),
-            )[:4]
-        ]
-        for row in ranked_rows:
-            sources = self._connection.execute(
-                """
-                SELECT source_object_type, source_object_id, source_object_revision, source_role
-                FROM memory_revision_sources
-                WHERE memory_revision_id = ?
-                ORDER BY memory_revision_source_id
-                """,
-                (str(row["current_revision_id"]),),
-            ).fetchall()
+        ranked = SqliteMemoryRecommendationQuery(self._connection).search(
+            "" if trigger is None else str(trigger["content"]),
+            research_path_id=str(turn["research_path_id"]),
+            limit=4,
+            hot_only=True,
+        )
+        for hit in ranked:
+            row = hit.row
+            memory_content = str(row["content"])
+            if self._memory_files is not None:
+                relative_path = row["relative_path"]
+                if relative_path is None:
+                    raise ValueError("recommended Memory has no managed filesystem payload")
+                file_title, memory_content = self._memory_files.read_revision_content(
+                    str(relative_path),
+                    expected_memory_item_id=str(row["memory_item_id"]),
+                    expected_memory_revision_id=str(row["memory_revision_id"]),
+                    expected_content_sha256=str(row["content_sha256"]),
+                    expected_payload_sha256=str(row["payload_sha256"]),
+                    expected_size_bytes=int(row["size_bytes"]),
+                )
+                if file_title != str(row["title"]):
+                    raise ValueError("recommended Memory file title does not match the ledger")
             high_relevance = str(row["memory_kind"]) in {
                 "research_decision",
                 "research_constraint",
@@ -751,27 +670,40 @@ class SqliteContextAuthorityReader:
                     "of current Research State. Current user input and authoritative state win."
                 ),
                 "memory_item_id": str(row["memory_item_id"]),
-                "memory_revision_id": str(row["current_revision_id"]),
+                "memory_revision_id": str(row["memory_revision_id"]),
                 "scope_kind": str(row["scope_kind"]),
                 "scope_object_id": str(row["scope_object_id"]),
                 "kind": str(row["memory_kind"]),
                 "title": str(row["title"]),
-                "content": str(row["content"]),
+                "content": memory_content,
                 "origin": str(row["origin_kind"]),
-                "sources": [dict(source) for source in sources],
+                "memory_file": row["relative_path"],
+                "retrieval": {
+                    "score": round(hit.score, 6),
+                    "reasons": list(hit.reasons),
+                },
+                "sources": [
+                    {
+                        "source_object_type": str(source["source_object_type"]),
+                        "source_object_id": str(source["source_object_id"]),
+                        "source_object_revision": str(source["source_object_revision"]),
+                        "source_role": str(source["source_role"]),
+                    }
+                    for source in hit.source_rows
+                ],
             }
             yield ContextSourceCandidate(
                 ContextItemCandidate(
                     "project_memory",
                     "memory_revision",
-                    str(row["current_revision_id"]),
+                    str(row["memory_revision_id"]),
                     str(row["created_revision"]),
                     "remote_allowed",
                     _json(content),
                     "recalled_context",
                 ),
                 1 if high_relevance else 2,
-                "active_project_memory",
+                "recommended_project_memory",
                 summarizable=False,
                 recency=max(int(row["created_revision"]), int(row["last_used_revision"])),
             )
@@ -894,14 +826,6 @@ class SqliteContextAuthorityReader:
                 summarizable=False,
                 recency=int(trigger["created_revision"]),
             )
-
-    @staticmethod
-    def _memory_tokens(value: str) -> set[str]:
-        # Unicode word tokens work for identifiers and Latin text; individual Han characters
-        # preserve useful overlap without requiring a language-specific tokenizer.
-        words = {token.lower() for token in re.findall(r"[\w.-]{2,}", value)}
-        han = set(re.findall(r"[\u4e00-\u9fff]", value))
-        return words | han
 
     @staticmethod
     def _state_candidate(

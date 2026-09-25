@@ -1287,6 +1287,10 @@ class SqliteKnowledgeRepository:
                 hit.section_title,
                 hit.content,
                 hit.fused_score,
+                hit.lexical_rank,
+                hit.dense_rank,
+                hit.dense_score,
+                hit.query_variant_ordinals,
             )
             for hit in fused_candidates
         )
@@ -1455,9 +1459,14 @@ class SqliteKnowledgeRepository:
             if not any(key[0] == candidate.node_id for key in by_key)
         )
         if missing_ids:
-            for hit in self.read_canonical_nodes(tuple(dict.fromkeys(missing_ids))):
-                if hit.corpus_role in allowed_roles:
-                    by_key[(hit.node_id, hit.corpus_role)] = hit
+            # Exact reads deliberately cap one request at 64 identities.  Dense candidate
+            # depth may be as high as 96, so preserve that guardrail and hydrate in bounded
+            # batches instead of accidentally making the hybrid path unusable at depth.
+            unique_missing = tuple(dict.fromkeys(missing_ids))
+            for offset in range(0, len(unique_missing), 64):
+                for hit in self.read_canonical_nodes(unique_missing[offset : offset + 64]):
+                    if hit.corpus_role in allowed_roles:
+                        by_key[(hit.node_id, hit.corpus_role)] = hit
         lexical_rank_by_key = {
             (hit.node_id, hit.corpus_role): hit.lexical_rank for hit in result
         }

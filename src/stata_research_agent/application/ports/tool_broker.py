@@ -10,8 +10,10 @@ from stata_research_agent.application.tool_broker import (
     ExecutorExceptionOutcome,
     PreparedToolCall,
     RecordExecutorExceptionCommand,
+    RecordToolAdmissionBlockedCommand,
     RegisteredToolContract,
     RegisterToolContractCommand,
+    ToolAdmissionBlockedOutcome,
     ToolAdmissionIdentity,
     ToolAdmissionOutcome,
 )
@@ -48,3 +50,7 @@ class ToolBrokerRepository(Protocol):
     def record_executor_exception(
         self, command: RecordExecutorExceptionCommand
     ) -> ExecutorExceptionOutcome: ...
+
+    def record_admission_blocked(
+        self, command: RecordToolAdmissionBlockedCommand
+    ) -> ToolAdmissionBlockedOutcome: ...

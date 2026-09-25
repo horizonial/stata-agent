@@ -19,6 +19,10 @@ from stata_research_agent.application.knowledge_retrieval import (
     SyncKnowledgeIndexCommand,
 )
 from stata_research_agent.application.ports.identity import IdentityGenerator
+from stata_research_agent.application.retrieval_pipeline import (
+    EvidenceSufficiencyGate,
+    RerankAssessment,
+)
 from stata_research_agent.application.turn_driver import (
     ToolExecutionRequest,
     ToolExecutionResult,
@@ -26,7 +30,12 @@ from stata_research_agent.application.turn_driver import (
 from stata_research_agent.domain.identifiers import CommandId
 from stata_research_agent.persistence.knowledge_store import SqliteKnowledgeRepository
 
-from .literature_catalog import FilesystemLiteratureCatalog, MineruCliParser, StataHelpCatalog
+from .literature_catalog import (
+    FilesystemLiteratureCatalog,
+    MineruCliParser,
+    PdfPageEscalationPolicy,
+    StataHelpCatalog,
+)
 
 
 class WorkspaceKnowledgeIndexService:
@@ -36,15 +45,21 @@ class WorkspaceKnowledgeIndexService:
         workspace_root: Path,
         identities: IdentityGenerator,
         pdf_parser: MineruCliParser | None = None,
+        pdf_enrichment_policy: PdfPageEscalationPolicy | None = None,
     ) -> None:
         self._repository = repository
         self._catalogs = (
-            FilesystemLiteratureCatalog(workspace_root, pdf_parser=pdf_parser),
+            FilesystemLiteratureCatalog(
+                workspace_root,
+                pdf_parser=pdf_parser,
+                pdf_enrichment_policy=pdf_enrichment_policy,
+            ),
             FilesystemLiteratureCatalog(
                 workspace_root,
                 folder_name="style-references",
                 corpus_role=CorpusRole.STYLE_EXEMPLAR,
                 pdf_parser=pdf_parser,
+                pdf_enrichment_policy=pdf_enrichment_policy,
             ),
         )
         self._identities = identities
@@ -135,6 +150,7 @@ class KnowledgeSearchExecutor:
         self._forced_roles = forced_roles
         self._forced_mode = forced_mode
         self._lazy_index = lazy_index
+        self._sufficiency_gate = EvidenceSufficiencyGate()
 
     async def execute(self, request: ToolExecutionRequest) -> ToolExecutionResult:
         handle = self._bridge.begin(
@@ -195,6 +211,17 @@ class KnowledgeSearchExecutor:
                         request.turn_id,
                     )
                 )
+            sufficiency = self._sufficiency_gate.assess(
+                tuple(
+                    RerankAssessment(
+                        hit.node_id,
+                        hit.rerank_score or 0.0,
+                        hit.relevance_label or "low_relevance",
+                        hit.rerank_reason_codes,
+                    )
+                    for hit in retrieval.hits
+                )
+            )
             payload: dict[str, object] = {
                 "boundary": (
                     "Knowledge retrieval material is not statistical Evidence. Literature "
@@ -213,6 +240,18 @@ class KnowledgeSearchExecutor:
                 "query_variants": list(retrieval.query_variants),
                 "query_planner_policy_revision": retrieval.query_planner_policy_revision,
                 "reranker_policy_revision": retrieval.reranker_policy_revision,
+                "evidence_sufficiency": {
+                    "status": sufficiency.status,
+                    "answer_allowed": sufficiency.answer_allowed,
+                    "highest_score": sufficiency.highest_score,
+                    "reason_codes": list(sufficiency.reason_codes),
+                    "policy_revision": self._sufficiency_gate.policy_revision,
+                    "fixed_no_answer": (
+                        "未在当前知识库中找到足够证据，无法回答。"
+                        if not sufficiency.answer_allowed
+                        else None
+                    ),
+                },
                 "hits": [
                     {
                         "knowledge_node_id": hit.node_id,

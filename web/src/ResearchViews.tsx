@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   getArtifactContent,
@@ -24,6 +24,9 @@ import {
   type TurnOperationalEvaluationResponse,
 } from "./generated/api-v1";
 import { newCommandId } from "./browser/commands";
+import { ModelDeltaStream, type ModelResponseDelta } from "./browser/model-delta-stream";
+import { projectProviderText } from "./browser/provider-text-projection";
+import { MarkdownContent } from "./MarkdownContent";
 
 type QueryState<T> =
   | { readonly kind: "loading" }
@@ -54,6 +57,127 @@ function QueryError({ error }: { readonly error: ErrorResponse }) {
       <strong>{error.error.code}</strong>
       <span>{error.error.message}</span>
     </div>
+  );
+}
+
+type LiveMessageState = {
+  readonly status: "connecting" | "streaming" | "reconnecting";
+  readonly providerAttemptId?: string;
+  readonly text: string;
+};
+
+function LiveAssistantMessage({
+  workspaceId,
+  turnId,
+  committedContents,
+}: {
+  readonly workspaceId: string;
+  readonly turnId: string;
+  readonly committedContents: ReadonlySet<string>;
+}) {
+  const stream = useMemo(() => new ModelDeltaStream(), []);
+  const rawByAttempt = useRef(new Map<string, string>());
+  const currentState = useRef<LiveMessageState>({ status: "connecting", text: "" });
+  const pendingState = useRef<LiveMessageState | undefined>(undefined);
+  const frame = useRef<number | undefined>(undefined);
+  const card = useRef<HTMLElement>(null);
+  const followOutput = useRef(true);
+  const [live, setLive] = useState<LiveMessageState>(currentState.current);
+
+  useEffect(() => {
+    const scrollContainer = card.current?.closest(".view-body");
+    if (!(scrollContainer instanceof HTMLElement)) return;
+    const updateFollowState = () => {
+      followOutput.current = (
+        scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight
+      ) < 180;
+    };
+    updateFollowState();
+    scrollContainer.addEventListener("scroll", updateFollowState, { passive: true });
+    return () => scrollContainer.removeEventListener("scroll", updateFollowState);
+  }, []);
+
+  useEffect(() => {
+    rawByAttempt.current.clear();
+    pendingState.current = undefined;
+    currentState.current = { status: "connecting", text: "" };
+    setLive(currentState.current);
+
+    const flush = () => {
+      frame.current = undefined;
+      const next = pendingState.current;
+      if (next === undefined) return;
+      pendingState.current = undefined;
+      currentState.current = next;
+      setLive(next);
+    };
+    const schedule = (next: LiveMessageState) => {
+      pendingState.current = next;
+      if (frame.current === undefined) frame.current = window.requestAnimationFrame(flush);
+    };
+    const acceptDelta = (delta: ModelResponseDelta) => {
+      const raw = (rawByAttempt.current.get(delta.provider_attempt_id) ?? "") + delta.content;
+      rawByAttempt.current.set(delta.provider_attempt_id, raw);
+      const projection = projectProviderText(raw);
+      schedule({
+        status: "streaming",
+        providerAttemptId: delta.provider_attempt_id,
+        text: projection?.text ?? "",
+      });
+    };
+
+    stream.open(workspaceId, turnId, {
+      onOpen: () => {
+        const current = pendingState.current ?? currentState.current;
+        schedule({
+          ...current,
+          status: current.text === "" ? "connecting" : "streaming",
+        });
+      },
+      onDelta: acceptDelta,
+      onReconnecting: () => {
+        const current = pendingState.current ?? currentState.current;
+        schedule({ ...current, status: "reconnecting" });
+      },
+    });
+    return () => {
+      stream.close();
+      if (frame.current !== undefined) window.cancelAnimationFrame(frame.current);
+      frame.current = undefined;
+    };
+  }, [stream, workspaceId, turnId]);
+
+  useEffect(() => {
+    if (!followOutput.current) return;
+    const animationFrame = window.requestAnimationFrame(() => {
+      card.current?.scrollIntoView({ block: "end" });
+    });
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, [live.text]);
+
+  if (live.text !== "" && committedContents.has(live.text)) return null;
+  const visibleText = live.text;
+  const statusText = live.status === "reconnecting"
+    ? "流式连接恢复中"
+    : visibleText === ""
+      ? "Agent 正在思考"
+      : "Agent 正在回复";
+  return (
+    <article
+      aria-busy="true"
+      aria-live="polite"
+      className="message-card assistant streaming-message"
+      ref={card}
+    >
+      <div className="message-role">Agent · 实时</div>
+      {visibleText === ""
+        ? <div className="stream-placeholder">{statusText}<span className="streaming-dots">…</span></div>
+        : <MarkdownContent content={visibleText} />}
+      <div className="stream-status">
+        <span>{statusText}</span>
+        <span aria-hidden="true" className="streaming-caret" />
+      </div>
+    </article>
   );
 }
 
@@ -254,10 +378,12 @@ export function ConversationDetailView({
   workspaceId,
   conversationId,
   queryRevision,
+  activeTurnId,
 }: {
   readonly workspaceId: string;
   readonly conversationId: string;
   readonly queryRevision: number;
+  readonly activeTurnId?: string;
 }) {
   const [state, setState] = useState<QueryState<ConversationDetailResponse>>({
     kind: "loading",
@@ -276,19 +402,31 @@ export function ConversationDetailView({
 
   if (state.kind === "loading") return <LoadingView />;
   if (state.kind === "error") return <QueryError error={state.error} />;
-  if (state.value.data.timeline.length === 0) {
+  if (state.value.data.timeline.length === 0 && activeTurnId === undefined) {
     return <div className="empty-state compact"><h2>这个对话还没有已提交内容</h2></div>;
   }
+  const committedContents = new Set(
+    state.value.data.timeline
+      .filter((item) => item.role === "assistant" && item.turn_id === activeTurnId)
+      .map((item) => item.content),
+  );
   return (
     <div className="conversation-view">
       <div className="view-watermark">一致读 R{state.value.authoritative_revision}</div>
       {state.value.data.timeline.map((item) => (
         <article className={`message-card ${item.role}`} key={item.item_id}>
           <div className="message-role">{item.role === "user" ? "研究者" : "Agent"}</div>
-          <p>{item.content}</p>
+          <MarkdownContent content={item.content} />
           <div className="item-meta">{item.item_id} · R{item.created_revision}</div>
         </article>
       ))}
+      {activeTurnId !== undefined && (
+        <LiveAssistantMessage
+          committedContents={committedContents}
+          turnId={activeTurnId}
+          workspaceId={workspaceId}
+        />
+      )}
       <section className="usage-section">
         <div className="usage-section-heading">
           <div><div className="eyebrow">运行记录</div><h2>用量与体检</h2></div>

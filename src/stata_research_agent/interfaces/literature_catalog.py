@@ -121,6 +121,8 @@ class MineruCliParser:
                 self._tier,
                 "--pages",
                 page_specification,
+                "--limit",
+                str(_MAX_EXTRACTED_CHARACTERS),
                 "--wait",
                 str(self._timeout_seconds),
                 "--json",
@@ -195,6 +197,11 @@ class PdfPageEscalationPolicy:
         re.I,
     )
     _TABLE_CAPTION = re.compile(r"(?:^|\n)\s*table\s+[A-Z]?\d+", re.I)
+    _COMMON_ENGLISH_TOKENS = frozenset(
+        "the of and to in a is that for as with by on are this we firms firm investment "
+        "cash flow financial capital debt corporate model our from be or an which their"
+        .split()
+    )
 
     def __init__(
         self,
@@ -236,6 +243,22 @@ class PdfPageEscalationPolicy:
             elif control_count / max(1, len(text)) > 0.005:
                 reasons.append("undecoded_layout_glyphs")
                 score += 3
+            ascii_tokens = re.findall(r"[A-Za-z]{2,}", text)
+            if len(ascii_tokens) >= 80:
+                common_ratio = sum(
+                    token.casefold() in self._COMMON_ENGLISH_TOKENS
+                    for token in ascii_tokens
+                ) / len(ascii_tokens)
+                mixed_case_ratio = sum(
+                    not (token.islower() or token.isupper() or token.istitle())
+                    for token in ascii_tokens
+                ) / len(ascii_tokens)
+                if common_ratio < 0.04 and mixed_case_ratio > 0.10:
+                    # Some older PDFs expose a non-empty but ciphered/glyph-mapped text
+                    # layer.  Length and replacement-character checks miss it entirely.
+                    reasons.append("corrupt_text_extraction")
+                    score += 10
+                    critical_pages.add(page.page_number)
             word_count = len(re.findall(r"\b[\w'-]+\b", text))
             if len(compact) < 400 and word_count < 45:
                 reasons.append("low_text_density")
@@ -418,13 +441,18 @@ class FilesystemLiteratureCatalog:
         folder_name: str = "literature",
         corpus_role: CorpusRole = CorpusRole.LITERATURE_EVIDENCE,
         pdf_parser: MineruCliParser | None = None,
+        pdf_enrichment_policy: PdfPageEscalationPolicy | None = None,
     ) -> None:
         self._workspace = workspace_root.resolve(strict=True)
         if not folder_name or "/" in folder_name or "\\" in folder_name or folder_name == "..":
             raise ValueError("knowledge folder name must be a direct Workspace child")
         self._folder_name = folder_name
         self._corpus_role = corpus_role
-        self._pdf_parser = AdaptivePdfParser(pdf_parser) if pdf_parser is not None else None
+        self._pdf_parser = (
+            AdaptivePdfParser(pdf_parser, policy=pdf_enrichment_policy)
+            if pdf_parser is not None
+            else None
+        )
         self._root = self._workspace / folder_name
 
     def extract_changed(

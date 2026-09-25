@@ -87,7 +87,7 @@ def _item(identifier: str, content: str) -> ContextItemCandidate:
     )
 
 
-def test_compiler_summarizes_optional_history_and_records_decision() -> None:
+def test_compiler_excludes_optional_overflow_without_lossy_replacement() -> None:
     reader = _StaticReader(
         (
             ContextSourceCandidate(
@@ -111,12 +111,17 @@ def test_compiler_summarizes_optional_history_and_records_decision() -> None:
             ),
         )
     )
-    compiled = ContextCompiler(reader, input_token_budget=300, summary_token_target=100).compile(
-        TurnId("turn_context")
-    )
+    compiled = ContextCompiler(reader, input_token_budget=300).compile(TurnId("turn_context"))
     assert compiled.items[0].item_kind == "user_message"
-    assert compiled.items[1].item_kind == "context_summary"
-    assert any(decision.decision_kind == "summarized" for decision in compiled.decisions)
+    assert len(compiled.items) == 1
+    overflow = next(
+        decision
+        for decision in compiled.decisions
+        if decision.source_object_id == "assistant_old"
+    )
+    assert overflow.decision_kind == "excluded"
+    assert overflow.reason_code == "token_budget_external_source_retained"
+    assert overflow.detail["lossy_replacement_created"] is False
 
 
 def test_compiler_never_silently_drops_mandatory_context() -> None:
@@ -230,7 +235,9 @@ def test_authority_reader_restores_waiting_answer_and_prior_assistant_output(
         )
         assert future.turn_status.value == "queued"
 
-        compiled = ContextCompiler(SqliteContextAuthorityReader(connection)).compile(turn.turn_id)
+        compiled = ContextCompiler(SqliteContextAuthorityReader(connection)).compile(
+            turn.turn_id, input_token_budget=96_000
+        )
         by_kind = {item.item_kind: item for item in compiled.items}
         assert by_kind["waiting_answer"].content == ("Use the alternative variable and continue.")
         assert "preserve this plan" in by_kind["assistant_message"].content

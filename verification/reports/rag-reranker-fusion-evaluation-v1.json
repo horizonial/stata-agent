@@ -1,0 +1,93 @@
+{
+  "schema_version": "stata-research-agent/reranker-fusion-evaluation/v1",
+  "generated_at": "2026-09-25T10:20:25.320607+00:00",
+  "corpus": {
+    "domain": "corporate finance",
+    "paper_count": 30,
+    "page_count": 1511,
+    "canonical_node_count": 10124,
+    "positive_case_count": 36,
+    "no_answer_case_count": 5,
+    "retrieval_query_count": 47
+  },
+  "adopted_profile": {
+    "first_stage": "SQLite FTS5 + intfloat/multilingual-e5-small",
+    "reranker": "BAAI/bge-reranker-base@2cfc18c9415c912f9d8155881c133215df768a70",
+    "strategy": "adaptive rank fusion",
+    "top_n": 32,
+    "maximum_input_tokens": 512,
+    "weights": {
+      "neural_rank_and_score": 0.55,
+      "deterministic_relevance": 0.25,
+      "first_stage_rank": 0.2
+    },
+    "scheduler": {
+      "maximum_normalized_top_margin": 0.12,
+      "maximum_deterministic_confidence": 0.52,
+      "maximum_abstention_confidence": 0.18,
+      "minimum_rank_disagreement": 6,
+      "minimum_complex_query_tokens": 7
+    }
+  },
+  "quality": {
+    "deterministic_baseline_mrr": 0.9623015873015874,
+    "adaptive_fusion_mrr": 0.9768518518518517,
+    "adaptive_fusion_marker_recall": 1.0,
+    "adaptive_fusion_multi_hop_coverage": 1.0,
+    "adaptive_fusion_source_recall": 1.0,
+    "no_answer_accuracy": 1.0,
+    "false_abstention_rate": 0.0,
+    "top_result_changed_case_count": 10,
+    "case_metric_improvement_count": 3,
+    "case_metric_regression_count": 0
+  },
+  "paired_latency": {
+    "repeats": 3,
+    "measurement_count_per_variant": 141,
+    "baseline_mean_seconds": 0.5406052652484143,
+    "adaptive_mean_seconds": 0.8759262070921487,
+    "mean_added_seconds": 0.3353209418437344,
+    "median_added_seconds": 0.38671460000114166,
+    "p95_added_seconds": 0.7935356000016327,
+    "observed_trigger_rate": 0.5140845070422535
+  },
+  "alternative_models": [
+    {
+      "model": "BAAI/bge-reranker-v2-m3",
+      "strategy": "adaptive fusion",
+      "mrr": 0.9761904761904763,
+      "mean_query_seconds": 1.4129832744682913,
+      "decision": "quality-valid but dominated by bge-reranker-base"
+    },
+    {
+      "model": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+      "strategy": "adaptive fusion",
+      "mrr": 0.9592592592592593,
+      "mean_query_seconds": 0.6532560936169094,
+      "decision": "low-latency alternative; not adopted because MRR regressed"
+    },
+    {
+      "model": "BAAI/bge-reranker-base",
+      "strategy": "adaptive fusion on CPU",
+      "mrr": 0.9768518518518517,
+      "mean_query_seconds": 6.0375850425531254,
+      "decision": "not a CPU default; deterministic fallback is cheaper"
+    }
+  ],
+  "robustness": {
+    "model_failure_behavior": "same-query deterministic fallback",
+    "failure_fallback_unit_test": "passed",
+    "no_answer_behavior": "hard evidence-sufficiency status and fixed response",
+    "unscored_candidate_behavior": "retains deterministic eligibility",
+    "historical_policy_identity": "model revision, scheduler thresholds and fusion weights are versioned"
+  },
+  "raw_reports": [
+    "D:/stata-agent-rag-lab/runs/corp-fin-scenario-e5-deterministic-v2/rag-scenario-report.json",
+    "D:/stata-agent-rag-lab/runs/corp-fin-scenario-e5-bge-reranker-fusion-always-v1/rag-scenario-report.json",
+    "D:/stata-agent-rag-lab/runs/corp-fin-scenario-e5-bge-reranker-fusion-adaptive-v2/rag-scenario-report.json",
+    "D:/stata-agent-rag-lab/runs/corp-fin-scenario-e5-bge-base-reranker-fusion-adaptive-gap6-v1/rag-scenario-report.json",
+    "D:/stata-agent-rag-lab/runs/corp-fin-scenario-e5-minilm-reranker-fusion-adaptive-v1/rag-scenario-report.json",
+    "D:/stata-agent-rag-lab/runs/corp-fin-scenario-e5-bge-base-reranker-fusion-adaptive-cpu-v1/rag-scenario-report.json",
+    "D:/stata-agent-rag-lab/runs/corp-fin-paired-latency-e5-bge-base-adaptive-v1/paired-latency-report.json"
+  ]
+}

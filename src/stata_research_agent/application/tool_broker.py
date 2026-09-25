@@ -27,6 +27,14 @@ from stata_research_agent.domain.revisions import WorkspaceRevision
 JsonObject = Mapping[str, Any]
 
 
+class ToolAdmissionBlockedError(ValueError):
+    """Stable JIT admission failure that must be recorded before the loop continues."""
+
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
 @dataclass(frozen=True, slots=True)
 class ResourceClaimTemplate:
     key_template: str
@@ -171,6 +179,22 @@ class ToolAdmissionOutcome:
     operation_id: OperationId
     tool_call_id: ToolCallId
     status: str
+    commit_revision: WorkspaceRevision
+    replayed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RecordToolAdmissionBlockedCommand:
+    command_id: CommandId
+    turn_id: TurnId
+    tool_call_id: ToolCallId
+    reason_code: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolAdmissionBlockedOutcome:
+    tool_call_id: ToolCallId
+    reason_code: str
     commit_revision: WorkspaceRevision
     replayed: bool
 

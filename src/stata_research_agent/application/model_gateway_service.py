@@ -34,6 +34,7 @@ from stata_research_agent.domain.identifiers import (
 from stata_research_agent.domain.revisions import WorkspaceRevision
 
 from .diagnostic_service import DiagnosticService
+from .diagnostic_tracing import DiagnosticTracer
 from .diagnostics import DiagnosticEventCandidate
 from .model_gateway import (
     FrozenModelInvocation,
@@ -166,6 +167,7 @@ class ModelGatewayService:
         max_provider_attempts: int = 3,
         sensitive_output_gate: SensitiveOutputGate | None = None,
         diagnostics: DiagnosticService | None = None,
+        tracer: DiagnosticTracer | None = None,
         irreversibility_guard: IrreversibilityGuard | None = None,
         resilience_policy: ProviderResiliencePolicy | None = None,
         circuit_registry: ProviderCircuitRegistry | None = None,
@@ -184,6 +186,7 @@ class ModelGatewayService:
         self._max_provider_attempts = max_provider_attempts
         self._sensitive_output_gate = sensitive_output_gate or SensitiveOutputGate()
         self._diagnostics = diagnostics
+        self._tracer = tracer
         self._irreversibility_guard = irreversibility_guard or NoopIrreversibilityGuard()
         self._resilience_policy = resilience_policy or ProviderResiliencePolicy()
         self._circuit_registry = circuit_registry or ProviderCircuitRegistry()
@@ -194,6 +197,22 @@ class ModelGatewayService:
         self._delta_sink = delta_sink
 
     async def execute_step(self, command: StartModelStepCommand) -> ModelStepOutcome:
+        if self._tracer is None:
+            return await self._execute_step(command)
+        async with self._tracer.span(
+            "model.invocation",
+            kind="client",
+            component="model_gateway",
+            turn_id=command.turn_id.value,
+            domain_ref_type="turn",
+            domain_ref_id=command.turn_id.value,
+        ) as span:
+            outcome = await self._execute_step(command)
+            span.set_domain_ref("model_invocation", outcome.invocation_id.value)
+            span.set_status(outcome.status)
+            return outcome
+
+    async def _execute_step(self, command: StartModelStepCommand) -> ModelStepOutcome:
         self._assert_secret_free_mapping(command.permissions, "permissions")
         self._assert_secret_free_mapping(command.provider_policy, "provider policy")
         if command.remote_provider:
@@ -281,7 +300,9 @@ class ModelGatewayService:
                     terminal_state="failed",
                     terminal_invocation=terminal,
                 )
-                self._diagnose_provider("circuit_open", attempt_ordinal)
+                self._diagnose_provider(
+                    "circuit_open", attempt_ordinal, attempt_id=identity.attempt_id.value
+                )
                 if terminal:
                     return self._failed_outcome(
                         frozen,
@@ -303,7 +324,11 @@ class ModelGatewayService:
                 if not credential:
                     raise RuntimeError("credential resolver returned an empty credential")
             except Exception:
-                self._diagnose_provider("credential_unavailable", attempt_ordinal)
+                self._diagnose_provider(
+                    "credential_unavailable",
+                    attempt_ordinal,
+                    attempt_id=identity.attempt_id.value,
+                )
                 final_revision = self._repository.fail_attempt(
                     command_id=self._identities.new(CommandId),
                     invocation_id=frozen.invocation_id,
@@ -330,16 +355,29 @@ class ModelGatewayService:
                 frozen.invocation_id,
                 identity.attempt_id,
             )
-            self._diagnose_provider("dispatch_started", attempt_ordinal)
+            self._diagnose_provider(
+                "dispatch_started", attempt_ordinal, attempt_id=identity.attempt_id.value
+            )
+            dispatch_started_at = self._monotonic_clock()
             try:
                 stream_send = getattr(self._transport, "send_stream", None)
                 delta_sink = self._delta_sink
                 if delta_sink is not None and callable(stream_send):
                     delta_sequence = 0
+                    first_delta_observed = False
 
                     async def emit_delta(content: str) -> None:
-                        nonlocal delta_sequence
+                        nonlocal delta_sequence, first_delta_observed
                         delta_sequence += 1
+                        if not first_delta_observed:
+                            first_delta_observed = True
+                            self._diagnose_provider(
+                                "first_delta",
+                                attempt_ordinal,
+                                attempt_id=identity.attempt_id.value,
+                                duration_ms=(self._monotonic_clock() - dispatch_started_at)
+                                * 1000.0,
+                            )
                         try:
                             await delta_sink(
                                 ProviderResponseDelta(
@@ -350,7 +388,11 @@ class ModelGatewayService:
                                 )
                             )
                         except Exception:
-                            self._diagnose_provider("delta_sink_failed", attempt_ordinal)
+                            self._diagnose_provider(
+                                "delta_sink_failed",
+                                attempt_ordinal,
+                                attempt_id=identity.attempt_id.value,
+                            )
 
                     response = await stream_send(
                         endpoint=route.endpoint,
@@ -365,7 +407,12 @@ class ModelGatewayService:
                         credential=credential,
                     )
             except ProviderDispatchError as error:
-                self._diagnose_provider("transport_error", attempt_ordinal)
+                self._diagnose_provider(
+                    "transport_error",
+                    attempt_ordinal,
+                    attempt_id=identity.attempt_id.value,
+                    duration_ms=(self._monotonic_clock() - dispatch_started_at) * 1000.0,
+                )
                 if error.retry_safe:
                     self._circuit_registry.record_failure(
                         route.provider_profile,
@@ -410,7 +457,12 @@ class ModelGatewayService:
                 # open state. Unknown transport exceptions are deliberately not retried: the
                 # gateway cannot prove whether a remote response was produced or partially
                 # delivered, and exception text may contain sensitive provider material.
-                self._diagnose_provider("unclassified_transport_error", attempt_ordinal)
+                self._diagnose_provider(
+                    "unclassified_transport_error",
+                    attempt_ordinal,
+                    attempt_id=identity.attempt_id.value,
+                    duration_ms=(self._monotonic_clock() - dispatch_started_at) * 1000.0,
+                )
                 final_revision = self._repository.fail_attempt(
                     command_id=self._identities.new(CommandId),
                     invocation_id=frozen.invocation_id,
@@ -434,7 +486,11 @@ class ModelGatewayService:
                     protected_values=(credential,),
                 )
             except SensitiveOutputGateUnavailable:
-                self._diagnose_provider("sensitive_output_gate_unavailable", attempt_ordinal)
+                self._diagnose_provider(
+                    "sensitive_output_gate_unavailable",
+                    attempt_ordinal,
+                    attempt_id=identity.attempt_id.value,
+                )
                 final_revision = self._repository.fail_attempt(
                     command_id=self._identities.new(CommandId),
                     invocation_id=frozen.invocation_id,
@@ -451,7 +507,11 @@ class ModelGatewayService:
                     "sensitive_output_gate_unavailable",
                 )
             if inspected_output.verdict != "safe":
-                self._diagnose_provider("sensitive_output_detected", attempt_ordinal)
+                self._diagnose_provider(
+                    "sensitive_output_detected",
+                    attempt_ordinal,
+                    attempt_id=identity.attempt_id.value,
+                )
                 final_revision = self._repository.fail_attempt(
                     command_id=self._identities.new(CommandId),
                     invocation_id=frozen.invocation_id,
@@ -481,7 +541,12 @@ class ModelGatewayService:
                 output_sha256=_sha256(output_json),
                 response=response,
             )
-            self._diagnose_provider("completed", attempt_ordinal)
+            self._diagnose_provider(
+                "completed",
+                attempt_ordinal,
+                attempt_id=identity.attempt_id.value,
+                duration_ms=(self._monotonic_clock() - dispatch_started_at) * 1000.0,
+            )
             return ModelStepOutcome(
                 frozen.step_id,
                 frozen.invocation_id,
@@ -506,14 +571,23 @@ class ModelGatewayService:
         jitter_multiplier = 1 + self._resilience_policy.jitter_ratio * (2 * jitter_unit - 1)
         return max(0.0, base * jitter_multiplier)
 
-    def _diagnose_provider(self, phase_code: str, attempt_ordinal: int) -> None:
+    def _diagnose_provider(
+        self,
+        phase_code: str,
+        attempt_ordinal: int,
+        *,
+        attempt_id: str | None = None,
+        duration_ms: float | None = None,
+    ) -> None:
         if self._diagnostics is None:
             return
+        context = None if self._tracer is None else self._tracer.current_context()
+        success_phases = {"dispatch_started", "first_delta", "completed"}
         self._diagnostics.record(
             DiagnosticEventCandidate(
                 "provider.transport",
-                9 if phase_code in {"dispatch_started", "completed"} else 17,
-                "INFO" if phase_code in {"dispatch_started", "completed"} else "ERROR",
+                9 if phase_code in success_phases else 17,
+                "INFO" if phase_code in success_phases else "ERROR",
                 "PROVIDER_TRANSPORT_STATE",
                 "model_gateway",
                 "main_service",
@@ -521,6 +595,13 @@ class ModelGatewayService:
                     "phase_code": phase_code,
                     "attempt_ordinal": attempt_ordinal,
                 },
+                trace_id=None if context is None else context.trace_id,
+                span_id=None if context is None else context.span_id,
+                workspace_ref=None if context is None else context.workspace_ref,
+                turn_id=None if context is None else context.turn_id,
+                operation_id=None if context is None else context.operation_id,
+                attempt_id=attempt_id,
+                duration_ms=duration_ms,
             )
         )
 

@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
+from stata_research_agent.application.diagnostic_tracing import DiagnosticTracer
+
 from .ipc_contract import (
     AgentIpcMessage,
     LifecycleEvent,
@@ -35,8 +37,14 @@ class TurnWorkerProtocolError(RuntimeError):
 
 
 class TurnWorkerProcess:
-    def __init__(self, python_executable: Path) -> None:
+    def __init__(
+        self,
+        python_executable: Path,
+        *,
+        tracer: DiagnosticTracer | None = None,
+    ) -> None:
         self._python_executable = python_executable.resolve()
+        self._tracer = tracer
         self._process: asyncio.subprocess.Process | None = None
         self._temporary: tempfile.TemporaryDirectory[str] | None = None
         self._bootstrap: WorkerBootstrap | None = None
@@ -60,6 +68,39 @@ class TurnWorkerProcess:
         context_revision: int,
         context: WorkerBootstrapContext,
         timeout_seconds: float = 10,
+    ) -> LifecycleEvent:
+        if self._tracer is None:
+            return await self._start(
+                turn_id=turn_id,
+                context_revision=context_revision,
+                context=context,
+                timeout_seconds=timeout_seconds,
+            )
+        async with self._tracer.span(
+            "worker.start",
+            kind="worker",
+            component="turn_worker",
+            turn_id=turn_id,
+            domain_ref_type="turn",
+            domain_ref_id=turn_id,
+        ) as span:
+            event = await self._start(
+                turn_id=turn_id,
+                context_revision=context_revision,
+                context=context,
+                timeout_seconds=timeout_seconds,
+            )
+            if self.worker_session_id is not None:
+                span.set_domain_ref("worker_session", self.worker_session_id)
+            return event
+
+    async def _start(
+        self,
+        *,
+        turn_id: str,
+        context_revision: int,
+        context: WorkerBootstrapContext,
+        timeout_seconds: float,
     ) -> LifecycleEvent:
         if self._process is not None:
             raise RuntimeError("Turn Worker process has already been started")
@@ -105,6 +146,19 @@ class TurnWorkerProcess:
         return event
 
     async def stop(self, *, timeout_seconds: float = 10) -> LifecycleEvent:
+        if self._tracer is None:
+            return await self._stop(timeout_seconds=timeout_seconds)
+        async with self._tracer.span(
+            "worker.stop",
+            kind="worker",
+            component="turn_worker",
+            turn_id=None if self._bootstrap is None else self._bootstrap.turn_id,
+            domain_ref_type="worker_session",
+            domain_ref_id=self.worker_session_id,
+        ):
+            return await self._stop(timeout_seconds=timeout_seconds)
+
+    async def _stop(self, *, timeout_seconds: float) -> LifecycleEvent:
         bootstrap = self._require_bootstrap()
         await self._send(
             WorkerShutdown(
@@ -136,6 +190,48 @@ class TurnWorkerProcess:
         waiting: WorkerWaiting | None = None,
         completion: WorkerCompletion | None = None,
         timeout_seconds: float = 10,
+    ) -> tuple[AgentIpcMessage, ...]:
+        if self._tracer is None:
+            return await self._process_model_output(
+                step_ordinal=step_ordinal,
+                text=text,
+                plan=plan,
+                tool_calls=tool_calls,
+                evaluation=evaluation,
+                waiting=waiting,
+                completion=completion,
+                timeout_seconds=timeout_seconds,
+            )
+        async with self._tracer.span(
+            "worker.process_model_output",
+            kind="worker",
+            component="turn_worker",
+            turn_id=None if self._bootstrap is None else self._bootstrap.turn_id,
+            domain_ref_type="step_ordinal",
+            domain_ref_id=str(step_ordinal),
+        ):
+            return await self._process_model_output(
+                step_ordinal=step_ordinal,
+                text=text,
+                plan=plan,
+                tool_calls=tool_calls,
+                evaluation=evaluation,
+                waiting=waiting,
+                completion=completion,
+                timeout_seconds=timeout_seconds,
+            )
+
+    async def _process_model_output(
+        self,
+        *,
+        step_ordinal: int,
+        text: str,
+        plan: WorkerPlan | None,
+        tool_calls: tuple[WorkerToolCall, ...],
+        evaluation: WorkerEvaluation | None,
+        waiting: WorkerWaiting | None,
+        completion: WorkerCompletion | None,
+        timeout_seconds: float,
     ) -> tuple[AgentIpcMessage, ...]:
         bootstrap = self._require_bootstrap()
         await self._send(
@@ -176,6 +272,41 @@ class TurnWorkerProcess:
         remaining_step_budget: int,
         remaining_tool_budget: int,
         timeout_seconds: float = 10,
+    ) -> ModelInvocationProposal:
+        if self._tracer is None:
+            return await self._request_model_invocation(
+                step_ordinal=step_ordinal,
+                trigger=trigger,
+                remaining_step_budget=remaining_step_budget,
+                remaining_tool_budget=remaining_tool_budget,
+                timeout_seconds=timeout_seconds,
+            )
+        async with self._tracer.span(
+            "worker.request_model_invocation",
+            kind="worker",
+            component="turn_worker",
+            turn_id=None if self._bootstrap is None else self._bootstrap.turn_id,
+            domain_ref_type="step_ordinal",
+            domain_ref_id=str(step_ordinal),
+        ):
+            return await self._request_model_invocation(
+                step_ordinal=step_ordinal,
+                trigger=trigger,
+                remaining_step_budget=remaining_step_budget,
+                remaining_tool_budget=remaining_tool_budget,
+                timeout_seconds=timeout_seconds,
+            )
+
+    async def _request_model_invocation(
+        self,
+        *,
+        step_ordinal: int,
+        trigger: Literal[
+            "initial", "tool_results_committed", "stop_guard_continue", "driver_feedback"
+        ],
+        remaining_step_budget: int,
+        remaining_tool_budget: int,
+        timeout_seconds: float,
     ) -> ModelInvocationProposal:
         bootstrap = self._require_bootstrap()
         await self._send(

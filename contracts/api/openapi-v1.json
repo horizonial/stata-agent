@@ -1582,6 +1582,66 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "InvestigationFindingResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "layer": {
+            "enum": [
+              "control",
+              "context",
+              "provider",
+              "tool_selection",
+              "tool_admission",
+              "tool_execution",
+              "stata_execution",
+              "evaluation",
+              "recovery"
+            ],
+            "title": "Layer",
+            "type": "string"
+          },
+          "next_query": {
+            "title": "Next Query",
+            "type": "string"
+          },
+          "object_id": {
+            "title": "Object Id",
+            "type": "string"
+          },
+          "object_type": {
+            "title": "Object Type",
+            "type": "string"
+          },
+          "severity": {
+            "enum": [
+              "info",
+              "warn",
+              "error"
+            ],
+            "title": "Severity",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "layer",
+          "code",
+          "severity",
+          "summary",
+          "object_type",
+          "object_id",
+          "next_query"
+        ],
+        "title": "InvestigationFindingResponse",
+        "type": "object"
+      },
       "JournalEntryPageResponse": {
         "additionalProperties": false,
         "properties": {
@@ -5269,6 +5329,416 @@
         "title": "SkillVersionResponse",
         "type": "object"
       },
+      "ToolDecisionTraceData": {
+        "additionalProperties": false,
+        "properties": {
+          "admission_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Admission Id"
+          },
+          "admission_policy_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Admission Policy Revision"
+          },
+          "artifact_references": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Artifact References",
+            "type": "array"
+          },
+          "assistant_output_id": {
+            "title": "Assistant Output Id",
+            "type": "string"
+          },
+          "assistant_public_text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assistant Public Text"
+          },
+          "call_ordinal": {
+            "minimum": 1.0,
+            "title": "Call Ordinal",
+            "type": "integer"
+          },
+          "canonical_arguments": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canonical Arguments"
+          },
+          "context_manifest_id": {
+            "title": "Context Manifest Id",
+            "type": "string"
+          },
+          "dispatch_plan_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dispatch Plan Id"
+          },
+          "effect_class": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Effect Class"
+          },
+          "evaluation_findings": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Evaluation Findings",
+            "type": "array"
+          },
+          "execution_batch_ordinal": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Batch Ordinal"
+          },
+          "execution_owner": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Owner"
+          },
+          "journal_references": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Journal References",
+            "type": "array"
+          },
+          "model_invocation_id": {
+            "title": "Model Invocation Id",
+            "type": "string"
+          },
+          "model_invocation_status": {
+            "title": "Model Invocation Status",
+            "type": "string"
+          },
+          "normalization_diff": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Normalization Diff"
+          },
+          "operation_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Kind"
+          },
+          "operations": {
+            "items": {
+              "$ref": "#/components/schemas/ToolOperationTraceResponse"
+            },
+            "title": "Operations",
+            "type": "array"
+          },
+          "proposal_status": {
+            "title": "Proposal Status",
+            "type": "string"
+          },
+          "provider_attempt_id": {
+            "title": "Provider Attempt Id",
+            "type": "string"
+          },
+          "provider_tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Tool Call Id"
+          },
+          "raw_arguments_text": {
+            "title": "Raw Arguments Text",
+            "type": "string"
+          },
+          "requested_tool_name": {
+            "title": "Requested Tool Name",
+            "type": "string"
+          },
+          "result_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Kind"
+          },
+          "result_payload": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Payload"
+          },
+          "result_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Summary"
+          },
+          "status_history": {
+            "items": {
+              "$ref": "#/components/schemas/ToolStatusObservationResponse"
+            },
+            "title": "Status History",
+            "type": "array"
+          },
+          "step_id": {
+            "title": "Step Id",
+            "type": "string"
+          },
+          "step_ordinal": {
+            "minimum": 1.0,
+            "title": "Step Ordinal",
+            "type": "integer"
+          },
+          "structural_diagnosis": {
+            "title": "Structural Diagnosis",
+            "type": "string"
+          },
+          "tool_call_id": {
+            "title": "Tool Call Id",
+            "type": "string"
+          },
+          "tool_contract_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Contract Id"
+          },
+          "tool_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Version"
+          },
+          "turn_id": {
+            "title": "Turn Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "turn_id",
+          "step_id",
+          "step_ordinal",
+          "context_manifest_id",
+          "model_invocation_id",
+          "model_invocation_status",
+          "provider_attempt_id",
+          "assistant_output_id",
+          "assistant_public_text",
+          "tool_call_id",
+          "call_ordinal",
+          "requested_tool_name",
+          "provider_tool_call_id",
+          "proposal_status",
+          "raw_arguments_text",
+          "canonical_arguments",
+          "normalization_diff",
+          "tool_contract_id",
+          "tool_version",
+          "operation_kind",
+          "effect_class",
+          "execution_owner",
+          "dispatch_plan_id",
+          "admission_id",
+          "admission_policy_revision",
+          "status_history",
+          "operations",
+          "result_kind",
+          "result_summary",
+          "result_payload",
+          "artifact_references",
+          "evaluation_findings",
+          "journal_references",
+          "structural_diagnosis"
+        ],
+        "title": "ToolDecisionTraceData",
+        "type": "object"
+      },
+      "ToolDecisionTraceResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "authoritative_revision": {
+            "minimum": 0.0,
+            "title": "Authoritative Revision",
+            "type": "integer"
+          },
+          "data": {
+            "$ref": "#/components/schemas/ToolDecisionTraceData"
+          },
+          "generated_at": {
+            "format": "date-time",
+            "title": "Generated At",
+            "type": "string"
+          },
+          "resource_refs": {
+            "items": {
+              "$ref": "#/components/schemas/ResourceRef"
+            },
+            "title": "Resource Refs",
+            "type": "array"
+          },
+          "schema_version": {
+            "const": "1",
+            "default": "1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "workspace_id": {
+            "title": "Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "authoritative_revision",
+          "generated_at",
+          "data",
+          "resource_refs"
+        ],
+        "title": "ToolDecisionTraceResponse",
+        "type": "object"
+      },
+      "ToolOperationTraceResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "attempts": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Attempts",
+            "type": "array"
+          },
+          "created_revision": {
+            "minimum": 1.0,
+            "title": "Created Revision",
+            "type": "integer"
+          },
+          "operation_id": {
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "operation_kind": {
+            "title": "Operation Kind",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "terminal_revision": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminal Revision"
+          }
+        },
+        "required": [
+          "operation_id",
+          "operation_kind",
+          "status",
+          "created_revision",
+          "attempts"
+        ],
+        "title": "ToolOperationTraceResponse",
+        "type": "object"
+      },
       "ToolOperationUsageResponse": {
         "additionalProperties": false,
         "properties": {
@@ -5331,6 +5801,151 @@
           "attempt_count"
         ],
         "title": "ToolOperationUsageResponse",
+        "type": "object"
+      },
+      "ToolStatusObservationResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "commit_revision": {
+            "minimum": 1.0,
+            "title": "Commit Revision",
+            "type": "integer"
+          },
+          "proposal_status": {
+            "title": "Proposal Status",
+            "type": "string"
+          },
+          "reason_code": {
+            "title": "Reason Code",
+            "type": "string"
+          },
+          "status_ordinal": {
+            "minimum": 1.0,
+            "title": "Status Ordinal",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status_ordinal",
+          "proposal_status",
+          "reason_code",
+          "commit_revision"
+        ],
+        "title": "ToolStatusObservationResponse",
+        "type": "object"
+      },
+      "TurnInvestigationData": {
+        "additionalProperties": false,
+        "properties": {
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/InvestigationFindingResponse"
+            },
+            "title": "Findings",
+            "type": "array"
+          },
+          "investigation_note": {
+            "title": "Investigation Note",
+            "type": "string"
+          },
+          "last_journal_event_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Journal Event Type"
+          },
+          "last_workspace_revision": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Workspace Revision"
+          },
+          "tool_call_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tool Call Ids",
+            "type": "array"
+          },
+          "turn_id": {
+            "title": "Turn Id",
+            "type": "string"
+          },
+          "turn_revision": {
+            "minimum": 1.0,
+            "title": "Turn Revision",
+            "type": "integer"
+          },
+          "turn_status": {
+            "title": "Turn Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "turn_id",
+          "turn_status",
+          "turn_revision",
+          "last_journal_event_type",
+          "findings",
+          "tool_call_ids",
+          "investigation_note"
+        ],
+        "title": "TurnInvestigationData",
+        "type": "object"
+      },
+      "TurnInvestigationResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "authoritative_revision": {
+            "minimum": 0.0,
+            "title": "Authoritative Revision",
+            "type": "integer"
+          },
+          "data": {
+            "$ref": "#/components/schemas/TurnInvestigationData"
+          },
+          "generated_at": {
+            "format": "date-time",
+            "title": "Generated At",
+            "type": "string"
+          },
+          "resource_refs": {
+            "items": {
+              "$ref": "#/components/schemas/ResourceRef"
+            },
+            "title": "Resource Refs",
+            "type": "array"
+          },
+          "schema_version": {
+            "const": "1",
+            "default": "1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "workspace_id": {
+            "title": "Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "authoritative_revision",
+          "generated_at",
+          "data",
+          "resource_refs"
+        ],
+        "title": "TurnInvestigationResponse",
         "type": "object"
       },
       "TurnOperationalEvaluationData": {
@@ -9559,6 +10174,64 @@
         "summary": "Turn Operational Evaluation"
       }
     },
+    "/api/v1/workspaces/{workspace_id}/turns/{turn_id}/investigation": {
+      "get": {
+        "operationId": "turn_investigation_api_v1_workspaces__workspace_id__turns__turn_id__investigation_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "turn_id",
+            "required": true,
+            "schema": {
+              "title": "Turn Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnInvestigationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Turn Investigation"
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/turns/{turn_id}/model-deltas": {
       "get": {
         "operationId": "model_deltas_api_v1_workspaces__workspace_id__turns__turn_id__model_deltas_get",
@@ -9702,6 +10375,73 @@
           }
         },
         "summary": "Record Turn Outcome Feedback"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/turns/{turn_id}/tool-decisions/{tool_call_id}": {
+      "get": {
+        "operationId": "tool_decision_trace_api_v1_workspaces__workspace_id__turns__turn_id__tool_decisions__tool_call_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "turn_id",
+            "required": true,
+            "schema": {
+              "title": "Turn Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tool_call_id",
+            "required": true,
+            "schema": {
+              "title": "Tool Call Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolDecisionTraceResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Tool Decision Trace"
       }
     },
     "/api/v1/workspaces/{workspace_id}/turns/{turn_id}/usage": {

@@ -183,6 +183,10 @@ class RerankCandidate:
     section_title: str | None
     content: str
     retrieval_score: float
+    lexical_rank: int | None = None
+    dense_rank: int | None = None
+    dense_score: float | None = None
+    query_variant_ordinals: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +218,48 @@ class EvidenceReranker(Protocol):
         objective: str,
         candidates: tuple[RerankCandidate, ...],
     ) -> tuple[RerankAssessment, ...]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceSufficiencyDecision:
+    status: str
+    highest_score: float
+    reason_codes: tuple[str, ...]
+
+    @property
+    def answer_allowed(self) -> bool:
+        return self.status == "supported"
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceSufficiencyGate:
+    """Hard retrieval-to-generation boundary for grounded factual answers."""
+
+    minimum_support_score: float = 0.35
+    policy_revision: str = "evidence-sufficiency-gate/v1"
+
+    def assess(
+        self, assessments: tuple[RerankAssessment, ...]
+    ) -> EvidenceSufficiencyDecision:
+        if not assessments:
+            return EvidenceSufficiencyDecision(
+                "insufficient_evidence", 0.0, ("no_retrieved_evidence",)
+            )
+        highest_score = max(item.score for item in assessments)
+        supported = any(
+            item.score >= self.minimum_support_score
+            and item.relevance_label in {"direct_support", "partial_support"}
+            for item in assessments
+        )
+        if not supported:
+            return EvidenceSufficiencyDecision(
+                "insufficient_evidence",
+                highest_score,
+                ("no_candidate_crossed_support_boundary",),
+            )
+        return EvidenceSufficiencyDecision(
+            "supported", highest_score, ("supported_candidate_present",)
+        )
 
 
 class DeterministicEvidenceReranker:

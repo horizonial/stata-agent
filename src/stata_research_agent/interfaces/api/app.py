@@ -129,6 +129,7 @@ from stata_research_agent.persistence.errors import (
     PersistenceBootstrapError,
 )
 from stata_research_agent.persistence.filesystem_memory import FilesystemMemoryStore
+from stata_research_agent.persistence.investigation_query import SqliteInvestigationQuery
 from stata_research_agent.persistence.lineage_query import SqliteEvidenceLineageQuery
 from stata_research_agent.persistence.memory_query import SqliteMemoryQuery
 from stata_research_agent.persistence.memory_store import SqliteMemoryRepository
@@ -201,6 +202,7 @@ from .models import (
     EvidenceLineageData,
     EvidenceLineageResponse,
     GlobalAttentionResponse,
+    InvestigationFindingResponse,
     JournalEntryPageResponse,
     JournalEntryResponse,
     KnowledgeDocumentResponse,
@@ -266,7 +268,13 @@ from .models import (
     SkillImprovementProposalResponse,
     SkillRollbackRequest,
     SkillVersionResponse,
+    ToolDecisionTraceData,
+    ToolDecisionTraceResponse,
+    ToolOperationTraceResponse,
     ToolOperationUsageResponse,
+    ToolStatusObservationResponse,
+    TurnInvestigationData,
+    TurnInvestigationResponse,
     TurnOperationalEvaluationData,
     TurnOperationalEvaluationResponse,
     TurnOutcomeFeedbackRequest,
@@ -1963,6 +1971,145 @@ def create_app(
                         ),
                     )
                 )
+            ),
+        )
+
+    @app.get(
+        "/api/v1/workspaces/{workspace_id}/turns/{turn_id}/investigation",
+        response_model=TurnInvestigationResponse,
+        responses={404: {"model": ErrorResponse}},
+    )
+    def turn_investigation(
+        workspace_id: str,
+        turn_id: str,
+    ) -> TurnInvestigationResponse:
+        try:
+            typed_workspace_id = WorkspaceId(workspace_id)
+            connection = host.database(typed_workspace_id).open(writable=False)
+            try:
+                snapshot = SqliteInvestigationQuery(connection).turn(turn_id)
+            finally:
+                connection.close()
+        except (PersistenceBootstrapError, ValueError) as error:
+            raise HTTPException(status_code=404, detail="TURN_NOT_FOUND") from error
+        return TurnInvestigationResponse(
+            workspace_id=workspace_id,
+            authoritative_revision=snapshot.authoritative_revision,
+            generated_at=datetime.now(UTC),
+            data=TurnInvestigationData(
+                turn_id=snapshot.turn_id,
+                turn_status=snapshot.turn_status,
+                turn_revision=snapshot.turn_revision,
+                last_journal_event_type=snapshot.last_journal_event_type,
+                last_workspace_revision=snapshot.last_workspace_revision,
+                findings=tuple(
+                    InvestigationFindingResponse(
+                        layer=item.layer,
+                        code=item.code,
+                        severity=item.severity,
+                        summary=item.summary,
+                        object_type=item.object_type,
+                        object_id=item.object_id,
+                        next_query=f"/api/v1/workspaces/{workspace_id}{item.next_query}",
+                    )
+                    for item in snapshot.findings
+                ),
+                tool_call_ids=snapshot.tool_call_ids,
+                investigation_note=snapshot.investigation_note,
+            ),
+            resource_refs=(ResourceRef(resource_type="turn", resource_id=turn_id),),
+        )
+
+    @app.get(
+        "/api/v1/workspaces/{workspace_id}/turns/{turn_id}/tool-decisions/{tool_call_id}",
+        response_model=ToolDecisionTraceResponse,
+        responses={404: {"model": ErrorResponse}},
+    )
+    def tool_decision_trace(
+        workspace_id: str,
+        turn_id: str,
+        tool_call_id: str,
+    ) -> ToolDecisionTraceResponse:
+        try:
+            typed_workspace_id = WorkspaceId(workspace_id)
+            connection = host.database(typed_workspace_id).open(writable=False)
+            try:
+                query = SqliteInvestigationQuery(connection)
+                trace = query.tool_decision(turn_id, tool_call_id)
+                authoritative_revision = int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(workspace_revision), 0) FROM workspace_commits"
+                    ).fetchone()[0]
+                )
+            finally:
+                connection.close()
+        except (PersistenceBootstrapError, ValueError) as error:
+            raise HTTPException(status_code=404, detail="TOOL_CALL_NOT_FOUND") from error
+        return ToolDecisionTraceResponse(
+            workspace_id=workspace_id,
+            authoritative_revision=authoritative_revision,
+            generated_at=datetime.now(UTC),
+            data=ToolDecisionTraceData(
+                turn_id=trace.turn_id,
+                step_id=trace.step_id,
+                step_ordinal=trace.step_ordinal,
+                context_manifest_id=trace.context_manifest_id,
+                model_invocation_id=trace.model_invocation_id,
+                model_invocation_status=trace.model_invocation_status,
+                provider_attempt_id=trace.provider_attempt_id,
+                assistant_output_id=trace.assistant_output_id,
+                assistant_public_text=trace.assistant_public_text,
+                tool_call_id=trace.tool_call_id,
+                call_ordinal=trace.call_ordinal,
+                requested_tool_name=trace.requested_tool_name,
+                provider_tool_call_id=trace.provider_tool_call_id,
+                proposal_status=trace.proposal_status,
+                raw_arguments_text=trace.raw_arguments_text,
+                canonical_arguments=trace.canonical_arguments,
+                normalization_diff=trace.normalization_diff,
+                tool_contract_id=trace.tool_contract_id,
+                tool_version=trace.tool_version,
+                operation_kind=trace.operation_kind,
+                effect_class=trace.effect_class,
+                execution_owner=trace.execution_owner,
+                dispatch_plan_id=trace.dispatch_plan_id,
+                execution_batch_ordinal=trace.execution_batch_ordinal,
+                admission_id=trace.admission_id,
+                admission_policy_revision=trace.admission_policy_revision,
+                status_history=tuple(
+                    ToolStatusObservationResponse(
+                        status_ordinal=item.status_ordinal,
+                        proposal_status=item.proposal_status,
+                        reason_code=item.reason_code,
+                        commit_revision=item.commit_revision,
+                    )
+                    for item in trace.status_history
+                ),
+                operations=tuple(
+                    ToolOperationTraceResponse(
+                        operation_id=item.operation_id,
+                        operation_kind=item.operation_kind,
+                        status=item.status,
+                        created_revision=item.created_revision,
+                        terminal_revision=item.terminal_revision,
+                        attempts=item.attempts,
+                    )
+                    for item in trace.operations
+                ),
+                result_kind=trace.result_kind,
+                result_summary=trace.result_summary,
+                result_payload=trace.result_payload,
+                artifact_references=trace.artifact_references,
+                evaluation_findings=trace.evaluation_findings,
+                journal_references=trace.journal_references,
+                structural_diagnosis=trace.structural_diagnosis,
+            ),
+            resource_refs=(
+                ResourceRef(resource_type="turn", resource_id=turn_id),
+                *tuple(
+                    ResourceRef(resource_type="operation", resource_id=item.operation_id)
+                    for item in trace.operations
+                ),
             ),
         )
 

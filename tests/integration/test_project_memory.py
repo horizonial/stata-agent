@@ -176,7 +176,7 @@ def test_active_memory_crosses_conversations_but_respects_read_policy(tmp_path: 
 
 
 def test_inferred_memory_requires_activation(tmp_path: Path) -> None:
-    connection, identities, _control, first = _workspace(tmp_path)
+    connection, identities, control, first = _workspace(tmp_path)
     try:
         model_outcome = asyncio.run(
             ModelGatewayService(
@@ -220,9 +220,24 @@ def test_inferred_memory_requires_activation(tmp_path: Path) -> None:
             )
         )
         assert active.lifecycle.value == "active"
+        control.complete_turn(
+            CompleteTurnCommand(
+                CommandId("cmd_memory_complete_inference_turn"),
+                first.turn_id,
+                TurnStatus.SUCCEEDED,
+            )
+        )
+        preference_query = control.submit_message(
+            SubmitMessageCommand(
+                CommandId("cmd_memory_preference_query"),
+                "Should this project use compact tables?",
+            )
+        )
         assert any(
             candidate.item.source_object_id == active.memory_revision_id.value
-            for candidate in SqliteContextAuthorityReader(connection).collect(first.turn_id)
+            for candidate in SqliteContextAuthorityReader(connection).collect(
+                preference_query.turn_id
+            )
         )
     finally:
         connection.close()
@@ -389,12 +404,10 @@ def test_retraction_between_compile_and_freeze_fails_closed(tmp_path: Path) -> N
             if candidate.item.source_object_type == "memory_revision"
         )
         assert stale_items
-        stale_summary_items = tuple(
-            candidate.item
+        assert all(
+            candidate.item.source_object_type != "memory_summary_projection"
             for candidate in SqliteContextAuthorityReader(connection).collect(first.turn_id)
-            if candidate.item.source_object_type == "memory_summary_projection"
         )
-        assert stale_summary_items
         service.retract(
             RetractMemoryCommand(
                 CommandId("cmd_memory_race_retract"),
@@ -403,22 +416,6 @@ def test_retraction_between_compile_and_freeze_fails_closed(tmp_path: Path) -> N
                 "User withdrew the constraint.",
             )
         )
-
-        with pytest.raises(ValueError, match="Memory summary is stale"):
-            asyncio.run(
-                ModelGatewayService(
-                    SqliteModelGatewayRepository(connection),
-                    identities,
-                    _Credential(),
-                    _Transport(),
-                ).execute_step(
-                    _step_command(
-                        "cmd_memory_summary_race_freeze",
-                        first.turn_id,
-                        context_items=stale_summary_items,
-                    )
-                )
-            )
 
         command = _step_command("cmd_memory_race_freeze", first.turn_id, context_items=stale_items)
         with pytest.raises(ValueError, match="no longer current and active"):

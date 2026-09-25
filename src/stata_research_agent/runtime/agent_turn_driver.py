@@ -6,14 +6,17 @@ import asyncio
 import json
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
+from stata_research_agent.application.context_budget import DynamicContextBudgetPolicy
 from stata_research_agent.application.context_compiler import (
     CompiledStepContext,
     ContextCompiler,
     EmptyContextAuthorityReader,
 )
+from stata_research_agent.application.diagnostic_tracing import DiagnosticTracer
 from stata_research_agent.application.evaluation import (
     DecideNaturalStopCommand,
     EvaluationDimension,
@@ -39,6 +42,8 @@ from stata_research_agent.application.tool_broker import (
     CreateDispatchPlanCommand,
     RawToolProposal,
     RecordExecutorExceptionCommand,
+    RecordToolAdmissionBlockedCommand,
+    ToolAdmissionBlockedError,
     ToolAdmissionOutcome,
 )
 from stata_research_agent.application.tool_broker_service import ToolBrokerService
@@ -104,6 +109,8 @@ class AgentTurnDriver:
         retrieval_finalizer: RetrievalSessionFinalizer | None = None,
         monotonic_clock: Callable[[], float] = time.monotonic,
         runtime_budget_ledger: TurnRuntimeBudgetLedger | None = None,
+        tracer: DiagnosticTracer | None = None,
+        context_budget_policy: DynamicContextBudgetPolicy | None = None,
     ) -> None:
         self._gateway = gateway
         self._broker = broker
@@ -120,6 +127,8 @@ class AgentTurnDriver:
         self._retrieval_finalizer = retrieval_finalizer
         self._monotonic_clock = monotonic_clock
         self._runtime_budget_ledger = runtime_budget_ledger
+        self._tracer = tracer
+        self._context_budget_policy = context_budget_policy or DynamicContextBudgetPolicy()
 
     async def run(self, config: TurnDriverConfig) -> TurnDriverOutcome:
         if (
@@ -143,7 +152,7 @@ class AgentTurnDriver:
         if available_seconds <= 0:
             return self._deadline_outcome(config.turn_id, 0, 0)
         deadline = segment_started + available_seconds
-        worker = TurnWorkerProcess(self._worker_python)
+        worker = TurnWorkerProcess(self._worker_python, tracer=self._tracer)
         transient_items: list[ContextItemCandidate] = []
         tool_executions = 0
         executed_steps = 0
@@ -179,16 +188,17 @@ class AgentTurnDriver:
                     remaining_step_budget=remaining_steps,
                     remaining_tool_budget=remaining_tools,
                 )
-                compiled = self._context_compiler.compile(
-                    config.turn_id,
-                    static_items=config.initial_context,
-                    transient_items=tuple(transient_items),
-                    remote_provider=config.model.remote_provider,
+                compiled, input_token_limit = self._compile_context(
+                    config,
+                    tuple(transient_items),
+                    remaining_step_budget=model_request.remaining_step_budget,
+                    remaining_tool_budget=model_request.remaining_tool_budget,
                 )
                 step = await self._gateway.execute_step(
                     self._step_command(
                         config,
                         compiled,
+                        input_token_limit=input_token_limit,
                         remaining_step_budget=model_request.remaining_step_budget,
                         remaining_tool_budget=model_request.remaining_tool_budget,
                     )
@@ -255,9 +265,7 @@ class AgentTurnDriver:
                         self._plan_coordinator.ensure_minimal_formal_plan(
                             config.turn_id, research_path_id, tools
                         )
-                        tools = self._plan_coordinator.bind_formal_tools(
-                            research_path_id, tools
-                        )
+                        tools = self._plan_coordinator.bind_formal_tools(research_path_id, tools)
                     assert step.assistant_output_id is not None
                     plan = self._broker.create_dispatch_plan(
                         CreateDispatchPlanCommand(
@@ -317,6 +325,19 @@ class AgentTurnDriver:
                                     )
                                 )
                             except ValueError as error:
+                                reason_code = (
+                                    error.reason_code
+                                    if isinstance(error, ToolAdmissionBlockedError)
+                                    else "admission_validation_error"
+                                )
+                                self._broker.record_admission_blocked(
+                                    RecordToolAdmissionBlockedCommand(
+                                        self._identities.new(CommandId),
+                                        config.turn_id,
+                                        tool_call_id,
+                                        reason_code,
+                                    )
+                                )
                                 transient_items.append(
                                     ContextItemCandidate(
                                         "tool_admission_feedback",
@@ -326,7 +347,7 @@ class AgentTurnDriver:
                                         "remote_allowed",
                                         (
                                             "Tool Admission rejected: "
-                                            f"{self._safe_executor_error_detail(error)}. "
+                                            f"{reason_code}. "
                                             "Revise the call or choose a different next action; "
                                             "do not repeat it unchanged."
                                         ),
@@ -436,20 +457,21 @@ class AgentTurnDriver:
                         "remote_allowed",
                         self._evaluation_request(completion, evaluation),
                     )
-                    compiled_evaluation = self._context_compiler.compile(
-                        config.turn_id,
-                        static_items=config.initial_context,
-                        transient_items=tuple((*transient_items, evaluator_context)),
-                        remote_provider=config.model.remote_provider,
+                    evaluation_remaining_steps = config.max_loop_steps - executed_steps
+                    evaluation_remaining_tools = config.max_tool_admissions - tool_executions
+                    compiled_evaluation, evaluation_input_limit = self._compile_context(
+                        config,
+                        tuple((*transient_items, evaluator_context)),
+                        remaining_step_budget=evaluation_remaining_steps,
+                        remaining_tool_budget=evaluation_remaining_tools,
                     )
                     evaluated = await self._model_evaluation.evaluate(
                         self._step_command(
                             config,
                             compiled_evaluation,
-                            remaining_step_budget=config.max_loop_steps - executed_steps,
-                            remaining_tool_budget=(
-                                config.max_tool_admissions - tool_executions
-                            ),
+                            input_token_limit=evaluation_input_limit,
+                            remaining_step_budget=evaluation_remaining_steps,
+                            remaining_tool_budget=evaluation_remaining_tools,
                         )
                     )
                     executed_steps += 1
@@ -681,9 +703,7 @@ class AgentTurnDriver:
             return type(error).__name__
         candidate = str(error).strip()[:500] or type(error).__name__
         try:
-            inspected = self._sensitive_output_gate.inspect_text(
-                "tool.executor_error", candidate
-            )
+            inspected = self._sensitive_output_gate.inspect_text("tool.executor_error", candidate)
         except SensitiveOutputGateUnavailable:
             return type(error).__name__
         if inspected.verdict not in {"safe", "redacted"}:
@@ -695,6 +715,7 @@ class AgentTurnDriver:
         config: TurnDriverConfig,
         compiled: CompiledStepContext,
         *,
+        input_token_limit: int,
         remaining_step_budget: int,
         remaining_tool_budget: int,
     ) -> StartModelStepCommand:
@@ -722,10 +743,39 @@ class AgentTurnDriver:
             model.credential_ref,
             model.provider_policy,
             model.remote_provider,
+            input_token_limit=input_token_limit,
             remaining_step_budget=config.max_loop_steps,
             remaining_tool_budget=config.max_tool_admissions,
             current_remaining_step_budget=remaining_step_budget,
             current_remaining_tool_budget=remaining_tool_budget,
+        )
+
+    def _compile_context(
+        self,
+        config: TurnDriverConfig,
+        transient_items: tuple[ContextItemCandidate, ...],
+        *,
+        remaining_step_budget: int,
+        remaining_tool_budget: int,
+    ) -> tuple[CompiledStepContext, int]:
+        allocation = self._context_budget_policy.allocate(
+            config.model,
+            remaining_step_budget=remaining_step_budget,
+            remaining_tool_budget=remaining_tool_budget,
+        )
+        compiled = self._context_compiler.compile(
+            config.turn_id,
+            static_items=config.initial_context,
+            transient_items=transient_items,
+            remote_provider=config.model.remote_provider,
+            input_token_budget=allocation.context_item_budget_tokens,
+        )
+        return (
+            replace(
+                compiled,
+                decisions=(*compiled.decisions, allocation.as_build_decision()),
+            ),
+            allocation.hard_input_token_limit,
         )
 
     @staticmethod
@@ -788,9 +838,7 @@ class AgentTurnDriver:
         if reason not in {"user_input", "user_confirmation", "external_resolution"}:
             raise ValueError("invalid model waiting reason")
         return WorkerWaiting(
-            reason=cast(
-                Literal["user_input", "user_confirmation", "external_resolution"], reason
-            ),
+            reason=cast(Literal["user_input", "user_confirmation", "external_resolution"], reason),
             prompt=str(raw.get("prompt", "")),
         )
 

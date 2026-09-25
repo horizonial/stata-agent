@@ -23,6 +23,8 @@ from stata_research_agent.application.dense_retrieval import (
     DenseKnowledgeIndexService,
     EmbeddingGateway,
 )
+from stata_research_agent.application.diagnostic_service import DiagnosticService
+from stata_research_agent.application.diagnostic_tracing import DiagnosticTracer
 from stata_research_agent.application.document_delivery_service import DocumentDeliveryService
 from stata_research_agent.application.evaluation import (
     ContractObligationCandidate,
@@ -51,6 +53,7 @@ from stata_research_agent.application.research_state_service import ResearchStat
 from stata_research_agent.application.result_profile_service import (
     RegisteredResultProfileService,
 )
+from stata_research_agent.application.retrieval_pipeline import EvidenceReranker
 from stata_research_agent.application.stata_operation_service import StataOperationService
 from stata_research_agent.application.streaming import EphemeralModelDeltaHub
 from stata_research_agent.application.table_export_service import EsttabTableExportService
@@ -681,7 +684,7 @@ def production_search_knowledge_contract() -> ToolContractDefinition:
 def production_search_memory_contract() -> ToolContractDefinition:
     return ToolContractDefinition(
         "memory.search",
-        "1.0.0",
+        "1.1.0",
         (
             "Search current Project Memory by meaning and return concise, stable revision "
             "references; Memory is advisory and never statistical Evidence"
@@ -695,6 +698,14 @@ def production_search_memory_contract() -> ToolContractDefinition:
                 "include_archived": {
                     "type": "boolean",
                     "description": "Use only for deliberate historical review.",
+                },
+                "retrieval_mode": {
+                    "type": "string",
+                    "enum": ["hybrid", "lexical"],
+                    "description": (
+                        "Hybrid adds local semantic similarity when the Workspace embedding "
+                        "runtime is available; lexical avoids that extra computation."
+                    ),
                 },
             },
             "required": ["query"],
@@ -858,15 +869,37 @@ def production_model_tool_schema(contract: ToolContractDefinition) -> dict[str, 
 
 
 class _ProductionToolExecutor:
-    def __init__(self, executors: Mapping[str, AdmittedToolExecutor]) -> None:
+    def __init__(
+        self,
+        executors: Mapping[str, AdmittedToolExecutor],
+        *,
+        tracer: DiagnosticTracer | None = None,
+        workspace_ref: str | None = None,
+    ) -> None:
         self._executors = dict(executors)
+        self._tracer = tracer
+        self._workspace_ref = workspace_ref
 
     async def execute(self, request: ToolExecutionRequest) -> ToolExecutionResult:
         try:
             executor = self._executors[request.tool_name]
         except KeyError as error:
             raise ValueError(f"unsupported admitted tool: {request.tool_name}") from error
-        return await executor.execute(request)
+        if self._tracer is None:
+            return await executor.execute(request)
+        async with self._tracer.span(
+            "tool.execute",
+            kind="tool",
+            component=request.tool_name,
+            workspace_ref=self._workspace_ref,
+            turn_id=request.turn_id.value,
+            operation_id=request.operation_id.value,
+            domain_ref_type="operation",
+            domain_ref_id=request.operation_id.value,
+        ) as span:
+            outcome = await executor.execute(request)
+            span.set_status("succeeded" if outcome.success else "failed")
+            return outcome
 
 
 class ProductionTurnRunner:
@@ -884,8 +917,11 @@ class ProductionTurnRunner:
         sandbox_factory: Callable[[Path], SandboxExecutor] | None = None,
         sandbox_network_allowed: bool = False,
         embedding_gateway: EmbeddingGateway | None = None,
+        evidence_reranker: EvidenceReranker | None = None,
         literature_pdf_parser: MineruCliParser | None = None,
         model_delta_hub: EphemeralModelDeltaHub | None = None,
+        diagnostics: DiagnosticService | None = None,
+        tracer: DiagnosticTracer | None = None,
     ) -> None:
         self._host = host
         self._pool = pool
@@ -900,10 +936,28 @@ class ProductionTurnRunner:
         self._sandbox_factory = sandbox_factory
         self._sandbox_network_allowed = sandbox_network_allowed
         self._embedding_gateway = embedding_gateway
+        self._evidence_reranker = evidence_reranker
         self._literature_pdf_parser = literature_pdf_parser
         self._model_delta_hub = model_delta_hub
+        self._diagnostics = diagnostics
+        self._tracer = tracer
 
     async def run_turn(self, workspace_id: WorkspaceId, turn_id: TurnId) -> None:
+        if self._tracer is None:
+            await self._run_turn(workspace_id, turn_id)
+            return
+        async with self._tracer.span(
+            "agent.turn",
+            component="production_turn_runner",
+            workspace_ref=workspace_id.value,
+            turn_id=turn_id.value,
+            domain_ref_type="turn",
+            domain_ref_id=turn_id.value,
+        ) as span:
+            await self._run_turn(workspace_id, turn_id)
+            span.set_status("returned")
+
+    async def _run_turn(self, workspace_id: WorkspaceId, turn_id: TurnId) -> None:
         database = self._host.database(workspace_id)
         connection = database.open(writable=True)
         identities = UuidIdentityGenerator()
@@ -952,7 +1006,9 @@ class ProductionTurnRunner:
                 return
             main_skill = self._main_skills.resolve(database.root)
             specialized_skills = self._main_skills.specialized_index(database.root)
-            knowledge = SqliteKnowledgeRepository(connection)
+            knowledge = SqliteKnowledgeRepository(
+                connection, reranker=self._evidence_reranker
+            )
             try:
                 WorkspaceKnowledgeIndexService(
                     knowledge,
@@ -980,7 +1036,11 @@ class ProductionTurnRunner:
                         # Dense retrieval is a rebuildable projection. FAST lexical retrieval
                         # remains available when an optional model pack is absent or unhealthy.
                         pass
-                knowledge = SqliteKnowledgeRepository(connection, dense_knowledge)
+                knowledge = SqliteKnowledgeRepository(
+                    connection,
+                    dense_knowledge,
+                    reranker=self._evidence_reranker,
+                )
 
             runtime = self._pool.runtime_for_active_write_turn(
                 SqliteExecutionScopeAuthority(database), turn_id
@@ -1119,7 +1179,12 @@ class ProductionTurnRunner:
             path_id = ResearchPathId(str(row["research_path_id"]))
             plan_coordinator = ResearchPlanCoordinator(research_state, identities)
             bridge = BrokerExecutionService(SqliteBrokerExecutionRepository(connection), identities)
-            memory_recall = SqliteMemoryRecallRepository(connection, memory_files, identities)
+            memory_recall = SqliteMemoryRecallRepository(
+                connection,
+                memory_files,
+                identities,
+                embedding_gateway=self._embedding_gateway,
+            )
             help_roots = discover_stata_help_roots()
             help_index = (
                 StataHelpIndexService(knowledge, help_roots, identities) if help_roots else None
@@ -1282,13 +1347,19 @@ class ProductionTurnRunner:
                 routes["research.adopt_analysis_output"] = AdoptAnalysisOutputExecutor(
                     connection, bridge, analysis_outputs, artifacts, identities
                 )
-            executor = _ProductionToolExecutor(routes)
+            executor = _ProductionToolExecutor(
+                routes,
+                tracer=self._tracer,
+                workspace_ref=workspace_id.value,
+            )
             delta_hub = self._model_delta_hub
             model_gateway = ModelGatewayService(
                 SqliteModelGatewayRepository(connection),
                 identities,
                 self._credentials,
                 self._transport,
+                diagnostics=self._diagnostics,
+                tracer=self._tracer,
                 circuit_registry=self._provider_circuits,
                 delta_sink=(
                     None
@@ -1304,13 +1375,7 @@ class ProductionTurnRunner:
                 identities,
                 self._worker_python,
                 context_compiler=ContextCompiler(
-                    SqliteContextAuthorityReader(connection),
-                    input_token_budget=(
-                        model.context_window_tokens
-                        - model.max_output_tokens
-                        - model.reserved_runtime_tokens
-                    ),
-                    summary_token_target=1_000,
+                    SqliteContextAuthorityReader(connection, memory_files),
                 ),
                 plan_coordinator=plan_coordinator,
                 turn_interactions=TurnInteractionService(
@@ -1319,6 +1384,7 @@ class ProductionTurnRunner:
                 model_evaluation=ModelEvaluationCoordinator(model_gateway),
                 retrieval_finalizer=knowledge,
                 runtime_budget_ledger=SqliteTurnRuntimeBudgetLedger(connection, identities),
+                tracer=self._tracer,
             )
             outcome = await driver.run(
                 TurnDriverConfig(
@@ -1355,7 +1421,10 @@ class ProductionTurnRunner:
                             "gaps after every Hop. Generate the next public_subquestion and query "
                             "yourself; do not repeat a query that produced no new evidence. Set "
                             "conclude_session on the final useful Hop. If the Workspace corpus "
-                            "cannot support the requested factual claim, say exactly: "
+                            "cannot support the requested factual claim, or a retrieval result "
+                            "reports evidence_sufficiency.answer_allowed=false, do not use model "
+                            "knowledge to fill the gap and do not emit factual claims. Say "
+                            "exactly: "
                             "未在当前知识库中找到足够证据，无法回答。"
                         ),
                         main_skill.name,

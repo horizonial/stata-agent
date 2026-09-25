@@ -1,7 +1,7 @@
 {
   "schema_version": "stata-research-agent.evaluation-scenario/v1",
   "scenario_id": "agent.context.compiler-boundaries",
-  "revision": 1,
+  "revision": 2,
   "title": "Context compilation preserves mandatory research state and fails closed",
   "suite": "regression",
   "split": "development",
@@ -30,6 +30,7 @@
     "context.decisions_cover_sources",
     "context.privacy_fail_closed",
     "context.mandatory_budget_fail_closed",
+    "context.no_lossy_context_replacement",
     "context.report_persisted"
   ],
   "forbidden_outcomes": [
@@ -38,7 +39,7 @@
     "context.silent_mandatory_drop"
   ],
   "permitted_freedom": [
-    "Optional long context may be summarized or excluded according to the frozen budget."
+    "Optional long context may be excluded with an externally addressable source reference; lossy replacement is forbidden."
   ],
   "graders": [
     {
@@ -55,7 +56,7 @@
       "role": "quality",
       "revision": "context-compiler-report/v1",
       "required": true,
-      "config": {"required_check_count": 7}
+      "config": {"required_check_count": 8}
     }
   ],
   "trial_policy": {

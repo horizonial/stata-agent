@@ -75,6 +75,7 @@ CORE_DIMENSIONS = (
             "tests/unit/test_agent_benchmarks.py::test_memory_quality_benchmark_scores_activation_sources_and_false_facts",
             "tests/integration/test_memory_quality_lifecycle.py::test_memory_remains_precise_across_correction_and_many_conversations",
             "tests/integration/test_project_memory.py::test_inferred_memory_requires_activation",
+            "tests/integration/test_memory_retrieval_evaluation.py::test_memory_retrieval_v2_runs_production_search_and_exact_open",
             "tests/unit/test_agent_benchmarks.py::test_tool_selection_benchmark_accepts_equivalent_registered_tool_choice",
             "tests/unit/test_production_tool_catalog.py::test_production_tool_schemas_include_use_boundaries",
             "tests/unit/test_agent_benchmarks.py::test_dataset_loader_rejects_cross_split_prompt_leakage",

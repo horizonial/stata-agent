@@ -101,6 +101,7 @@ class FilesystemDiagnosticSink:
                     candidate.operation_id,
                     candidate.attempt_id,
                     candidate.duration_ms,
+                    candidate.parent_span_id,
                 )
                 line = json.dumps(
                     event.to_payload(),
@@ -332,6 +333,7 @@ class FilesystemDiagnosticSink:
                 None,
                 None,
                 None,
+                None,
             )
         return DiagnosticEvent(
             str(payload["diagnostic_event_id"]),
@@ -357,4 +359,5 @@ class FilesystemDiagnosticSink:
             payload.get("operation_id"),
             payload.get("attempt_id"),
             payload.get("duration_ms"),
+            payload.get("parent_span_id"),
         )
